@@ -28,7 +28,7 @@ mce:
 operator:
   image:
     repository: ghcr.io/osac-project/osac-operator
-    tag: sha-6f95938
+    tag: latest
     pullPolicy: Always
   provisioning:
     provider: "aap"
@@ -58,7 +58,7 @@ service:
   externalHostname: ""
   internalHostname: ""
   images:
-    service: ghcr.io/osac-project/fulfillment-service:sha-2151630
+    service: ghcr.io/osac-project/fulfillment-service:main
     envoy: ghcr.io/osac-project/envoy:v1.33.0
   certs:
     issuerRef:
@@ -119,15 +119,15 @@ aap:
       name: "osac-aap"
   bootstrap:
     enabled: true
-    image: ghcr.io/osac-project/osac-aap:sha-86791c0
+    image: ghcr.io/osac-project/osac-aap:latest
     cliImage: quay.io/openshift/origin-cli:4.20.0
     backoffLimit: 15
   configAsCode:
     manifestSecret: "config-as-code-manifest-ig"
     secret: "config-as-code-ig"
-    eeImage: "ghcr.io/osac-project/osac-aap:sha-86791c0"
-    projectGitUri: "https://github.com/osac-project/osac"
-    projectGitBranch: "main"
+    eeImage: "ghcr.io/osac-project/osac-aap:latest"
+    projectGitUri: "https://github.com/ybettan/osac"
+    projectGitBranch: "agentless-net-lab"
   instanceGroups:
     clusterFulfillment:
       enabled: true
