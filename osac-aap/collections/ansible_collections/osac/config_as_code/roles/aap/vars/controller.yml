@@ -629,6 +629,7 @@ controller_instance_groups: # noqa: var-naming[no-role-prefix]
           ansible_job: ''
       spec:
         serviceAccountName: osac-sa
+        hostNetwork: true
         affinity:
           podAntiAffinity:
             preferredDuringSchedulingIgnoredDuringExecution:
