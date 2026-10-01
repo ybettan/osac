@@ -44,12 +44,18 @@ See [suite boundaries and coverage gaps](../docs/INTEGRATION-TESTING.md#osac-aap
 | Touched area | Required validation | Command / follow-up |
 |---|---|---|
 | Filters, variable transforms, and isolated plugin logic | Unit | `uv run pytest tests/unit` |
+| AgentlessNet VirtualNetwork allocation, JSON state, and Linux command helpers | Unit | `tests/unit/test_agentless_network_state.py` and `tests/unit/test_agentless_net_network.py`; run `uv run pytest tests/unit` |
 | Ansible roles, workflow tasks, hooks, leases, finalizers, or Kubernetes resources | Component integration | `make test` or the focused target command |
 | Execution-environment definition or dependency inputs | Build/package validation plus applicable integration tests | `make execution-environment-build`, then `make test` |
 | AAP, OpenStack, KubeVirt/RHACM, or provider provisioning | Contract or real-provider integration | Use the qualifying [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843) suite |
+| AgentlessNet Fulfillment-to-AAP-to-network-node lifecycle | Manual E2E on an existing lab | `./vlan-test-deploy.sh` from the monorepo root; requires deployed OSAC/AAP and one isolated SSH network node |
 | Storage-provider behavior | Component integration (focused) plus real-provider coverage when required | `STORAGE_TESTS_ENABLED=true make test` (or the relevant storage target and provider suite) |
 
 Storage integration requires `STORAGE_TESTS_ENABLED=true`; image builds are separate build/package validation.
+
+The AgentlessNet unit tests mock `ip`, `iptables`, and the remote node. The
+manual E2E runner covers the real Fulfillment, Kubernetes CR, operator, AAP
+worker, SSH, and namespace-provider boundary for [OSAC-5529](https://redhat.atlassian.net/browse/OSAC-5529); it is not a CI suite.
 
 ## Generated and vendored files
 

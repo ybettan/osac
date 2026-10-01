@@ -210,10 +210,12 @@ Touched-area requirements: [component guide](../osac-aap/AGENTS.md#integration-t
 | Tier | Location / command | Exercises for real | Faked or omitted |
 |---|---|---|---|
 | Unit | `tests/unit/`; `uv run pytest tests/unit` | Filter and isolated plugin behavior | Kubernetes, AAP, cloud, and storage services are mocked or fixture-driven. |
+| Unit | `tests/unit/test_agentless_network_state.py`, `tests/unit/test_agentless_net_network.py`; included by `uv run pytest tests/unit` | UID/CIDR allocation, atomic state handling, per-UID operations, parsed Linux state, and bounded command failures | `ip`, `iptables`, the network namespace, and AAP are mocked; this does not prove provider execution. |
 | Component integration | `tests/integration/`; `make test` (creates Kind, runs playbooks, and tears it down) | Ansible roles/playbooks against a real Kind API, CRDs, leases, finalizers, and test-runner pod | AAP, OpenStack, KubeVirt/RHACM, and other provider APIs are not generally real; the VMS storage target uses a mock server. |
 | Component integration (focused) | A target under `tests/integration/targets/`; run the corresponding playbook from `tests/integration/` | The specific role workflow and its documented fixtures | Only the dependencies declared by that target; inspect its setup and overrides before claiming a real boundary. |
 | Contract | No dedicated contract suite; use the qualifying [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843) task for AAP/provider coverage | No AAP or provider endpoint is exercised as a contract | The Kind API, mock VMS server, and fixture-driven provider behavior do not prove an AAP or provider contract. |
 | E2E | Cross-component OSAC E2E suites | Complete fulfillment and provisioning flows | Depends on the deployed AAP and provider environment. |
+| E2E (manual existing lab) | Repository-root `./vlan-test-deploy.sh`; owned by [OSAC-5529](https://redhat.atlassian.net/browse/OSAC-5529) | Fulfillment API/DB, generated CR, operator, AAP worker, SSH, and isolated Linux namespace provider | Uses the existing lab and a disposable isolated network node; it is not a CI suite. |
 
 ### Build/package validation
 
@@ -224,6 +226,7 @@ applicable integration tests separately to validate workflow behavior.
 ### Coverage notes
 
 - **Filters, variable transforms, and isolated plugin logic:** Include invalid input and default handling.
+- **AgentlessNet provider state and command helpers:** Unit coverage proves allocation, locking, retry retention, and command construction; run the manual existing-lab E2E to verify the AAP/SSH/Linux boundary.
 - **Ansible roles, workflow tasks, hooks, leases, finalizers, or Kubernetes resources:** The test must exercise the role/playbook through Ansible against Kind.
 - **Execution-environment definition or dependency inputs:** Image success does not prove the workflow boundary.
 - **AAP, OpenStack, KubeVirt/RHACM, or provider provisioning:** Kind-only tests with mocks cannot claim provider coverage.
