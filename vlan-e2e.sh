@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# OSAC-5530 AgentlessNet VirtualNetwork and Subnet E2E flow:
+# OSAC-5530/OSAC-6306 AgentlessNet VirtualNetwork, Subnet, and ExternalIPPool E2E flow:
 #   1. Boot or reuse the SNO with cluster-tool.
 #   2. Build and push runtime images when source inputs changed, or reuse their tags.
 #   3. Install or upgrade OSAC with those custom images.
@@ -8,6 +8,83 @@
 # the SNO or Containerlab topology.
 set -euo pipefail
 umask 077
+
+VLAN_E2E_SUITE="full"
+
+usage() {
+    cat <<'USAGE'
+Usage: bash ./vlan-e2e.sh [--suite SUITE]
+
+Suites:
+  full              Run the complete ExternalIPPool, VirtualNetwork, and Subnet/DHCP E2E (default).
+  virtual-network   Create, verify, and delete one VirtualNetwork.
+  subnet-dhcp       Create a parent VirtualNetwork and run the Subnet/DHCP E2E.
+  external-ip-pool  Create, verify, and delete one ExternalIPPool.
+
+All suites boot or reuse the SNO, prepare source-matched images, and install or
+upgrade OSAC before running the selected checks. The runner also corrects the
+known development database version marker to schema V1 before creating test
+resources. Keep the AgentlessNet state schema at V1 until OSAC-5528 is complete.
+
+Examples:
+  bash ./vlan-e2e.sh
+  bash ./vlan-e2e.sh --suite virtual-network
+  bash ./vlan-e2e.sh --suite subnet-dhcp
+  bash ./vlan-e2e.sh --suite external-ip-pool
+USAGE
+}
+
+argument_error() {
+    printf 'ERROR: %s\n' "$1" >&2
+    usage >&2
+    exit 2
+}
+
+SUITE_SELECTED=false
+while (($# > 0)); do
+    case "$1" in
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        --suite)
+            [[ "$SUITE_SELECTED" == false ]] || argument_error "--suite may be specified only once"
+            (($# >= 2)) || argument_error "--suite requires a value"
+            case "$2" in
+                full|virtual-network|subnet-dhcp|external-ip-pool)
+                    VLAN_E2E_SUITE="$2"
+                    ;;
+                *) argument_error "unsupported suite: $2" ;;
+            esac
+            SUITE_SELECTED=true
+            shift 2
+            ;;
+        *) argument_error "unexpected argument: $1" ;;
+    esac
+done
+
+case "$VLAN_E2E_SUITE" in
+    full)
+        SUITE_USES_VN=true
+        SUITE_USES_SUBNET_DHCP=true
+        SUITE_USES_POOL=true
+        ;;
+    virtual-network)
+        SUITE_USES_VN=true
+        SUITE_USES_SUBNET_DHCP=false
+        SUITE_USES_POOL=false
+        ;;
+    subnet-dhcp)
+        SUITE_USES_VN=true
+        SUITE_USES_SUBNET_DHCP=true
+        SUITE_USES_POOL=false
+        ;;
+    external-ip-pool)
+        SUITE_USES_VN=false
+        SUITE_USES_SUBNET_DHCP=false
+        SUITE_USES_POOL=true
+        ;;
+esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AAP_DIR="${REPO_ROOT}/osac-aap"
@@ -79,6 +156,8 @@ SUBNET_THREE_NAME="${SUBNET_THREE_NAME:-${VIRTUAL_NETWORK_NAME}-subnet-30}"
 SUBNET_ONE_IPV4_CIDR="${SUBNET_ONE_IPV4_CIDR:-}"
 SUBNET_TWO_IPV4_CIDR="${SUBNET_TWO_IPV4_CIDR:-}"
 SUBNET_THREE_IPV4_CIDR="${SUBNET_THREE_IPV4_CIDR:-}"
+EXTERNAL_IP_POOL_NAME="agentless-e2e-pool-$(date -u +%Y%m%d%H%M%S)-$$"
+EXTERNAL_IP_POOL_CIDR="198.51.100.0/24"
 
 CLI_BIN="${OSAC_CLI_BIN:-}"
 CLI_CONFIG_DIR="${OSAC_CLI_CONFIG_DIR:-}"
@@ -88,6 +167,12 @@ GENERATED_CLI_BIN=false
 GENERATED_CLI_CONFIG=false
 CREATED_IDS=()
 CREATED_SUBNET_IDS=()
+EXTERNAL_IP_POOL_ID=""
+EXTERNAL_IP_POOL_K8S_UID=""
+EXTERNAL_IP_POOL_INITIAL_ENTRY=""
+EXTERNAL_IP_POOL_CREATE_AAP_JOB_ID=""
+EXTERNAL_IP_POOL_DELETE_AAP_JOB_ID=""
+EXTERNAL_IP_POOL_PENDING_CLEANUP=false
 BASELINE_STATE_FILE=""
 CURRENT_STATE_FILE=""
 SWITCH_MANIFEST_FILE=""
@@ -137,6 +222,248 @@ require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Required command not fou
 
 label_selector() { printf 'osac.openshift.io/virtualnetwork-uuid=%s' "$1"; }
 subnet_label_selector() { printf 'osac.openshift.io/subnet-uuid=%s' "$1"; }
+external_ip_pool_label_selector() { printf 'osac.openshift.io/externalippool-uuid=%s' "$1"; }
+
+assert_provider_schema_v1() {
+    python3 - "$AAP_DIR/collections/ansible_collections/osac/templates/plugins/module_utils/agentless_net_state.py" <<'PY'
+import ast
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1])
+try:
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+except (OSError, SyntaxError) as error:
+    raise SystemExit(f"could not read the AgentlessNet state source: {error}") from error
+
+versions = []
+for node in tree.body:
+    if not isinstance(node, ast.Assign):
+        continue
+    if any(isinstance(target, ast.Name) and target.id == "SCHEMA_VERSION" for target in node.targets):
+        try:
+            versions.append(ast.literal_eval(node.value))
+        except (TypeError, ValueError) as error:
+            raise SystemExit("AgentlessNet SCHEMA_VERSION must be a literal integer") from error
+
+if versions != [1]:
+    raise SystemExit(f"AgentlessNet SCHEMA_VERSION must remain 1 until OSAC-5528 is complete; found {versions!r}")
+PY
+}
+
+# AgentlessNet schema remains V1 while OSAC-5528 is in progress. Extend V1
+# during this development period; the earlier V2 marker was accidental.
+repair_provider_schema_v1() {
+    local result_file="${TEMP_DIR}/schema-repair.json"
+    if ! docker exec -i "$CONTAINERLAB_NET_NODE" python3 - "$AGENTLESS_NET_STATE_FILE" \
+        >"$result_file" <<'PY_SCHEMA_REPAIR'
+import contextlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import sqlite3
+import stat
+import sys
+import time
+
+STATE_VN_COLUMNS = {
+    "uid", "tenant_id", "virtual_network_cidr", "namespace_name",
+    "namespace_interface", "host_interface", "transit_cidr",
+    "transit_start", "payload",
+}
+STATE_SUBNET_COLUMNS = {
+    "uid", "virtual_network_uid", "tenant_id", "vlan_id",
+    "vlan_interface", "ipv4_cidr", "phase", "payload",
+}
+STATE_POOL_COLUMNS = {
+    "uid", "fulfillment_id", "tenant_id", "ip_family", "ipv4_cidr",
+}
+CURRENT_TABLES = {"virtual_networks", "subnets", "external_ip_pools"}
+LEGACY_V1_TABLES = (
+    {"virtual_networks"},
+    {"virtual_networks", "subnets"},
+)
+KNOWN_ACCIDENTAL_V2_TABLES = {"virtual_networks", "subnets"}
+
+
+class RepairError(Exception):
+    pass
+
+
+@contextlib.contextmanager
+def database_lock(lock_path):
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        lock_fd = os.open(lock_path, flags, 0o600)
+    except OSError as error:
+        raise RepairError(f"could not open AgentlessNet database lock: {error}") from error
+    try:
+        lock_stat = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock_stat.st_mode):
+            raise RepairError("AgentlessNet database lock is not a regular file")
+        if lock_stat.st_uid != os.geteuid() or lock_stat.st_mode & 0o077:
+            raise RepairError("AgentlessNet database lock has unsafe owner or mode")
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RepairError("timed out waiting for the AgentlessNet database lock")
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(lock_fd)
+
+
+def table_names(connection):
+    return {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+
+
+def table_columns(connection, table):
+    return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
+def validate_known_columns(connection, tables):
+    expected = {
+        "virtual_networks": STATE_VN_COLUMNS,
+        "subnets": STATE_SUBNET_COLUMNS,
+        "external_ip_pools": STATE_POOL_COLUMNS,
+    }
+    for table in tables:
+        if table_columns(connection, table) != expected[table]:
+            raise RepairError(f"AgentlessNet {table} table has an unsupported V1 layout")
+
+
+def repair_database(database_path):
+    path = Path(database_path)
+    if path.is_symlink():
+        raise RepairError("AgentlessNet state path must not be a symlink")
+    if not path.exists():
+        return {"changed": False, "version": None}
+
+    with database_lock(f"{path}.lock"):
+        try:
+            state_fd = os.open(
+                path,
+                os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except OSError as error:
+            raise RepairError(f"could not safely open AgentlessNet state: {error}") from error
+
+        try:
+            state_stat = os.fstat(state_fd)
+            if not stat.S_ISREG(state_stat.st_mode):
+                raise RepairError("AgentlessNet state path is not a regular file")
+            if state_stat.st_uid != os.geteuid() or state_stat.st_mode & 0o077:
+                raise RepairError("AgentlessNet state file has unsafe owner or mode")
+
+            database_uri = path.resolve().as_uri() + "?mode=rw"
+            connection = sqlite3.connect(
+                database_uri,
+                uri=True,
+                timeout=60,
+                isolation_level=None,
+            )
+            try:
+                connection.execute("PRAGMA foreign_keys = ON")
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                tables = table_names(connection)
+
+                if version == 1:
+                    if tables not in (*LEGACY_V1_TABLES, CURRENT_TABLES):
+                        raise RepairError("AgentlessNet V1 database has an unsupported table set")
+                elif version == 2:
+                    if tables != KNOWN_ACCIDENTAL_V2_TABLES:
+                        raise RepairError("AgentlessNet V2 database is not the known accidental layout")
+                else:
+                    raise RepairError(f"unsupported AgentlessNet schema version: {version}")
+
+                if "virtual_networks" not in tables:
+                    raise RepairError("AgentlessNet state is missing its VirtualNetwork table")
+                validate_known_columns(connection, tables)
+
+                if version == 1 and tables == CURRENT_TABLES:
+                    return {"changed": False, "version": 1}
+
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    if "subnets" not in tables:
+                        connection.execute(
+                            """CREATE TABLE subnets (
+                                uid TEXT PRIMARY KEY,
+                                virtual_network_uid TEXT NOT NULL
+                                    REFERENCES virtual_networks(uid),
+                                tenant_id TEXT NOT NULL,
+                                vlan_id INTEGER NOT NULL UNIQUE,
+                                vlan_interface TEXT NOT NULL UNIQUE,
+                                ipv4_cidr TEXT NOT NULL,
+                                phase TEXT NOT NULL,
+                                payload TEXT NOT NULL
+                            )"""
+                        )
+                        connection.execute(
+                            "CREATE INDEX subnets_by_vn ON subnets(virtual_network_uid)"
+                        )
+                    if "external_ip_pools" not in tables:
+                        connection.execute(
+                            """CREATE TABLE external_ip_pools (
+                                uid TEXT NOT NULL PRIMARY KEY,
+                                fulfillment_id TEXT NOT NULL UNIQUE,
+                                tenant_id TEXT NOT NULL,
+                                ip_family TEXT NOT NULL,
+                                ipv4_cidr TEXT NOT NULL
+                            )"""
+                        )
+                    connection.execute("PRAGMA user_version = 1")
+                    if connection.execute("PRAGMA user_version").fetchone()[0] != 1:
+                        raise RepairError("AgentlessNet schema correction did not set version 1")
+                    if table_names(connection) != CURRENT_TABLES:
+                        raise RepairError("AgentlessNet schema correction did not create the V1 table set")
+                    validate_known_columns(connection, CURRENT_TABLES)
+                    connection.commit()
+                except BaseException:
+                    connection.rollback()
+                    raise
+                return {"changed": True, "version": 1}
+            except sqlite3.DatabaseError as error:
+                raise RepairError(f"could not correct AgentlessNet state schema: {error}") from error
+            finally:
+                connection.close()
+        finally:
+            os.close(state_fd)
+
+
+if __name__ == "__main__":
+    try:
+        result = repair_database(sys.argv[1])
+    except (OSError, RepairError) as error:
+        print(f"AgentlessNet schema correction failed: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+    print(json.dumps(result, sort_keys=True))
+PY_SCHEMA_REPAIR
+    then
+        cat "$result_file" >&2
+        die "Could not normalize the AgentlessNet database to schema V1"
+    fi
+    jq -e '.version == null or .version == 1' "$result_file" >/dev/null \
+        || die "The AgentlessNet schema correction returned an invalid result"
+    if [[ "$(jq -r '.changed' "$result_file")" == true ]]; then
+        info "Corrected the AgentlessNet development database to schema V1."
+    else
+        info "AgentlessNet database is already using schema V1."
+    fi
+}
 
 resolve_mgmt_network() {
     local network_xml network_info
@@ -1226,6 +1553,81 @@ ensure_osac_tenant() (
     fi
 )
 
+# Calls one private Fulfillment RPC. A fresh token and short-lived port-forward
+# are used for each call so the token cannot expire during the long VLAN run.
+external_ip_pool_rpc() (
+    local method="$1" request_file="$2" response_file="$3" error_file="$4"
+    local local_port="" port_forward_log="" port_forward_pid="" admin_token=""
+    local attempt
+
+    case "$method" in
+        Create|Get|Delete|List) ;;
+        *)
+            printf 'Unsupported ExternalIPPool RPC method: %s\n' "$method" >&2
+            return 1
+            ;;
+    esac
+    [[ -f "$request_file" && -d "$TEMP_DIR" ]] || {
+        printf 'ExternalIPPool RPC request or temporary directory is missing\n' >&2
+        return 1
+    }
+    : >"$response_file" || return 1
+    : >"$error_file" || return 1
+
+    local_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')" \
+        || return 1
+    port_forward_log="${TEMP_DIR}/external-ip-pool-${method}-port-forward.log"
+    cleanup_external_ip_pool_port_forward() {
+        if [[ -n "$port_forward_pid" ]]; then
+            kill "$port_forward_pid" >/dev/null 2>&1 || true
+            wait "$port_forward_pid" 2>/dev/null || true
+            port_forward_pid=""
+        fi
+    }
+    trap cleanup_external_ip_pool_port_forward EXIT
+
+    oc port-forward --address 127.0.0.1 service/fulfillment-internal-api \
+        "${local_port}:8001" -n "$OSAC_NAMESPACE" >"$port_forward_log" 2>&1 &
+    port_forward_pid=$!
+    for ((attempt = 1; attempt <= 30; attempt++)); do
+        if grep -Fq "Forwarding from 127.0.0.1:${local_port}" "$port_forward_log"; then
+            break
+        fi
+        if ! kill -0 "$port_forward_pid" 2>/dev/null; then
+            cat "$port_forward_log" >&2
+            return 1
+        fi
+        sleep 1
+    done
+    if ! grep -Fq "Forwarding from 127.0.0.1:${local_port}" "$port_forward_log"; then
+        cat "$port_forward_log" >&2
+        return 1
+    fi
+
+    admin_token="$(oc create token admin -n "$OSAC_NAMESPACE" --duration=10m)" || return 1
+    if grpcurl -insecure -connect-timeout 5 -max-time 20 -format json -format-error \
+        -H "authorization: Bearer ${admin_token}" -d @ \
+        "127.0.0.1:${local_port}" "osac.private.v1.ExternalIPPools/${method}" \
+        <"$request_file" >"$response_file" 2>"$error_file"; then
+        unset admin_token
+        return 0
+    fi
+    unset admin_token
+    return 1
+)
+
+external_ip_pool_rpc_error_is_not_found() {
+    local response_file
+    for response_file in "$@"; do
+        [[ -s "$response_file" ]] || continue
+        if jq -e '(.code | type == "number") and .code == 5' "$response_file" \
+            >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 virtual_network_cr_json() {
     local id="$1"
     local selector json
@@ -1268,6 +1670,34 @@ subnet_cr_json() {
             error("Subnet CR is outside the configured networking namespace")
           else $s end
       end' <<<"$json"
+}
+
+external_ip_pool_crs_json() {
+    local id="$1" selector json
+    selector="$(external_ip_pool_label_selector "$id")"
+    json="$(oc get externalippools -n "$NETWORKING_NAMESPACE" -l "$selector" \
+        -o json --request-timeout=20s)" || return 1
+    jq -ce --arg id "$id" --arg namespace "$NETWORKING_NAMESPACE" '
+      if (.items | type) != "array" then
+        error("ExternalIPPool list response has no items array")
+      elif any(.items[]; .metadata.namespace != $namespace
+               or .metadata.labels["osac.openshift.io/externalippool-uuid"] != $id) then
+        error("ExternalIPPool list contains a resource with mismatched identity")
+      else . end' <<<"$json"
+}
+
+external_ip_pool_validate_cr_identity() {
+    local cr_json="$1" id="$2"
+    jq -e --arg id "$id" --arg namespace "$NETWORKING_NAMESPACE" \
+        --arg cidr "$EXTERNAL_IP_POOL_CIDR" '
+      (.metadata.namespace == $namespace)
+      and (.metadata.labels["osac.openshift.io/externalippool-uuid"] == $id)
+      and (.metadata.annotations["osac.openshift.io/tenant"] == "shared")
+      and (.metadata.uid | type == "string"
+           and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))
+      and (.metadata.uid != $id)
+      and (.spec.ipFamily == "IPv4")
+      and (.spec.cidrs == [$cidr])' <<<"$cr_json" >/dev/null
 }
 
 wait_for_virtual_network_ready() {
@@ -1405,6 +1835,151 @@ wait_for_subnet_deleted() {
     die "Timed out waiting for Subnet UUID ${id} deletion"
 }
 
+wait_for_external_ip_pool_ready() {
+    local id="$1" deadline=$((SECONDS + 600))
+    local pool_crs pool_cr pool_count phase provision_job provision_job_id provision_state
+    local get_request get_response get_error pool_state
+    get_request="${TEMP_DIR}/external-ip-pool-get.request.json"
+    get_response="${TEMP_DIR}/external-ip-pool-get.response.json"
+    get_error="${TEMP_DIR}/external-ip-pool-get.error.json"
+    jq -n --arg id "$id" '{id: $id}' >"$get_request" \
+        || die "Could not write ExternalIPPool Get request"
+
+    info "Waiting for ExternalIPPool ${id} to become READY..."
+    while ((SECONDS < deadline)); do
+        if ! pool_crs="$(external_ip_pool_crs_json "$id")"; then
+            die "Kubernetes API failed while looking up ExternalIPPool UUID ${id}"
+        fi
+        pool_count="$(jq -er '.items | length' <<<"$pool_crs")" \
+            || die "Could not count ExternalIPPool CRs for UUID ${id}"
+        if [[ "$pool_count" -gt 1 ]]; then
+            die "Expected one ExternalIPPool CR for Fulfillment UUID ${id}; found ${pool_count}"
+        fi
+        if [[ "$pool_count" == 1 ]]; then
+            pool_cr="$(jq -c '.items[0]' <<<"$pool_crs")"
+            external_ip_pool_validate_cr_identity "$pool_cr" "$id" \
+                || die "ExternalIPPool CR identity or spec does not match Fulfillment UUID ${id}"
+            EXTERNAL_IP_POOL_K8S_UID="$(jq -er '.metadata.uid' <<<"$pool_cr")" \
+                || die "ExternalIPPool CR has no Kubernetes UID"
+            phase="$(jq -r '.status.phase // ""' <<<"$pool_cr")"
+            provision_job="$(jq -c '
+              [.status.provisioningJobs[]? | select(.type == "provision")]
+              | last // {}' <<<"$pool_cr")"
+            provision_job_id="$(jq -r '.jobID // ""' <<<"$provision_job")"
+            provision_state="$(jq -r '.state // ""' <<<"$provision_job")"
+            [[ -z "$provision_job_id" ]] \
+                || EXTERNAL_IP_POOL_CREATE_AAP_JOB_ID="$provision_job_id"
+            [[ "$phase" != Failed ]] \
+                || die "ExternalIPPool ${id} entered Failed phase"
+            [[ "$provision_state" != Failed && "$provision_state" != Canceled ]] \
+                || die "AAP provision job ${provision_job_id} ended in ${provision_state} for ExternalIPPool ${id}"
+
+            if [[ "$phase" == Ready && "$provision_state" == Succeeded \
+                && -n "$provision_job_id" ]]; then
+                jq -e '.metadata.annotations["osac.openshift.io/implementation-strategy"] == "agentless_net"' \
+                    <<<"$pool_cr" >/dev/null \
+                    || die "ExternalIPPool ${id} did not resolve to the AgentlessNet implementation"
+                if ! external_ip_pool_rpc Get "$get_request" "$get_response" "$get_error"; then
+                    cat "$get_error" >&2
+                    die "Fulfillment API failed while reading ExternalIPPool ${id} status"
+                fi
+                jq -e --arg id "$id" --arg cidr "$EXTERNAL_IP_POOL_CIDR" '
+                  .object.id == $id
+                  and .object.metadata.tenant == "shared"
+                  and .object.spec.ipFamily == "IP_FAMILY_IPV4"
+                  and .object.spec.cidrs == [$cidr]' \
+                    "$get_response" >/dev/null \
+                    || die "Fulfillment ExternalIPPool ${id} response has mismatched identity or spec"
+                pool_state="$(jq -r '.object.status.state // ""' "$get_response")"
+                case "$pool_state" in
+                    EXTERNAL_IP_POOL_STATE_READY)
+                        jq -e '((.object.status.allocated // 0 | tonumber) == 0)' \
+                            "$get_response" >/dev/null \
+                            || die "ExternalIPPool ${id} unexpectedly has allocated addresses"
+                        return 0
+                        ;;
+                    EXTERNAL_IP_POOL_STATE_FAILED|EXTERNAL_IP_POOL_STATE_DELETE_FAILED)
+                        die "Fulfillment ExternalIPPool ${id} entered ${pool_state}"
+                        ;;
+                esac
+            fi
+        fi
+        sleep 5
+    done
+    die "Timed out waiting for ExternalIPPool ${id} to become READY"
+}
+
+external_ip_pool_state_is_absent() {
+    local uid="$1" id="$2" snapshot
+    if ! snapshot="$(state_snapshot)"; then
+        printf 'Could not read AgentlessNet state while checking ExternalIPPool cleanup\n' >&2
+        return 1
+    fi
+    jq -e --arg uid "$uid" --arg id "$id" '
+      .schema_version == 1
+      and all(.external_ip_pools[]; .uid != $uid and .fulfillment_id != $id)' \
+        <<<"$snapshot" >/dev/null 2>&1
+}
+
+wait_for_external_ip_pool_removed() {
+    local id="$1" uid="$2" deadline=$((SECONDS + 600))
+    local pool_crs pool_cr pool_count deprovision_job deprovision_job_id deprovision_state
+    local get_request get_response get_error
+    get_request="${TEMP_DIR}/external-ip-pool-get.request.json"
+    get_response="${TEMP_DIR}/external-ip-pool-get.response.json"
+    get_error="${TEMP_DIR}/external-ip-pool-get.error.json"
+    jq -n --arg id "$id" '{id: $id}' >"$get_request" \
+        || { printf 'Could not write ExternalIPPool Get request\n' >&2; return 1; }
+
+    while ((SECONDS < deadline)); do
+        if ! pool_crs="$(external_ip_pool_crs_json "$id")"; then
+            printf 'Kubernetes API failed while checking ExternalIPPool UUID %s deletion\n' "$id" >&2
+            return 1
+        fi
+        if ! pool_count="$(jq -er '.items | length' <<<"$pool_crs")"; then
+            printf 'Could not count ExternalIPPool CRs for UUID %s\n' "$id" >&2
+            return 1
+        fi
+        if [[ "$pool_count" -gt 1 ]]; then
+            printf 'Found multiple ExternalIPPool CRs for UUID %s during deletion\n' "$id" >&2
+            return 1
+        fi
+        if [[ "$pool_count" == 1 ]]; then
+            pool_cr="$(jq -c '.items[0]' <<<"$pool_crs")"
+            if ! external_ip_pool_validate_cr_identity "$pool_cr" "$id"; then
+                printf 'ExternalIPPool CR identity changed during deletion of UUID %s\n' "$id" >&2
+                return 1
+            fi
+            deprovision_job="$(jq -c '
+              [.status.provisioningJobs[]? | select(.type == "deprovision")]
+              | last // {}' <<<"$pool_cr")"
+            deprovision_job_id="$(jq -r '.jobID // ""' <<<"$deprovision_job")"
+            deprovision_state="$(jq -r '.state // ""' <<<"$deprovision_job")"
+            [[ -z "$deprovision_job_id" ]] \
+                || EXTERNAL_IP_POOL_DELETE_AAP_JOB_ID="$deprovision_job_id"
+            if [[ "$deprovision_state" == Failed || "$deprovision_state" == Canceled ]]; then
+                printf 'AAP deprovision job %s ended in %s for ExternalIPPool %s\n' \
+                    "$deprovision_job_id" "$deprovision_state" "$id" >&2
+                return 1
+            fi
+        fi
+
+        if ! external_ip_pool_rpc Get "$get_request" "$get_response" "$get_error"; then
+            if ! external_ip_pool_rpc_error_is_not_found "$get_error" "$get_response"; then
+                cat "$get_error" >&2
+                printf 'Fulfillment API failed while checking ExternalIPPool UUID %s deletion\n' "$id" >&2
+                return 1
+            fi
+            if [[ "$pool_count" == 0 ]] && external_ip_pool_state_is_absent "$uid" "$id"; then
+                return 0
+            fi
+        fi
+        sleep 5
+    done
+    printf 'Timed out waiting for ExternalIPPool UUID %s and its provider state to be deleted\n' "$id" >&2
+    return 1
+}
+
 wait_for_aap_provision_success() {
     local fulfillment_id="$1" job_id="$2" cr_json job_state
     for ((attempt = 1; attempt <= 180; attempt++)); do
@@ -1456,9 +2031,95 @@ cleanup_created_subnets() {
     [[ "$test_subnets_clean" == true ]]
 }
 
+cleanup_created_external_ip_pool() {
+    [[ "$EXTERNAL_IP_POOL_PENDING_CLEANUP" == true ]] || return 0
+
+    local request_file="${TEMP_DIR}/external-ip-pool-cleanup.request.json"
+    local response_file="${TEMP_DIR}/external-ip-pool-cleanup.response.json"
+    local error_file="${TEMP_DIR}/external-ip-pool-cleanup.error.json"
+    local list_request="${TEMP_DIR}/external-ip-pool-list.request.json"
+    local list_response="${TEMP_DIR}/external-ip-pool-list.response.json"
+    local list_error="${TEMP_DIR}/external-ip-pool-list.error.json"
+    local list_json match_count recovered_id baseline_pools current_pools
+
+    info "Cleaning up the ExternalIPPool created by this run..."
+
+    if [[ -z "$EXTERNAL_IP_POOL_ID" ]]; then
+        jq -n --arg name "$EXTERNAL_IP_POOL_NAME" \
+            '{filter: ("this.metadata.name == \"" + $name + "\" && this.metadata.tenant == \"shared\"")} ' \
+            >"$list_request" || return 1
+        if ! external_ip_pool_rpc List "$list_request" "$list_response" "$list_error"; then
+            cat "$list_error" >&2
+            printf 'Could not recover the ExternalIPPool ID for cleanup\n' >&2
+            return 1
+        fi
+        if ! list_json="$(jq -ce '.items | if type == "array" then . else error("items is not an array") end' \
+            "$list_response")"; then
+            printf 'Private Fulfillment List returned an invalid ExternalIPPool response\n' >&2
+            return 1
+        fi
+        match_count="$(jq -er 'length' <<<"$list_json")" || return 1
+        if [[ "$match_count" -gt 1 ]]; then
+            printf 'Multiple pools use the generated ExternalIPPool name; preserving resources\n' >&2
+            return 1
+        fi
+        if [[ "$match_count" == 0 ]]; then
+            if ! current_pools="$(state_snapshot | jq -cS '.external_ip_pools')"; then
+                printf 'Could not verify ExternalIPPool provider state during recovery\n' >&2
+                return 1
+            fi
+            if ! baseline_pools="$(jq -cS '.external_ip_pools' "$BASELINE_STATE_FILE")"; then
+                printf 'Could not read the baseline ExternalIPPool state\n' >&2
+                return 1
+            fi
+            if [[ "$current_pools" != "$baseline_pools" ]]; then
+                printf 'ExternalIPPool state changed but its Fulfillment ID is unknown; preserving provider state\n' >&2
+                return 1
+            fi
+            EXTERNAL_IP_POOL_PENDING_CLEANUP=false
+            return 0
+        fi
+        recovered_id="$(jq -er --arg name "$EXTERNAL_IP_POOL_NAME" \
+            '.[0] | select(.metadata.name == $name and .metadata.tenant == "shared") | .id' \
+            <<<"$list_json")" || {
+            printf 'Private Fulfillment List returned a pool with unexpected ownership metadata\n' >&2
+            return 1
+        }
+        EXTERNAL_IP_POOL_ID="$recovered_id"
+    fi
+
+    jq -n --arg id "$EXTERNAL_IP_POOL_ID" '{id: $id}' >"$request_file" || return 1
+    if ! external_ip_pool_rpc Delete "$request_file" "$response_file" "$error_file"; then
+        if ! external_ip_pool_rpc_error_is_not_found "$error_file" "$response_file"; then
+            cat "$error_file" >&2
+            printf 'Private Fulfillment could not delete ExternalIPPool %s\n' \
+                "$EXTERNAL_IP_POOL_ID" >&2
+            return 1
+        fi
+    fi
+    if ! wait_for_external_ip_pool_removed "$EXTERNAL_IP_POOL_ID" \
+        "$EXTERNAL_IP_POOL_K8S_UID"; then
+        printf 'ExternalIPPool %s is not fully removed; preserving provider access for recovery\n' \
+            "$EXTERNAL_IP_POOL_ID" >&2
+        return 1
+    fi
+
+    if [[ -n "$EXTERNAL_IP_POOL_DELETE_AAP_JOB_ID" ]]; then
+        info "AAP ExternalIPPool delete job ID: ${EXTERNAL_IP_POOL_DELETE_AAP_JOB_ID}"
+    fi
+    EXTERNAL_IP_POOL_PENDING_CLEANUP=false
+    return 0
+}
+
 cleanup_created_virtual_networks() {
     local cleanup_incomplete=false
-    local test_vns_clean=true test_subnets_clean=true id selector current
+    local test_vns_clean=true test_subnets_clean=true test_external_ip_pool_clean=true
+    local id selector current
+    if ! cleanup_created_external_ip_pool; then
+        test_external_ip_pool_clean=false
+        printf 'ERROR: preserving the ExternalIPPool and provider access because pool cleanup is incomplete\n' >&2
+        cleanup_incomplete=true
+    fi
     if ! cleanup_created_subnets; then
         test_subnets_clean=false
         printf 'ERROR: test-owned Subnet cleanup is incomplete; preserving its provider and DHCP state for recovery\n' >&2
@@ -1494,7 +2155,8 @@ cleanup_created_virtual_networks() {
             test_vns_clean=false
         fi
     done
-    if [[ "$test_subnets_clean" == true && "$test_vns_clean" == true ]]; then
+    if [[ "$test_external_ip_pool_clean" == true && "$test_subnets_clean" == true \
+        && "$test_vns_clean" == true ]]; then
         if ! restore_dhcp_supervisor; then
             printf 'ERROR: could not stop the temporary DHCP Supervisor or remove its owned configuration\n' >&2
             cleanup_incomplete=true
@@ -1528,7 +2190,9 @@ cleanup_created_virtual_networks() {
             cleanup_incomplete=true
         fi
     else
-        if [[ "$test_subnets_clean" != true ]]; then
+        if [[ "$test_external_ip_pool_clean" != true ]]; then
+            printf 'ERROR: preserving AAP inventory and provider access because ExternalIPPool cleanup is incomplete\n' >&2
+        elif [[ "$test_subnets_clean" != true ]]; then
             printf 'ERROR: preserving VirtualNetwork and provider access because Subnet cleanup is incomplete\n' >&2
         else
             printf 'ERROR: test-owned VirtualNetwork cleanup is incomplete; the Containerlab fabric is retained for recovery\n' >&2
@@ -1589,11 +2253,13 @@ on_exit() {
     local provider_cleanup_allowed=true
     trap - EXIT
     set +e
-    if [[ "$VLAN_E2E_DEBUG" == true ]] && ! export_dhcp_debug_artifacts; then
+    if [[ "$SUITE_USES_SUBNET_DHCP" == true && "$VLAN_E2E_DEBUG" == true ]] \
+        && ! export_dhcp_debug_artifacts; then
         printf 'ERROR: could not preserve the requested DHCP debug artifacts\n' >&2
         cleanup_status=1
     fi
-    if declare -F cleanup_dhcp_clients_and_ports >/dev/null; then
+    if [[ "$SUITE_USES_SUBNET_DHCP" == true ]] \
+        && declare -F cleanup_dhcp_clients_and_ports >/dev/null; then
         if ! cleanup_dhcp_clients_and_ports; then
             printf 'ERROR: DHCP client or access-port cleanup is incomplete\n' >&2
             cleanup_status=1
@@ -1607,7 +2273,7 @@ on_exit() {
             cleanup_status=1
         fi
     else
-        printf 'ERROR: preserving test-owned Subnets, VirtualNetworks, AAP inventory, and provider access for recovery because client-link cleanup failed\n' >&2
+        printf 'ERROR: preserving the test-owned ExternalIPPool, Subnets, VirtualNetworks, AAP inventory, and provider access for recovery because client-link cleanup failed\n' >&2
     fi
     if [[ "$status" == 0 && "$cleanup_status" != 0 ]]; then
         status=1
@@ -1634,7 +2300,7 @@ for tool in cluster-tool virsh oc helm go jq python3 awk sed grep sort sleep mak
 done
 require_cmd "$CONTAINER_TOOL"
 require_cmd "$CONTAINERLAB"
-if [[ "$VLAN_E2E_DEBUG" == true ]]; then
+if [[ "$SUITE_USES_SUBNET_DHCP" == true && "$VLAN_E2E_DEBUG" == true ]]; then
     require_cmd tcpdump
     require_cmd nsenter
 fi
@@ -1643,7 +2309,8 @@ fi
     || die "OSAC_INSTALL_MODE must be auto, install, or upgrade"
 [[ "$VLAN_E2E_DEBUG" == true || "$VLAN_E2E_DEBUG" == false ]] \
     || die "VLAN_E2E_DEBUG must be true or false"
-if [[ "$VLAN_E2E_DEBUG" == true && -n "$VLAN_E2E_ARTIFACT_DIR" ]]; then
+if [[ "$SUITE_USES_SUBNET_DHCP" == true \
+    && "$VLAN_E2E_DEBUG" == true && -n "$VLAN_E2E_ARTIFACT_DIR" ]]; then
     [[ "$VLAN_E2E_ARTIFACT_DIR" =~ ^/[A-Za-z0-9_./-]+$ ]] \
         || die "VLAN_E2E_ARTIFACT_DIR must be an absolute path with safe path characters"
 fi
@@ -1662,25 +2329,39 @@ fi
     || die "AAP_PROJECT_EXPECTED_REVISION must be a full lowercase Git commit SHA"
 [[ "$AGENTLESS_NET_STATE_FILE" =~ ^/[A-Za-z0-9_./-]+$ ]] \
     || die "AGENTLESS_NET_STATE_FILE must be an absolute path with safe path characters"
-[[ "$VIRTUAL_NETWORK_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
-    || die "VIRTUAL_NETWORK_NAME must be a DNS label"
-[[ "$PEER_VIRTUAL_NETWORK_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
-    || die "PEER_VIRTUAL_NETWORK_NAME must be a DNS label"
-[[ "$SUBNET_ONE_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
-    || die "SUBNET_ONE_NAME must be a DNS label"
-[[ "$SUBNET_TWO_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
-    || die "SUBNET_TWO_NAME must be a DNS label"
-[[ "$SUBNET_THREE_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
-    || die "SUBNET_THREE_NAME must be a DNS label"
-[[ "$SUBNET_ONE_NAME" != "$SUBNET_TWO_NAME" && "$SUBNET_ONE_NAME" != "$SUBNET_THREE_NAME" \
-    && "$SUBNET_TWO_NAME" != "$SUBNET_THREE_NAME" ]] \
-    || die "All test Subnet names must be different"
 [[ "$OSAC_NAMESPACE" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
     || die "OSAC_NAMESPACE must be a DNS label"
-[[ "$OSAC_TENANT" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
-    || die "OSAC_TENANT must be a DNS label"
-python3 - "$VIRTUAL_NETWORK_IPV4_CIDR" "$SUBNET_ONE_IPV4_CIDR" \
-    "$SUBNET_TWO_IPV4_CIDR" "$SUBNET_THREE_IPV4_CIDR" <<'PY'
+if [[ "$SUITE_USES_VN" == true ]]; then
+    [[ "$VIRTUAL_NETWORK_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
+        || die "VIRTUAL_NETWORK_NAME must be a DNS label"
+    [[ "$OSAC_TENANT" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
+        || die "OSAC_TENANT must be a DNS label"
+fi
+if [[ "$VLAN_E2E_SUITE" == full ]]; then
+    [[ "$PEER_VIRTUAL_NETWORK_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
+        || die "PEER_VIRTUAL_NETWORK_NAME must be a DNS label"
+fi
+if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
+    [[ "$SUBNET_ONE_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
+        || die "SUBNET_ONE_NAME must be a DNS label"
+    [[ "$SUBNET_TWO_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
+        || die "SUBNET_TWO_NAME must be a DNS label"
+    [[ "$SUBNET_THREE_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
+        || die "SUBNET_THREE_NAME must be a DNS label"
+    [[ "$SUBNET_ONE_NAME" != "$SUBNET_TWO_NAME" && "$SUBNET_ONE_NAME" != "$SUBNET_THREE_NAME" \
+        && "$SUBNET_TWO_NAME" != "$SUBNET_THREE_NAME" ]] \
+        || die "All test Subnet names must be different"
+fi
+if [[ "$SUITE_USES_VN" == true ]]; then
+    SUBNET_CIDR_ARGUMENTS=("" "" "")
+    if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
+        SUBNET_CIDR_ARGUMENTS=(
+            "$SUBNET_ONE_IPV4_CIDR"
+            "$SUBNET_TWO_IPV4_CIDR"
+            "$SUBNET_THREE_IPV4_CIDR"
+        )
+    fi
+    python3 - "$VIRTUAL_NETWORK_IPV4_CIDR" "${SUBNET_CIDR_ARGUMENTS[@]}" <<'PY'
 import ipaddress
 import sys
 
@@ -1700,11 +2381,13 @@ for label, value in zip(("SUBNET_ONE_IPV4_CIDR", "SUBNET_TWO_IPV4_CIDR", "SUBNET
 if len(children) == 2 and children[0][1].overlaps(children[1][1]):
     raise SystemExit("SUBNET_ONE_IPV4_CIDR and SUBNET_TWO_IPV4_CIDR must not overlap")
 PY
+fi
+assert_provider_schema_v1 || die "The AgentlessNet provider schema must remain V1 until OSAC-5528 is complete"
 TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/osac-5530-vlan-e2e.XXXXXX")"
 BASELINE_STATE_FILE="${TEMP_DIR}/baseline-state.json"
 CURRENT_STATE_FILE="${TEMP_DIR}/current-state.json"
 SWITCH_MANIFEST_FILE="${TEMP_DIR}/switches.json"
-if [[ "$VLAN_E2E_DEBUG" == true ]]; then
+if [[ "$SUITE_USES_SUBNET_DHCP" == true && "$VLAN_E2E_DEBUG" == true ]]; then
     if [[ -z "$VLAN_E2E_ARTIFACT_DIR" ]]; then
         DEBUG_ARTIFACT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/osac-5530-dhcp-debug.XXXXXX")"
         DEBUG_ARTIFACT_DIR_GENERATED=true
@@ -1717,13 +2400,15 @@ if [[ "$VLAN_E2E_DEBUG" == true ]]; then
     chmod 0700 "$DEBUG_ARTIFACT_DIR"
     info "Opt-in DHCP traces and logs will be saved to ${DEBUG_ARTIFACT_DIR}"
 fi
-if [[ -z "$CLI_BIN" ]]; then
-    CLI_BIN="$(mktemp "${TMPDIR:-/tmp}/osac-5530-cli.XXXXXX")"
-    GENERATED_CLI_BIN=true
-fi
-if [[ -z "$CLI_CONFIG_DIR" ]]; then
-    CLI_CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/osac-5530-cli-config.XXXXXX")"
-    GENERATED_CLI_CONFIG=true
+if [[ "$SUITE_USES_VN" == true ]]; then
+    if [[ -z "$CLI_BIN" ]]; then
+        CLI_BIN="$(mktemp "${TMPDIR:-/tmp}/osac-5530-cli.XXXXXX")"
+        GENERATED_CLI_BIN=true
+    fi
+    if [[ -z "$CLI_CONFIG_DIR" ]]; then
+        CLI_CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/osac-5530-cli-config.XXXXXX")"
+        GENERATED_CLI_CONFIG=true
+    fi
 fi
 
 # Phase 1: boot or reuse the SNO with cluster-tool.
@@ -1893,44 +2578,44 @@ EXPECTED_AAP_BRANCH="${AAP_PROJECT_GIT_BRANCH:-$CURRENT_BRANCH}"
     || die "AAP project branch is ${AAP_BRANCH}; expected ${EXPECTED_AAP_BRANCH}. Update the existing AAP project before running this E2E."
 info "AAP project branch: ${AAP_BRANCH}"
 
-# Phase 4: run the VirtualNetwork and Subnet VLAN/DHCP E2E.
-# Phase 4a prepares AAP and the workspace's isolated network node/inventory.
-step "STEP 4 OF 4: Running the VirtualNetwork and Subnet E2E test"
+# Phase 4: prepare the provider and run the selected networking suite.
+step "STEP 4 OF 4: Running the ${VLAN_E2E_SUITE} E2E suite"
 sync_aap_project_revision
 configure_aap_execution_environment
 resolve_mgmt_network
 write_provider_inventory
 ensure_containerlab_net_node
 prepare_containerlab_net_node
-ensure_containerlab_switches
-prepare_containerlab_switches
-prepare_containerlab_dhcp_supervisor
+repair_provider_schema_v1
+if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
+    ensure_containerlab_switches
+    prepare_containerlab_switches
+    prepare_containerlab_dhcp_supervisor
+fi
 prepare_aap_networking_instance_group
 
-# Phase 4b builds a local CLI client and exercises the VN and Subnet lifecycles.
-# Coverage includes overlapping VN creates, VN and Subnet retries, internal VLAN
-# discovery, real DHCP clients, gateway/L2 traffic, service restart, /30 scope,
-# peer-preserving deletion, and restoration of the test access ports.
-# The CLI is a local binary, not another container image.
-info "Preparing a temporary CLI CA bundle and building the CLI from this checkout..."
-CLI_CA_FILE="$(mktemp "${TMPDIR:-/tmp}/osac-5530-ca.XXXXXX")"
-oc get configmap ca-bundle -n "$OSAC_NAMESPACE" \
-    -o jsonpath='{.data.bundle\.pem}' > "$CLI_CA_FILE"
-[[ -s "$CLI_CA_FILE" ]] || die "OSAC CA bundle is empty"
-(
-    cd "${REPO_ROOT}/fulfillment-service"
-    go build -o "$CLI_BIN" ./cmd/osac
-)
+if [[ "$SUITE_USES_VN" == true ]]; then
+    # The CLI is a local binary, not another container image.
+    info "Preparing a temporary CLI CA bundle and building the CLI from this checkout..."
+    CLI_CA_FILE="$(mktemp "${TMPDIR:-/tmp}/osac-5530-ca.XXXXXX")"
+    oc get configmap ca-bundle -n "$OSAC_NAMESPACE" \
+        -o jsonpath='{.data.bundle\.pem}' > "$CLI_CA_FILE"
+    [[ -s "$CLI_CA_FILE" ]] || die "OSAC CA bundle is empty"
+    (
+        cd "${REPO_ROOT}/fulfillment-service"
+        go build -o "$CLI_BIN" ./cmd/osac
+    )
 
-OSAC_API="https://fulfillment-api-${OSAC_NAMESPACE}.${CLUSTER_DOMAIN}"
-OSAC_TOKEN_SCRIPT="oc create token -n ${OSAC_NAMESPACE} ${OSAC_SERVICE_ACCOUNT} --duration=1h"
-"$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" login \
-    --ca-file "$CLI_CA_FILE" \
-    --token-script "$OSAC_TOKEN_SCRIPT" \
-    "$OSAC_API"
+    OSAC_API="https://fulfillment-api-${OSAC_NAMESPACE}.${CLUSTER_DOMAIN}"
+    OSAC_TOKEN_SCRIPT="oc create token -n ${OSAC_NAMESPACE} ${OSAC_SERVICE_ACCOUNT} --duration=1h"
+    "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" login \
+        --ca-file "$CLI_CA_FILE" \
+        --token-script "$OSAC_TOKEN_SCRIPT" \
+        "$OSAC_API"
 
-ensure_osac_tenant
-"$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" tenant "$OSAC_TENANT"
+    ensure_osac_tenant
+    "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" tenant "$OSAC_TENANT"
+fi
 
 netnode() {
     docker exec "$CONTAINERLAB_NET_NODE" "$@"
@@ -2949,7 +3634,12 @@ import sys
 
 path = pathlib.Path(sys.argv[1])
 if not path.exists():
-    print(json.dumps({"schema_version": 0, "virtual_networks": [], "subnets": []}, sort_keys=True))
+    print(json.dumps({
+        "schema_version": 0,
+        "virtual_networks": [],
+        "subnets": [],
+        "external_ip_pools": [],
+    }, sort_keys=True))
     raise SystemExit(0)
 expected_virtual_network_columns = {
     "uid", "tenant_id", "virtual_network_cidr", "namespace_name",
@@ -2960,62 +3650,89 @@ expected_subnet_columns = {
     "uid", "virtual_network_uid", "tenant_id", "vlan_id", "vlan_interface",
     "ipv4_cidr", "phase", "payload",
 }
+expected_external_ip_pool_columns = {
+    "uid", "fulfillment_id", "tenant_id", "ip_family", "ipv4_cidr",
+}
 connection = None
 try:
     connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=60)
+    connection.execute("BEGIN")
     tables = {
         row[0]
         for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
     version = connection.execute("PRAGMA user_version").fetchone()[0]
+    expected_tables = {"virtual_networks", "subnets", "external_ip_pools"}
+    if version != 1 or tables != expected_tables:
+        raise SystemExit("AgentlessNet SQLite state is incompatible with schema v1; preserving it")
+
     virtual_network_columns = {
         row[1]
         for row in connection.execute("PRAGMA table_info(virtual_networks)")
     }
-    if version == 1:
-        if tables != {"virtual_networks"} or virtual_network_columns != expected_virtual_network_columns:
-            raise SystemExit("AgentlessNet schema-v1 SQLite state is incompatible; preserving it")
-        subnet_entries = []
-    elif version == 2:
-        subnet_columns = {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(subnets)")
-        }
-        if (
-            tables != {"virtual_networks", "subnets"}
-            or virtual_network_columns != expected_virtual_network_columns
-            or subnet_columns != expected_subnet_columns
-        ):
-            raise SystemExit("AgentlessNet schema-v2 SQLite state is incompatible; preserving it")
-        subnet_entries = [
-            json.loads(row[0])
-            for row in connection.execute("SELECT payload FROM subnets ORDER BY uid")
-        ]
-    else:
-        raise SystemExit("AgentlessNet SQLite state has an incompatible schema; preserving it")
+    subnet_columns = {
+        row[1]
+        for row in connection.execute("PRAGMA table_info(subnets)")
+    }
+    external_ip_pool_columns = {
+        row[1]
+        for row in connection.execute("PRAGMA table_info(external_ip_pools)")
+    }
+    if (
+        virtual_network_columns != expected_virtual_network_columns
+        or subnet_columns != expected_subnet_columns
+        or external_ip_pool_columns != expected_external_ip_pool_columns
+    ):
+        raise SystemExit("AgentlessNet SQLite table definitions are incompatible with schema v1; preserving it")
+
+    subnet_entries = [
+        json.loads(row[0])
+        for row in connection.execute("SELECT payload FROM subnets ORDER BY uid")
+    ]
     entries = [
         json.loads(row[0])
         for row in connection.execute("SELECT payload FROM virtual_networks ORDER BY uid")
+    ]
+    external_ip_pool_entries = [
+        {
+            "uid": row[0],
+            "fulfillment_id": row[1],
+            "tenant_id": row[2],
+            "ip_family": row[3],
+            "ipv4_cidr": row[4],
+        }
+        for row in connection.execute(
+            """SELECT uid, fulfillment_id, tenant_id, ip_family, ipv4_cidr
+               FROM external_ip_pools ORDER BY uid"""
+        )
     ]
 except (OSError, sqlite3.DatabaseError, json.JSONDecodeError) as error:
     raise SystemExit("AgentlessNet SQLite state is unreadable; preserving it") from error
 finally:
     if connection is not None:
         connection.close()
-print(json.dumps({"schema_version": version, "virtual_networks": entries, "subnets": subnet_entries}, sort_keys=True))
+print(json.dumps({
+    "schema_version": version,
+    "virtual_networks": entries,
+    "subnets": subnet_entries,
+    "external_ip_pools": external_ip_pool_entries,
+}, sort_keys=True))
 PY
 }
 
 save_current_state() {
     state_snapshot > "$CURRENT_STATE_FILE"
-    jq -e '.schema_version == 2 and (.virtual_networks | type == "array") and (.subnets | type == "array")' \
+    jq -e '.schema_version == 1
+      and (.virtual_networks | type == "array")
+      and (.subnets | type == "array")
+      and (.external_ip_pools | type == "array")' \
         "$CURRENT_STATE_FILE" >/dev/null \
-        || die "AgentlessNet state is not a valid schema-v2 snapshot"
+        || die "AgentlessNet state is not a valid schema-v1 snapshot"
 }
 
 assert_baseline_state_unchanged() {
     local collection uid before after
-    for collection in virtual_networks subnets; do
+    for collection in virtual_networks subnets external_ip_pools; do
         while IFS= read -r uid; do
             [[ -n "$uid" ]] || continue
             before="$(jq -cS --arg uid "$uid" --arg collection "$collection" \
@@ -3043,6 +3760,15 @@ get_subnet_state_entry() {
     jq -ce --arg uid "$uid" '
       [.subnets[] | select(.uid == $uid)]
       | if length == 1 then .[0] else error("expected exactly one Subnet state entry for UID " + $uid) end' \
+      "$CURRENT_STATE_FILE"
+}
+
+get_external_ip_pool_state_entry() {
+    local uid="$1" fulfillment_id="$2"
+    save_current_state
+    jq -ceS --arg uid "$uid" --arg id "$fulfillment_id" '
+      [.external_ip_pools[] | select(.uid == $uid and .fulfillment_id == $id)]
+      | if length == 1 then .[0] else error("expected exactly one ExternalIPPool state entry") end' \
       "$CURRENT_STATE_FILE"
 }
 
@@ -3393,6 +4119,100 @@ delete_subnet_by_id() {
     done
 }
 
+create_external_ip_pool() {
+    local request_file="${TEMP_DIR}/external-ip-pool-create.request.json"
+    local response_file="${TEMP_DIR}/external-ip-pool-create.response.json"
+    local error_file="${TEMP_DIR}/external-ip-pool-create.error.json"
+    local list_request="${TEMP_DIR}/external-ip-pool-preflight.request.json"
+    local list_response="${TEMP_DIR}/external-ip-pool-preflight.response.json"
+    local list_error="${TEMP_DIR}/external-ip-pool-preflight.error.json"
+    local existing_count
+
+    jq -n --arg name "$EXTERNAL_IP_POOL_NAME" --arg cidr "$EXTERNAL_IP_POOL_CIDR" \
+        '{object:{metadata:{name:$name,tenant:"shared"},spec:{cidrs:[$cidr],ipFamily:"IP_FAMILY_IPV4"}}}' \
+        >"$request_file" || die "Could not write ExternalIPPool Create request"
+    jq -n --arg name "$EXTERNAL_IP_POOL_NAME" \
+        '{filter:("this.metadata.name == \"" + $name + "\" && this.metadata.tenant == \"shared\"")}' \
+        >"$list_request" || die "Could not write ExternalIPPool preflight List request"
+    if ! external_ip_pool_rpc List "$list_request" "$list_response" "$list_error"; then
+        cat "$list_error" >&2
+        die "Could not check whether the generated ExternalIPPool name is already in use"
+    fi
+    existing_count="$(jq -er '.items | length' "$list_response")" \
+        || die "Private Fulfillment List returned an invalid ExternalIPPool response"
+    [[ "$existing_count" == 0 ]] \
+        || die "Generated ExternalIPPool name ${EXTERNAL_IP_POOL_NAME} already exists"
+
+    EXTERNAL_IP_POOL_PENDING_CLEANUP=true
+    if ! external_ip_pool_rpc Create "$request_file" "$response_file" "$error_file"; then
+        cat "$error_file" >&2
+        die "Private Fulfillment could not create ExternalIPPool ${EXTERNAL_IP_POOL_NAME}"
+    fi
+    if ! EXTERNAL_IP_POOL_ID="$(jq -er --arg name "$EXTERNAL_IP_POOL_NAME" \
+        --arg cidr "$EXTERNAL_IP_POOL_CIDR" '
+        .object as $pool
+        | select($pool.metadata.name == $name
+            and $pool.metadata.tenant == "shared"
+            and $pool.spec.ipFamily == "IP_FAMILY_IPV4"
+            and $pool.spec.cidrs == [$cidr])
+        | $pool.id
+        | select(type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))' \
+        "$response_file")"; then
+        printf '%s\n' "$(cat "$response_file")" >&2
+        die "Fulfillment Create response did not contain a canonical ExternalIPPool UUID"
+    fi
+
+    printf 'ExternalIPPool Fulfillment UUID: %s\n' "$EXTERNAL_IP_POOL_ID"
+    wait_for_external_ip_pool_ready "$EXTERNAL_IP_POOL_ID"
+    [[ "$EXTERNAL_IP_POOL_K8S_UID" != "$EXTERNAL_IP_POOL_ID" ]] \
+        || die "ExternalIPPool Kubernetes UID and Fulfillment UUID unexpectedly match"
+    EXTERNAL_IP_POOL_INITIAL_ENTRY="$(get_external_ip_pool_state_entry \
+        "$EXTERNAL_IP_POOL_K8S_UID" "$EXTERNAL_IP_POOL_ID")"
+    jq -e --arg uid "$EXTERNAL_IP_POOL_K8S_UID" --arg id "$EXTERNAL_IP_POOL_ID" \
+        --arg cidr "$EXTERNAL_IP_POOL_CIDR" '
+      .uid == $uid
+      and .fulfillment_id == $id
+      and .tenant_id == "shared"
+      and .ip_family == "IPv4"
+      and .ipv4_cidr == $cidr' <<<"$EXTERNAL_IP_POOL_INITIAL_ENTRY" >/dev/null \
+        || die "Saved AgentlessNet ExternalIPPool identity does not match the CR"
+    [[ -n "$EXTERNAL_IP_POOL_CREATE_AAP_JOB_ID" ]] \
+        || die "No successful AAP provision job ID was recorded for ExternalIPPool ${EXTERNAL_IP_POOL_ID}"
+    info "ExternalIPPool ${EXTERNAL_IP_POOL_ID} is Ready; Kubernetes UID ${EXTERNAL_IP_POOL_K8S_UID}; AAP job ${EXTERNAL_IP_POOL_CREATE_AAP_JOB_ID}"
+    assert_baseline_state_unchanged
+}
+
+delete_external_ip_pool() {
+    local request_file="${TEMP_DIR}/external-ip-pool-delete.request.json"
+    local response_file="${TEMP_DIR}/external-ip-pool-delete.response.json"
+    local error_file="${TEMP_DIR}/external-ip-pool-delete.error.json"
+    local current_entry
+
+    [[ "$EXTERNAL_IP_POOL_PENDING_CLEANUP" == true \
+        && -n "$EXTERNAL_IP_POOL_ID" && -n "$EXTERNAL_IP_POOL_K8S_UID" ]] \
+        || die "ExternalIPPool test identity is incomplete before deletion"
+    current_entry="$(get_external_ip_pool_state_entry \
+        "$EXTERNAL_IP_POOL_K8S_UID" "$EXTERNAL_IP_POOL_ID")"
+    [[ "$current_entry" == "$EXTERNAL_IP_POOL_INITIAL_ENTRY" ]] \
+        || die "ExternalIPPool provider state changed during the VLAN/Subnet test"
+
+    jq -n --arg id "$EXTERNAL_IP_POOL_ID" '{id:$id}' >"$request_file" \
+        || die "Could not write ExternalIPPool Delete request"
+    if ! external_ip_pool_rpc Delete "$request_file" "$response_file" "$error_file"; then
+        if ! external_ip_pool_rpc_error_is_not_found "$error_file" "$response_file"; then
+            cat "$error_file" >&2
+            die "Private Fulfillment could not delete ExternalIPPool ${EXTERNAL_IP_POOL_ID}"
+        fi
+    fi
+    wait_for_external_ip_pool_removed "$EXTERNAL_IP_POOL_ID" "$EXTERNAL_IP_POOL_K8S_UID" \
+        || die "ExternalIPPool ${EXTERNAL_IP_POOL_ID} was not completely removed"
+    [[ -z "$EXTERNAL_IP_POOL_DELETE_AAP_JOB_ID" ]] \
+        || info "Observed ExternalIPPool AAP delete job ID: ${EXTERNAL_IP_POOL_DELETE_AAP_JOB_ID}"
+    EXTERNAL_IP_POOL_PENDING_CLEANUP=false
+    assert_baseline_state_unchanged
+    info "ExternalIPPool ${EXTERNAL_IP_POOL_ID} is absent from Fulfillment, Kubernetes, and AgentlessNet SQLite"
+}
+
 assert_uid_provider_state_absent() {
     local uid="$1" namespace_name="$2" host_interface="$3" namespace_list
     save_current_state
@@ -3517,114 +4337,63 @@ PY
     SUBNET_THREE_IPV4_CIDR="$subnet_output"
 }
 
-# Preserve the full pre-test JSON snapshot. Only the UIDs created by this run
-# are asserted or removed; any unrelated node state remains untouched.
-write_agentless_e2e_helpers
-HOST_IP_FORWARDING_BEFORE="$(netnode sysctl -n net.ipv4.ip_forward)"
-state_snapshot > "$BASELINE_STATE_FILE"
-jq -e '(.schema_version == 0 or .schema_version == 1 or .schema_version == 2)
-      and (.virtual_networks | type == "array") and (.subnets | type == "array")' \
-    "$BASELINE_STATE_FILE" >/dev/null \
-    || die "AgentlessNet state must be valid schema v1 or v2 before the test starts"
-
-info "Submitting two overlapping VirtualNetwork requests concurrently through Fulfillment..."
-CREATE_ONE_OUTPUT="${TEMP_DIR}/create-one.out"
-CREATE_TWO_OUTPUT="${TEMP_DIR}/create-two.out"
 create_virtual_network() {
-    local name="$1" output_file="$2" output id
-    if ! "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" \
+    local name="$1" output_file="$2" output id create_status=0
+    if "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" \
         create virtualnetwork --name "$name" --ipv4-cidr "$VIRTUAL_NETWORK_IPV4_CIDR" \
         > "$output_file" 2>&1; then
-        cat "$output_file" >&2
-        return 1
+        create_status=0
+    else
+        create_status=$?
     fi
-    cat "$output_file" >&2
-    output="$(cat "$output_file")"
+    cat "$output_file" >&2 || return 1
+    output="$(cat "$output_file")" || return 1
     id="$(sed -nE 's/.*\(ID: ([0-9a-f-]+)\).*/\1/p' <<<"$output" | tail -n 1)"
     [[ "$id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
         || { printf 'Could not parse Fulfillment UUID from CLI create output for %s\n' "$name" >&2; return 1; }
-    printf '%s\n' "$id" > "${output_file}.id"
+    printf '%s\n' "$id" > "${output_file}.id" || return 1
+    return "$create_status"
 }
-create_virtual_network "$VIRTUAL_NETWORK_NAME" "$CREATE_ONE_OUTPUT" &
-CREATE_ONE_PID=$!
-create_virtual_network "$PEER_VIRTUAL_NETWORK_NAME" "$CREATE_TWO_OUTPUT" &
-CREATE_TWO_PID=$!
-CREATE_ONE_STATUS=0
-CREATE_TWO_STATUS=0
-wait "$CREATE_ONE_PID" || CREATE_ONE_STATUS=$?
-wait "$CREATE_TWO_PID" || CREATE_TWO_STATUS=$?
-for id_file in "${CREATE_ONE_OUTPUT}.id" "${CREATE_TWO_OUTPUT}.id"; do
-    if [[ -s "$id_file" ]]; then
-        CREATED_IDS+=("$(cat "$id_file")")
+create_primary_virtual_network_for_suite() {
+    local output_file="$TEMP_DIR/create-primary-vn.out"
+    local create_status=0
+
+    if create_virtual_network "$VIRTUAL_NETWORK_NAME" "$output_file"; then
+        create_status=0
+    else
+        create_status=$?
     fi
-done
-[[ "$CREATE_ONE_STATUS" == 0 && "$CREATE_TWO_STATUS" == 0 ]] \
-    || die "One or both concurrent Fulfillment create requests failed"
-[[ "${#CREATED_IDS[@]}" == 2 ]] || die "Did not capture both test VirtualNetwork Fulfillment UUIDs"
-FIRST_FULFILLMENT_ID="$(cat "${CREATE_ONE_OUTPUT}.id")"
-SECOND_FULFILLMENT_ID="$(cat "${CREATE_TWO_OUTPUT}.id")"
-[[ "$FIRST_FULFILLMENT_ID" != "$SECOND_FULFILLMENT_ID" ]] \
-    || die "Fulfillment returned the same UUID for both VirtualNetwork requests"
+    if [[ -s "$output_file.id" ]]; then
+        FIRST_FULFILLMENT_ID="$(<"$output_file.id")"
+        CREATED_IDS+=("$FIRST_FULFILLMENT_ID")
+    fi
+    [[ "$create_status" == 0 ]] || die "Could not create test VirtualNetwork $VIRTUAL_NETWORK_NAME"
+    [[ "$FIRST_FULFILLMENT_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+        || die "VirtualNetwork creation did not return a valid Fulfillment UUID"
 
-wait_for_virtual_network_ready "$FIRST_FULFILLMENT_ID"
-wait_for_virtual_network_ready "$SECOND_FULFILLMENT_ID"
-FIRST_CR="$(virtual_network_cr_json "$FIRST_FULFILLMENT_ID")"
-SECOND_CR="$(virtual_network_cr_json "$SECOND_FULFILLMENT_ID")"
-FIRST_K8S_UID="$(jq -r '.metadata.uid' <<<"$FIRST_CR")"
-SECOND_K8S_UID="$(jq -r '.metadata.uid' <<<"$SECOND_CR")"
-FIRST_AAP_JOB_ID="$(jq -er '.status.provisioningJobs | map(.jobID // empty) | last' <<<"$FIRST_CR")"
-SECOND_AAP_JOB_ID="$(jq -er '.status.provisioningJobs | map(.jobID // empty) | last' <<<"$SECOND_CR")"
-info "AAP create job IDs: ${FIRST_AAP_JOB_ID}, ${SECOND_AAP_JOB_ID}"
-printf 'create Fulfillment UUIDs: %s %s\n' "$FIRST_FULFILLMENT_ID" "$SECOND_FULFILLMENT_ID"
-printf 'create Kubernetes UIDs: %s %s\n' "$FIRST_K8S_UID" "$SECOND_K8S_UID"
-printf 'create AAP job IDs: %s %s\n' "$FIRST_AAP_JOB_ID" "$SECOND_AAP_JOB_ID"
-
-info "Checking exact /31 endpoints, namespace gateway reachability, and host forwarding rules..."
-assert_virtual_network_state "$FIRST_FULFILLMENT_ID" "$VIRTUAL_NETWORK_IPV4_CIDR" "$SECOND_FULFILLMENT_ID"
-assert_virtual_network_state "$SECOND_FULFILLMENT_ID" "$VIRTUAL_NETWORK_IPV4_CIDR" "$FIRST_FULFILLMENT_ID"
-assert_private_vn_isolation "$FIRST_FULFILLMENT_ID" "$SECOND_FULFILLMENT_ID"
-save_current_state
-assert_baseline_state_unchanged
-
-FIRST_ENTRY_BEFORE_REHYDRATE="$(get_state_entry "$FIRST_K8S_UID" | jq -cS '.')"
-FIRST_JOB_BEFORE_REHYDRATE="$FIRST_AAP_JOB_ID"
-FIRST_CR_NAME="$(jq -r '.metadata.name' <<<"$FIRST_CR")"
-FIRST_NAMESPACE_NAME="$(jq -r '.namespace_name' <<<"$(get_state_entry "$FIRST_K8S_UID")")"
-FIRST_HOST_INTERFACE="$(jq -r '.uplink.host_interface' <<<"$(get_state_entry "$FIRST_K8S_UID")")"
-info "Removing only the first test UID's transient namespace and uplink, then resetting its operator job history to exercise AAP rehydration..."
-netnode ip netns delete "$FIRST_NAMESPACE_NAME"
-# Deleting a network namespace can remove the host side of its veth pair too.
-if netnode ip link show dev "$FIRST_HOST_INTERFACE" >/dev/null 2>&1; then
-    netnode ip link delete dev "$FIRST_HOST_INTERFACE"
-fi
-save_current_state
-[[ "$(jq -cS --arg uid "$FIRST_K8S_UID" '.virtual_networks[] | select(.uid == $uid)' "$CURRENT_STATE_FILE")" == "$FIRST_ENTRY_BEFORE_REHYDRATE" ]] \
-    || die "Removing runtime objects changed the persisted UID allocation"
-oc patch virtualnetwork "$FIRST_CR_NAME" -n "$NETWORKING_NAMESPACE" --subresource=status \
-    --type=merge -p '{"status":{"phase":"Progressing","conditions":[],"provisioningJobs":[]}}' >/dev/null
-
-REHYDRATED=false
-for ((attempt = 1; attempt <= 120; attempt++)); do
+    wait_for_virtual_network_ready "$FIRST_FULFILLMENT_ID"
     FIRST_CR="$(virtual_network_cr_json "$FIRST_FULFILLMENT_ID")"
-    FIRST_AAP_JOB_ID="$(jq -r '.status.provisioningJobs | map(.jobID // empty) | last // ""' <<<"$FIRST_CR")"
-    if [[ -n "$FIRST_AAP_JOB_ID" && "$FIRST_AAP_JOB_ID" != "$FIRST_JOB_BEFORE_REHYDRATE" ]]; then
-        REHYDRATED=true
-        break
-    fi
-    sleep 2
-done
-[[ "$REHYDRATED" == true ]] \
-    || die "Operator did not trigger a second AAP job for the same Kubernetes UID"
-info "Rehydration AAP job ID: ${FIRST_AAP_JOB_ID}"
-wait_for_aap_provision_success "$FIRST_FULFILLMENT_ID" "$FIRST_AAP_JOB_ID"
-wait_for_virtual_network_ready "$FIRST_FULFILLMENT_ID"
-[[ "$(get_state_entry "$FIRST_K8S_UID" | jq -cS '.')" == "$FIRST_ENTRY_BEFORE_REHYDRATE" ]] \
-    || die "AAP retry allocated a different transit link or changed the UID mapping"
-assert_virtual_network_state "$FIRST_FULFILLMENT_ID" "$VIRTUAL_NETWORK_IPV4_CIDR" "$SECOND_FULFILLMENT_ID"
-assert_private_vn_isolation "$FIRST_FULFILLMENT_ID" "$SECOND_FULFILLMENT_ID"
-save_current_state
-assert_baseline_state_unchanged
+    FIRST_K8S_UID="$(jq -er '.metadata.uid' <<<"$FIRST_CR")"
+    FIRST_AAP_JOB_ID="$(jq -er '.status.provisioningJobs | map(.jobID // empty) | last' <<<"$FIRST_CR")"
+    wait_for_aap_provision_success "$FIRST_FULFILLMENT_ID" "$FIRST_AAP_JOB_ID"
+    FIRST_ENTRY="$(get_state_entry "$FIRST_K8S_UID")"
+    FIRST_NAMESPACE_NAME="$(jq -r '.namespace_name' <<<"$FIRST_ENTRY")"
+    FIRST_HOST_INTERFACE="$(jq -r '.uplink.host_interface' <<<"$FIRST_ENTRY")"
+    assert_virtual_network_state "$FIRST_FULFILLMENT_ID" "$VIRTUAL_NETWORK_IPV4_CIDR"
+    save_current_state
+    assert_baseline_state_unchanged
+}
 
+delete_primary_virtual_network_for_suite() {
+    delete_virtual_network_by_id "$FIRST_FULFILLMENT_ID"
+    printf 'delete AAP job ID (test VN): %s\n' "$LAST_DELETE_AAP_JOB_ID"
+    assert_uid_provider_state_absent \
+        "$FIRST_K8S_UID" "$FIRST_NAMESPACE_NAME" "$FIRST_HOST_INTERFACE"
+    save_current_state
+    assert_baseline_state_unchanged
+}
+
+run_subnet_dhcp_checks() {
 info "Snapshotting existing switch VLAN memberships and reserved ranges before creating sibling Subnets..."
 FIRST_ENTRY="$(get_state_entry "$FIRST_K8S_UID")"
 FIRST_TRANSIT_CIDR="$(jq -r '.transit.cidr' <<<"$FIRST_ENTRY")"
@@ -3830,7 +4599,95 @@ netnode test ! -e "/etc/agentless-net/dhcp/${FIRST_K8S_UID}/dnsmasq.conf" \
     || die "Combined DHCP configuration remains after the VirtualNetwork's last Subnet was deleted"
 save_current_state
 assert_baseline_state_unchanged
+}
 
+run_full_suite() {
+info "Creating and verifying one shared IPv4 ExternalIPPool through Fulfillment..."
+create_external_ip_pool
+
+info "Submitting two overlapping VirtualNetwork requests concurrently through Fulfillment..."
+CREATE_ONE_OUTPUT="${TEMP_DIR}/create-one.out"
+CREATE_TWO_OUTPUT="${TEMP_DIR}/create-two.out"
+create_virtual_network "$VIRTUAL_NETWORK_NAME" "$CREATE_ONE_OUTPUT" &
+CREATE_ONE_PID=$!
+create_virtual_network "$PEER_VIRTUAL_NETWORK_NAME" "$CREATE_TWO_OUTPUT" &
+CREATE_TWO_PID=$!
+CREATE_ONE_STATUS=0
+CREATE_TWO_STATUS=0
+wait "$CREATE_ONE_PID" || CREATE_ONE_STATUS=$?
+wait "$CREATE_TWO_PID" || CREATE_TWO_STATUS=$?
+for id_file in "${CREATE_ONE_OUTPUT}.id" "${CREATE_TWO_OUTPUT}.id"; do
+    if [[ -s "$id_file" ]]; then
+        CREATED_IDS+=("$(cat "$id_file")")
+    fi
+done
+[[ "$CREATE_ONE_STATUS" == 0 && "$CREATE_TWO_STATUS" == 0 ]] \
+    || die "One or both concurrent Fulfillment create requests failed"
+[[ "${#CREATED_IDS[@]}" == 2 ]] || die "Did not capture both test VirtualNetwork Fulfillment UUIDs"
+FIRST_FULFILLMENT_ID="$(cat "${CREATE_ONE_OUTPUT}.id")"
+SECOND_FULFILLMENT_ID="$(cat "${CREATE_TWO_OUTPUT}.id")"
+[[ "$FIRST_FULFILLMENT_ID" != "$SECOND_FULFILLMENT_ID" ]] \
+    || die "Fulfillment returned the same UUID for both VirtualNetwork requests"
+
+wait_for_virtual_network_ready "$FIRST_FULFILLMENT_ID"
+wait_for_virtual_network_ready "$SECOND_FULFILLMENT_ID"
+FIRST_CR="$(virtual_network_cr_json "$FIRST_FULFILLMENT_ID")"
+SECOND_CR="$(virtual_network_cr_json "$SECOND_FULFILLMENT_ID")"
+FIRST_K8S_UID="$(jq -r '.metadata.uid' <<<"$FIRST_CR")"
+SECOND_K8S_UID="$(jq -r '.metadata.uid' <<<"$SECOND_CR")"
+FIRST_AAP_JOB_ID="$(jq -er '.status.provisioningJobs | map(.jobID // empty) | last' <<<"$FIRST_CR")"
+SECOND_AAP_JOB_ID="$(jq -er '.status.provisioningJobs | map(.jobID // empty) | last' <<<"$SECOND_CR")"
+info "AAP create job IDs: ${FIRST_AAP_JOB_ID}, ${SECOND_AAP_JOB_ID}"
+printf 'create Fulfillment UUIDs: %s %s\n' "$FIRST_FULFILLMENT_ID" "$SECOND_FULFILLMENT_ID"
+printf 'create Kubernetes UIDs: %s %s\n' "$FIRST_K8S_UID" "$SECOND_K8S_UID"
+printf 'create AAP job IDs: %s %s\n' "$FIRST_AAP_JOB_ID" "$SECOND_AAP_JOB_ID"
+
+info "Checking exact /31 endpoints, namespace gateway reachability, and host forwarding rules..."
+assert_virtual_network_state "$FIRST_FULFILLMENT_ID" "$VIRTUAL_NETWORK_IPV4_CIDR" "$SECOND_FULFILLMENT_ID"
+assert_virtual_network_state "$SECOND_FULFILLMENT_ID" "$VIRTUAL_NETWORK_IPV4_CIDR" "$FIRST_FULFILLMENT_ID"
+assert_private_vn_isolation "$FIRST_FULFILLMENT_ID" "$SECOND_FULFILLMENT_ID"
+save_current_state
+assert_baseline_state_unchanged
+
+FIRST_ENTRY_BEFORE_REHYDRATE="$(get_state_entry "$FIRST_K8S_UID" | jq -cS '.')"
+FIRST_JOB_BEFORE_REHYDRATE="$FIRST_AAP_JOB_ID"
+FIRST_CR_NAME="$(jq -r '.metadata.name' <<<"$FIRST_CR")"
+FIRST_NAMESPACE_NAME="$(jq -r '.namespace_name' <<<"$(get_state_entry "$FIRST_K8S_UID")")"
+FIRST_HOST_INTERFACE="$(jq -r '.uplink.host_interface' <<<"$(get_state_entry "$FIRST_K8S_UID")")"
+info "Removing only the first test UID's transient namespace and uplink, then resetting its operator job history to exercise AAP rehydration..."
+netnode ip netns delete "$FIRST_NAMESPACE_NAME"
+# Deleting a network namespace can remove the host side of its veth pair too.
+if netnode ip link show dev "$FIRST_HOST_INTERFACE" >/dev/null 2>&1; then
+    netnode ip link delete dev "$FIRST_HOST_INTERFACE"
+fi
+save_current_state
+[[ "$(jq -cS --arg uid "$FIRST_K8S_UID" '.virtual_networks[] | select(.uid == $uid)' "$CURRENT_STATE_FILE")" == "$FIRST_ENTRY_BEFORE_REHYDRATE" ]] \
+    || die "Removing runtime objects changed the persisted UID allocation"
+oc patch virtualnetwork "$FIRST_CR_NAME" -n "$NETWORKING_NAMESPACE" --subresource=status \
+    --type=merge -p '{"status":{"phase":"Progressing","conditions":[],"provisioningJobs":[]}}' >/dev/null
+
+REHYDRATED=false
+for ((attempt = 1; attempt <= 120; attempt++)); do
+    FIRST_CR="$(virtual_network_cr_json "$FIRST_FULFILLMENT_ID")"
+    FIRST_AAP_JOB_ID="$(jq -r '.status.provisioningJobs | map(.jobID // empty) | last // ""' <<<"$FIRST_CR")"
+    if [[ -n "$FIRST_AAP_JOB_ID" && "$FIRST_AAP_JOB_ID" != "$FIRST_JOB_BEFORE_REHYDRATE" ]]; then
+        REHYDRATED=true
+        break
+    fi
+    sleep 2
+done
+[[ "$REHYDRATED" == true ]] \
+    || die "Operator did not trigger a second AAP job for the same Kubernetes UID"
+info "Rehydration AAP job ID: ${FIRST_AAP_JOB_ID}"
+wait_for_aap_provision_success "$FIRST_FULFILLMENT_ID" "$FIRST_AAP_JOB_ID"
+wait_for_virtual_network_ready "$FIRST_FULFILLMENT_ID"
+[[ "$(get_state_entry "$FIRST_K8S_UID" | jq -cS '.')" == "$FIRST_ENTRY_BEFORE_REHYDRATE" ]] \
+    || die "AAP retry allocated a different transit link or changed the UID mapping"
+assert_virtual_network_state "$FIRST_FULFILLMENT_ID" "$VIRTUAL_NETWORK_IPV4_CIDR" "$SECOND_FULFILLMENT_ID"
+assert_private_vn_isolation "$FIRST_FULFILLMENT_ID" "$SECOND_FULFILLMENT_ID"
+save_current_state
+assert_baseline_state_unchanged
+    run_subnet_dhcp_checks
 info "Deleting the first test VirtualNetwork and verifying its peer remains provisioned..."
 FIRST_PEER_ENTRY="$(get_state_entry "$SECOND_K8S_UID" | jq -cS '.')"
 delete_virtual_network_by_id "$FIRST_FULFILLMENT_ID"
@@ -3852,10 +4709,78 @@ printf 'delete AAP job ID (peer VN): %s\n' "$SECOND_DELETE_AAP_JOB_ID"
 assert_uid_provider_state_absent "$SECOND_K8S_UID" "$SECOND_NAMESPACE_NAME" "$SECOND_HOST_INTERFACE"
 save_current_state
 assert_baseline_state_unchanged
+
+EXTERNAL_IP_POOL_ENTRY_AFTER_VN_DELETE="$(get_external_ip_pool_state_entry \
+    "$EXTERNAL_IP_POOL_K8S_UID" "$EXTERNAL_IP_POOL_ID")"
+[[ "$EXTERNAL_IP_POOL_ENTRY_AFTER_VN_DELETE" == "$EXTERNAL_IP_POOL_INITIAL_ENTRY" ]] \
+    || die "VirtualNetwork and Subnet deletion altered ExternalIPPool provider state"
+info "Deleting the test-owned ExternalIPPool through Fulfillment and verifying provider cleanup..."
+delete_external_ip_pool
+save_current_state
+assert_baseline_state_unchanged
+}
+
+run_virtual_network_suite() {
+    create_primary_virtual_network_for_suite
+    delete_primary_virtual_network_for_suite
+}
+
+run_subnet_dhcp_suite() {
+    create_primary_virtual_network_for_suite
+    run_subnet_dhcp_checks
+    delete_primary_virtual_network_for_suite
+}
+
+run_external_ip_pool_suite() {
+    info "Creating and verifying one shared IPv4 ExternalIPPool through Fulfillment..."
+    create_external_ip_pool
+    info "Deleting the test-owned ExternalIPPool through Fulfillment and verifying provider cleanup..."
+    delete_external_ip_pool
+    save_current_state
+    assert_baseline_state_unchanged
+}
+
+# Preserve the full pre-test JSON snapshot. Only the UIDs created by this run
+# are asserted or removed; any unrelated node state remains untouched.
+if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
+    write_agentless_e2e_helpers
+fi
+HOST_IP_FORWARDING_BEFORE="$(netnode sysctl -n net.ipv4.ip_forward)"
+state_snapshot > "$BASELINE_STATE_FILE"
+jq -e '(.schema_version == 0 or .schema_version == 1)
+      and (.virtual_networks | type == "array")
+      and (.subnets | type == "array")
+      and (.external_ip_pools | type == "array")' \
+    "$BASELINE_STATE_FILE" >/dev/null \
+    || die "AgentlessNet state must be empty or use the current schema v1 before the test starts"
+
+
+case "$VLAN_E2E_SUITE" in
+    full) run_full_suite ;;
+    virtual-network) run_virtual_network_suite ;;
+    subnet-dhcp) run_subnet_dhcp_suite ;;
+    external-ip-pool) run_external_ip_pool_suite ;;
+esac
+
 HOST_IP_FORWARDING_AFTER="$(netnode sysctl -n net.ipv4.ip_forward)"
 [[ "$HOST_IP_FORWARDING_AFTER" == "$HOST_IP_FORWARDING_BEFORE" ]] \
     || die "The AgentlessNet operations changed the test node's forwarding sysctl"
 
-cleanup_dhcp_clients_and_ports \
-    || die "Could not remove run-owned DHCP client containers or restore access-port snapshots"
-info "Existing-lab AgentlessNet E2E passed: overlapping VirtualNetworks, VN and Subnet retries, internal VLAN exclusion, real DHCP clients and leases, gateway and same-Subnet L2 traffic across leaves, DHCP service restart, /30 lease, peer-preserving lifecycle, and client/port cleanup."
+if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
+    cleanup_dhcp_clients_and_ports \
+        || die "Could not remove run-owned DHCP client containers or restore access-port snapshots"
+fi
+case "$VLAN_E2E_SUITE" in
+    full)
+        info "Existing-lab AgentlessNet E2E passed: ExternalIPPool create/delete, overlapping VirtualNetworks, VN and Subnet retries, internal VLAN exclusion, real DHCP clients and leases, gateway and same-Subnet L2 traffic across leaves, DHCP service restart, /30 lease, peer-preserving lifecycle, and client/port cleanup."
+        ;;
+    virtual-network)
+        info "VirtualNetwork-only E2E passed: one VN was created, verified, deleted, and cleaned up."
+        ;;
+    subnet-dhcp)
+        info "Subnet/DHCP-only E2E passed: Subnet, retry, DHCP client, /30, and temporary parent VN cleanup checks passed."
+        ;;
+    external-ip-pool)
+        info "ExternalIPPool-only E2E passed: one pool was created, verified, deleted, and cleaned up."
+        ;;
+esac
