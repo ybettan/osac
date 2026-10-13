@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# OSAC-5530/OSAC-6306 AgentlessNet VirtualNetwork, Subnet, and ExternalIPPool E2E flow:
+# OSAC-5528/OSAC-5530/OSAC-6306 AgentlessNet development lab:
 #   1. Boot or reuse the SNO with cluster-tool.
 #   2. Build and push runtime images when source inputs changed, or reuse their tags.
 #   3. Install or upgrade OSAC with those custom images.
-#   4. Run the AgentlessNet lifecycle with real DHCP clients and traffic checks.
+#   4. Deploy or reuse the Containerlab fabric and initialize its declared trunks.
+#   5. Run the selected AgentlessNet developer suite.
 # Existing clusters and OSAC releases are reused; this script never destroys
 # the SNO or Containerlab topology.
 set -euo pipefail
@@ -21,10 +22,11 @@ Suites:
   subnet-dhcp       Create a parent VirtualNetwork and run the Subnet/DHCP E2E.
   external-ip-pool  Create, verify, and delete one ExternalIPPool.
 
-All suites boot or reuse the SNO, prepare source-matched images, and install or
-upgrade OSAC before running the selected checks. The runner also corrects the
-known development database version marker to schema V1 before creating test
-resources. Keep the AgentlessNet state schema at V1 until OSAC-5528 is complete.
+All suites boot or reuse the SNO, prepare source-matched images, install or
+upgrade OSAC, and initialize the Containerlab fabric before running the
+selected checks. The runner also corrects the known development database
+version marker to schema V1 before creating test resources. Keep the
+AgentlessNet state schema at V1 until OSAC-5528 is complete.
 
 Examples:
   bash ./vlan-e2e.sh
@@ -89,9 +91,10 @@ esac
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AAP_DIR="${REPO_ROOT}/osac-aap"
 INSTALLER_DIR="${REPO_ROOT}/osac-installer"
-WORKSPACE_DIR="${REPO_ROOT}/../osac-workspace"
-CONTAINERLAB_TOPOLOGY="${WORKSPACE_DIR}/agentless-net-lab.clab.yml"
-CONTAINERLAB_INVENTORY="${WORKSPACE_DIR}/ansible/inventory.yml"
+FABRIC_DIR="${REPO_ROOT}/tests/e2e/agentless_net/lab"
+CONTAINERLAB_TOPOLOGY="${FABRIC_DIR}/agentless-net-lab.clab.yml"
+CONTAINERLAB_INVENTORY="${FABRIC_DIR}/inventory.yml"
+CONTAINERLAB_CONFIGURE_PLAYBOOK="${FABRIC_DIR}/configure_network.yml"
 CONTAINERLAB_NAME="agentless-net-lab"
 CONTAINERLAB_PREFIX="clab-${CONTAINERLAB_NAME}"
 CONTAINERLAB_NET_NODE="${CONTAINERLAB_PREFIX}-net-node"
@@ -481,7 +484,7 @@ gateway = ipaddress.IPv4Address(node.attrib["address"])
 network_prefix = node.attrib.get("prefix", node.attrib.get("netmask", "24"))
 network = ipaddress.IPv4Network(str(gateway) + "/" + network_prefix, strict=False)
 if network.prefixlen != 24:
-    raise SystemExit("the workspace Containerlab management network requires an IPv4 /24")
+    raise SystemExit("the Containerlab management network requires an IPv4 /24")
 prefix = ".".join(str(gateway).split(".")[:3])
 dhcp = node.find("dhcp")
 ranges = [] if dhcp is None else [item.attrib["start"] + "-" + item.attrib["end"] for item in dhcp.findall("range")]
@@ -539,8 +542,9 @@ PY
 
 ensure_containerlab_net_node() {
     local node_state existing_names
-    [[ -f "$CONTAINERLAB_TOPOLOGY" && -f "$CONTAINERLAB_INVENTORY" ]] \
-        || die "The osac-workspace Containerlab topology or inventory is missing"
+    [[ -f "$CONTAINERLAB_TOPOLOGY" && -f "$CONTAINERLAB_INVENTORY" \
+        && -f "$CONTAINERLAB_CONFIGURE_PLAYBOOK" ]] \
+        || die "A repository-owned Containerlab topology, inventory, or trunk playbook is missing"
     resolve_mgmt_network
     if docker inspect "$CONTAINERLAB_NET_NODE" >/dev/null 2>&1; then
         node_state="$(docker inspect -f '{{.State.Running}}' "$CONTAINERLAB_NET_NODE")"
@@ -552,7 +556,7 @@ ensure_containerlab_net_node() {
     existing_names="$(docker ps -a --format '{{.Names}}' | awk -v prefix="$CONTAINERLAB_PREFIX-" 'index($0, prefix) == 1')"
     [[ -z "$existing_names" ]] \
         || die "A partial Containerlab topology exists without its network node; refusing to redeploy it"
-    info "Deploying the osac-workspace Containerlab topology on the existing SNO management bridge..."
+    info "Deploying the repository Containerlab topology on the existing SNO management bridge..."
     sudo env \
         "MGMT_BRIDGE=$MGMT_BRIDGE" \
         "MGMT_CIDR=$MGMT_CIDR" \
@@ -587,7 +591,9 @@ prepare_containerlab_net_node() {
         bridge_status="$(docker inspect -f '{{if index .NetworkSettings.Networks "bridge"}}true{{else}}false{{end}}' "$CONTAINERLAB_NET_NODE")" \
             || die "Could not inspect the Containerlab node network attachments"
         if [[ "$bridge_status" != true ]]; then
-            docker network connect bridge "$CONTAINERLAB_NET_NODE" >/dev/null \
+            docker network connect \
+                --driver-opt=com.docker.network.endpoint.ifname=net-download \
+                bridge "$CONTAINERLAB_NET_NODE" >/dev/null \
                 || die "Could not temporarily connect the test network node to the Docker bridge"
             NETNODE_DOCKER_BRIDGE_ATTACHED_BY_RUN=true
         fi
@@ -733,7 +739,7 @@ SH
 ensure_containerlab_switches() {
     local switch
     jq -e '.switches | type == "array" and length > 0' "$SWITCH_MANIFEST_FILE" >/dev/null \
-        || die "The workspace switch manifest is empty"
+        || die "The local lab switch manifest is empty"
     while IFS= read -r switch; do
         [[ -n "$switch" ]] || continue
         docker inspect "$switch" >/dev/null 2>&1 \
@@ -744,7 +750,7 @@ ensure_containerlab_switches() {
 }
 
 prepare_containerlab_switches() {
-    local switch public_key user ssh_output
+    local switch public_key user ssh_output address port attempt ready
     [[ -f "$SSH_PUBLIC_KEY_FILE" ]] || die "The temporary AgentlessNet SSH public key is missing"
     public_key="$(<"$SSH_PUBLIC_KEY_FILE")"
     ensure_containerlab_switches
@@ -793,22 +799,60 @@ SH
     done < <(jq -r '.switches[].name' "$SWITCH_MANIFEST_FILE")
     while IFS= read -r switch; do
         [[ -n "$switch" ]] || continue
-        local address port
         address="$(jq -r --arg name "$switch" \
             '.switches[] | select(.name == $name) | .ansible_host' "$SWITCH_MANIFEST_FILE")"
         port="$(jq -r --arg name "$switch" \
             '.switches[] | select(.name == $name) | .ansible_port' "$SWITCH_MANIFEST_FILE")"
         ssh_output="$TEMP_DIR/switch-${switch}-ssh-check.log"
-        if ! ssh -i "$SSH_PRIVATE_KEY_FILE" \
-            -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
-            -o "UserKnownHostsFile=$TEMP_DIR/known_hosts" -o ConnectTimeout=5 \
-            -p "$port" "cumulus@$address" \
-            'sudo -n bridge -j vlan show >/dev/null' >"$ssh_output" 2>&1; then
+        ready=false
+        for ((attempt = 1; attempt <= 60; attempt++)); do
+            if ssh -i "$SSH_PRIVATE_KEY_FILE" \
+                -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+                -o "UserKnownHostsFile=$TEMP_DIR/known_hosts" -o ConnectTimeout=5 \
+                -p "$port" "cumulus@$address" \
+                'sudo -n true && sudo -n bridge -j vlan show >/dev/null && sudo -n nv show bridge --output json >/dev/null' \
+                >"$ssh_output" 2>&1; then
+                ready=true
+                break
+            fi
+            if ((attempt < 60)); then
+                sleep 2
+            fi
+        done
+        if [[ "$ready" != true ]]; then
             tail -n 30 "$ssh_output" >&2
-            die "Key-based SSH or Cumulus VLAN tooling is unavailable on $switch"
+            die "Cumulus switch $switch did not become ready for VLAN discovery and NVUE configuration"
         fi
     done < <(jq -r '.switches[].name' "$SWITCH_MANIFEST_FILE")
     info "Containerlab Cumulus switches are reachable with the isolated provider SSH key."
+}
+
+configure_containerlab_fabric() {
+    local switch pending_diff playbook_log
+    while IFS= read -r switch; do
+        [[ -n "$switch" ]] || continue
+        if ! pending_diff="$(docker exec "$switch" nv config diff --color off)"; then
+            die "Could not inspect pending NVUE changes on $switch"
+        fi
+        [[ -z "$pending_diff" ]] \
+            || die "Switch $switch has pending NVUE changes; refusing to apply fabric trunk configuration"
+    done < <(jq -r '.switches[].name' "$SWITCH_MANIFEST_FILE")
+
+    playbook_log="$TEMP_DIR/fabric-setup.log"
+    info "Initializing declared Cumulus trunk ports in br_default..."
+    if ! (
+        cd "$AAP_DIR"
+        uv run --locked --group development ansible-playbook \
+            --inventory "$TEMP_DIR/inventory.yml" \
+            --private-key "$SSH_PRIVATE_KEY_FILE" \
+            --ssh-extra-args \
+            "-o BatchMode=yes -o IdentitiesOnly=yes -o UserKnownHostsFile=$TEMP_DIR/known_hosts -o ConnectTimeout=5" \
+            "$CONTAINERLAB_CONFIGURE_PLAYBOOK"
+    ) >"$playbook_log" 2>&1; then
+        tail -n 80 "$playbook_log" >&2
+        die "Containerlab fabric trunk initialization failed"
+    fi
+    info "Declared Cumulus trunk ports are initialized and verified."
 }
 
 write_provider_inventory() {
@@ -835,7 +879,7 @@ switch_manifest_path = pathlib.Path(sys.argv[6])
 inventory = yaml.safe_load(source_path.read_text())
 topology = yaml.safe_load(topology_path.read_text())
 if not isinstance(inventory, dict):
-    raise SystemExit("workspace inventory must be a mapping")
+    raise SystemExit("local lab inventory must be a mapping")
 mgmt = topology.get("mgmt", {}) if isinstance(topology, dict) else {}
 if not isinstance(mgmt, dict):
     raise SystemExit("Containerlab topology management network must be a mapping")
@@ -849,78 +893,78 @@ children = all_group.get("children", {}) if isinstance(all_group, dict) else {}
 net_nodes = children.get("net_nodes", {}) if isinstance(children, dict) else {}
 hosts = net_nodes.get("hosts", {}) if isinstance(net_nodes, dict) else {}
 if not isinstance(hosts, dict) or len(hosts) != 1:
-    raise SystemExit("workspace inventory must define exactly one authoritative net node")
+    raise SystemExit("local lab inventory must define exactly one authoritative net node")
 name, vars = next(iter(hosts.items()))
 if not isinstance(vars, dict):
-    raise SystemExit("workspace net-node inventory variables must be a mapping")
+    raise SystemExit("local lab net-node inventory variables must be a mapping")
 host = vars.get("ansible_host")
 user = vars.get("ansible_user")
 prefix = os.environ["MGMT_PREFIX"]
 cidr = ipaddress.IPv4Network(os.environ["MGMT_CIDR"], strict=False)
 if not isinstance(host, str) or not isinstance(user, str):
-    raise SystemExit("workspace net-node inventory requires ansible_host and ansible_user")
+    raise SystemExit("local lab net-node inventory requires ansible_host and ansible_user")
 host = host.replace("$" + "{MGMT_PREFIX}", prefix).replace("$MGMT_PREFIX", prefix)
 if "$" in host or "{{" in host or "}}" in host:
-    raise SystemExit("workspace net-node address contains an unresolved variable")
+    raise SystemExit("local lab net-node address contains an unresolved variable")
 try:
     address = ipaddress.IPv4Address(host)
 except ipaddress.AddressValueError as error:
-    raise SystemExit("workspace net-node address is not an IPv4 address") from error
+    raise SystemExit("local lab net-node address is not an IPv4 address") from error
 if address not in cidr:
-    raise SystemExit("workspace net-node address is outside the SNO management network")
+    raise SystemExit("local lab net-node address is outside the SNO management network")
 for item in filter(None, os.environ.get("MGMT_DHCP_RANGES", "").split(",")):
     start, end = (ipaddress.IPv4Address(part) for part in item.split("-", 1))
     if start <= address <= end:
-        raise SystemExit("workspace net-node address conflicts with the SNO DHCP pool")
+        raise SystemExit("local lab net-node address conflicts with the SNO DHCP pool")
 if user != "root":
     raise SystemExit("the Containerlab net-node must use its root SSH account")
 if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
-    raise SystemExit("workspace net-node inventory name contains unsupported characters")
+    raise SystemExit("local lab net-node inventory name contains unsupported characters")
 topology_name = topology.get("name", "")
 container_prefix = f"clab-{topology_name}-"
 switch_group = children.get("switches", {}) if isinstance(children, dict) else {}
 switch_hosts = switch_group.get("hosts", {}) if isinstance(switch_group, dict) else {}
 if not isinstance(switch_hosts, dict) or not switch_hosts:
-    raise SystemExit("workspace inventory must define at least one Cumulus switch")
+    raise SystemExit("local lab inventory must define at least one Cumulus switch")
 switch_manifest = []
 switch_inventory_hosts = {}
 for switch_name, switch_vars in switch_hosts.items():
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", switch_name) or not switch_name.startswith(container_prefix):
-        raise SystemExit("workspace switch inventory name does not match the Containerlab topology")
+        raise SystemExit("local lab switch inventory name does not match the Containerlab topology")
     if not isinstance(switch_vars, dict):
-        raise SystemExit("workspace switch inventory variables must be a mapping")
+        raise SystemExit("local lab switch inventory variables must be a mapping")
     switch_host = switch_vars.get("ansible_host")
     switch_user = switch_vars.get("ansible_user")
     if not isinstance(switch_host, str) or not isinstance(switch_user, str):
-        raise SystemExit("workspace switch inventory requires ansible_host and ansible_user")
+        raise SystemExit("local lab switch inventory requires ansible_host and ansible_user")
     switch_host = switch_host.replace("${MGMT_PREFIX}", prefix).replace("$MGMT_PREFIX", prefix)
     if "$" in switch_host or "{{" in switch_host or "}}" in switch_host:
-        raise SystemExit("workspace switch address contains an unresolved variable")
+        raise SystemExit("local lab switch address contains an unresolved variable")
     try:
         switch_address = ipaddress.IPv4Address(switch_host)
     except ipaddress.AddressValueError as error:
-        raise SystemExit("workspace switch address is not an IPv4 address") from error
+        raise SystemExit("local lab switch address is not an IPv4 address") from error
     if switch_address not in cidr:
-        raise SystemExit("workspace switch address is outside the SNO management network")
+        raise SystemExit("local lab switch address is outside the SNO management network")
     for item in filter(None, os.environ.get("MGMT_DHCP_RANGES", "").split(",")):
         start, end = (ipaddress.IPv4Address(part) for part in item.split("-", 1))
         if start <= switch_address <= end:
-            raise SystemExit("workspace switch address conflicts with the SNO DHCP pool")
+            raise SystemExit("local lab switch address conflicts with the SNO DHCP pool")
     if switch_user != "cumulus" or switch_vars.get("ansible_network_os", "cumulus") != "cumulus":
-        raise SystemExit("workspace Cumulus switches must use the cumulus account and network_os")
+        raise SystemExit("local lab Cumulus switches must use the cumulus account and network_os")
     try:
         switch_port = int(switch_vars.get("ansible_port", 22))
     except (TypeError, ValueError) as error:
-        raise SystemExit("workspace switch SSH port must be an integer") from error
+        raise SystemExit("local lab switch SSH port must be an integer") from error
     if not 1 <= switch_port <= 65535:
-        raise SystemExit("workspace switch SSH port is outside the valid range")
+        raise SystemExit("local lab switch SSH port is outside the valid range")
     trunk_ports = switch_vars.get("trunk_ports")
     if not isinstance(trunk_ports, list) or not trunk_ports:
-        raise SystemExit("workspace Cumulus switches require a nonempty trunk_ports list")
+        raise SystemExit("local lab Cumulus switches require a nonempty trunk_ports list")
     if any(not isinstance(port, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", port) for port in trunk_ports):
-        raise SystemExit("workspace switch trunk port contains unsupported characters")
+        raise SystemExit("local lab switch trunk port contains unsupported characters")
     if len(set(trunk_ports)) != len(trunk_ports):
-        raise SystemExit("workspace switch trunk_ports must be unique")
+        raise SystemExit("local lab switch trunk_ports must be unique")
     switch_manifest.append({
         "name": switch_name,
         "ansible_host": str(switch_address),
@@ -1023,7 +1067,7 @@ os.chmod(backup_path, 0o600)
 os.chmod(patch_path, 0o600)
 PY
     then
-        die "Existing AgentlessNet inventory differs from this workspace; refusing to overwrite it"
+        die "Existing AgentlessNet inventory differs from the local lab configuration; refusing to overwrite it"
     fi
     oc patch configmap "$AAP_NETWORKING_SECRET" -n "$OSAC_NAMESPACE" \
         --type=merge --patch-file="$patch_file" >/dev/null
@@ -2295,11 +2339,14 @@ on_exit() {
 }
 trap on_exit EXIT
 
-for tool in cluster-tool virsh oc helm go jq python3 awk sed grep sort sleep make ssh-keygen base64 grpcurl docker sudo ssh; do
+for tool in cluster-tool virsh oc helm go jq python3 awk sed grep sort sleep make ssh-keygen base64 grpcurl docker sudo ssh uv; do
     require_cmd "$tool"
 done
 require_cmd "$CONTAINER_TOOL"
 require_cmd "$CONTAINERLAB"
+[[ -f "$CONTAINERLAB_TOPOLOGY" ]] || die "Containerlab topology is missing: $CONTAINERLAB_TOPOLOGY"
+[[ -f "$CONTAINERLAB_INVENTORY" ]] || die "Containerlab inventory is missing: $CONTAINERLAB_INVENTORY"
+[[ -f "$CONTAINERLAB_CONFIGURE_PLAYBOOK" ]] || die "Containerlab trunk playbook is missing: $CONTAINERLAB_CONFIGURE_PLAYBOOK"
 if [[ "$SUITE_USES_SUBNET_DHCP" == true && "$VLAN_E2E_DEBUG" == true ]]; then
     require_cmd tcpdump
     require_cmd nsenter
@@ -2582,14 +2629,18 @@ info "AAP project branch: ${AAP_BRANCH}"
 step "STEP 4 OF 4: Running the ${VLAN_E2E_SUITE} E2E suite"
 sync_aap_project_revision
 configure_aap_execution_environment
+(
+    cd "$AAP_DIR"
+    uv sync --locked --group development
+)
 resolve_mgmt_network
 write_provider_inventory
 ensure_containerlab_net_node
 prepare_containerlab_net_node
 repair_provider_schema_v1
+prepare_containerlab_switches
+configure_containerlab_fabric
 if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
-    ensure_containerlab_switches
-    prepare_containerlab_switches
     prepare_containerlab_dhcp_supervisor
 fi
 prepare_aap_networking_instance_group

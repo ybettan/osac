@@ -1,0 +1,19 @@
+all:
+  children:
+    switches:
+      hosts:
+        clab-agentless-net-lab-leaf-1:
+          ansible_host: ${MGMT_PREFIX}.11
+          ansible_user: cumulus
+          ansible_network_os: cumulus
+          trunk_ports: [swp1, swp3, swp4]
+        clab-agentless-net-lab-leaf-2:
+          ansible_host: ${MGMT_PREFIX}.12
+          ansible_user: cumulus
+          ansible_network_os: cumulus
+          trunk_ports: [swp1]
+    net_nodes:
+      hosts:
+        clab-agentless-net-lab-net-node:
+          ansible_host: ${MGMT_PREFIX}.30
+          ansible_user: root
