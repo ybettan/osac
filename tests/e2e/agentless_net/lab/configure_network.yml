@@ -1,0 +1,67 @@
+---
+- name: Initialize Cumulus trunk ports for the AgentlessNet development lab
+  hosts: switches
+  connection: ssh
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Read current VLAN memberships on {{ inventory_hostname }}
+      ansible.builtin.raw: bridge -j vlan show
+      register: _agentless_net_fabric_vlan_before
+      changed_when: false
+
+    - name: Validate current VLAN membership output on {{ inventory_hostname }}
+      ansible.builtin.assert:
+        that:
+          - (_agentless_net_fabric_vlan_before.stdout | from_json | type_debug) == 'list'
+        fail_msg: >-
+          Cumulus switch {{ inventory_hostname }} returned invalid JSON for
+          bridge VLAN membership discovery.
+
+    - name: Record interfaces with existing VLAN membership
+      ansible.builtin.set_fact:
+        _agentless_net_fabric_configured_ports: >-
+          {{ (_agentless_net_fabric_vlan_before.stdout | from_json)
+             | selectattr('vlans', 'defined')
+             | selectattr('vlans')
+             | map(attribute='ifname')
+             | list }}
+
+    - name: Find declared trunks that do not yet have VLAN membership
+      ansible.builtin.set_fact:
+        _agentless_net_fabric_missing_trunks: >-
+          {{ trunk_ports | difference(_agentless_net_fabric_configured_ports) }}
+
+    - name: Configure missing trunk {{ _agentless_net_fabric_trunk }} in br_default
+      ansible.builtin.include_role:
+        name: ansible_network.network_runner.switch
+        tasks_from: conf_trunk_port
+      vars:
+        port_name: "{{ _agentless_net_fabric_trunk }}"
+        port_description: "AgentlessNet development lab trunk"
+      loop: "{{ _agentless_net_fabric_missing_trunks }}"
+      loop_control:
+        loop_var: _agentless_net_fabric_trunk
+        label: "{{ inventory_hostname }}/{{ _agentless_net_fabric_trunk }}"
+
+    - name: Verify declared trunk {{ _agentless_net_fabric_trunk }} has VLAN membership
+      ansible.builtin.raw: >-
+        bridge -j vlan show dev {{ _agentless_net_fabric_trunk }}
+      register: _agentless_net_fabric_vlan_after
+      changed_when: false
+      until: >-
+        _agentless_net_fabric_vlan_after.rc == 0
+        and
+        (((_agentless_net_fabric_vlan_after.stdout | from_json)
+          | selectattr('ifname', 'equalto', _agentless_net_fabric_trunk)
+          | selectattr('vlans', 'defined')
+          | selectattr('vlans')
+          | list
+          | length) > 0)
+      retries: 30
+      delay: 2
+      loop: "{{ trunk_ports }}"
+      loop_control:
+        loop_var: _agentless_net_fabric_trunk
+        label: "{{ inventory_hostname }}/{{ _agentless_net_fabric_trunk }}"
