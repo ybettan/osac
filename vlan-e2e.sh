@@ -1532,6 +1532,11 @@ if not isinstance(values, dict):
 with open(profile_path, encoding="utf-8") as stream:
     profile_values = yaml.safe_load(stream) or {}
 
+# This development release predates removal of the CSI subcharts and VAST
+# storage-operations credential values from the current umbrella chart.
+values.pop("csiBackends", None)
+values.pop("csiDriver", None)
+
 # The long-lived lab release can contain fields removed from this checkout's
 # chart schema. Drop only those known legacy fields before validating upgrades.
 aap = values.get("aap")
@@ -1544,6 +1549,12 @@ if isinstance(aap, dict):
         config_as_code.pop("importBcmAgentsEnabled", None)
     instance_groups = aap.get("instanceGroups")
     if isinstance(instance_groups, dict):
+        storage_fulfillment = instance_groups.get("storageFulfillment")
+        if isinstance(storage_fulfillment, dict):
+            secret = storage_fulfillment.get("secret")
+            if isinstance(secret, dict):
+                for name in ("VAST_ENDPOINT", "VAST_PASSWORD", "VAST_USERNAME"):
+                    secret.pop(name, None)
         cluster_fulfillment = instance_groups.get("clusterFulfillment")
         if isinstance(cluster_fulfillment, dict):
             config = cluster_fulfillment.get("config")
