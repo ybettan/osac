@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# OSAC-5528/OSAC-5530/OSAC-6306 AgentlessNet development lab:
+# OSAC-5528/OSAC-5530/OSAC-6306/OSAC-6307 AgentlessNet development lab:
 #   1. Boot or reuse the SNO with cluster-tool.
 #   2. Build and push runtime images when source inputs changed, or reuse their tags.
 #   3. Install or upgrade OSAC with those custom images.
@@ -21,6 +21,7 @@ Suites:
   virtual-network   Create, verify, and delete one VirtualNetwork.
   subnet-dhcp       Create a parent VirtualNetwork and run the Subnet/DHCP E2E.
   external-ip-pool  Create, verify, and delete one ExternalIPPool.
+  external-ip       Allocate, retry, and release ExternalIPs through Fulfillment.
 
 All suites boot or reuse the SNO, prepare source-matched images, install or
 upgrade OSAC, and initialize the Containerlab fabric before running the
@@ -33,6 +34,7 @@ Examples:
   bash ./vlan-e2e.sh --suite virtual-network
   bash ./vlan-e2e.sh --suite subnet-dhcp
   bash ./vlan-e2e.sh --suite external-ip-pool
+  bash ./vlan-e2e.sh --suite external-ip
 USAGE
 }
 
@@ -53,7 +55,7 @@ while (($# > 0)); do
             [[ "$SUITE_SELECTED" == false ]] || argument_error "--suite may be specified only once"
             (($# >= 2)) || argument_error "--suite requires a value"
             case "$2" in
-                full|virtual-network|subnet-dhcp|external-ip-pool)
+                full|virtual-network|subnet-dhcp|external-ip-pool|external-ip)
                     VLAN_E2E_SUITE="$2"
                     ;;
                 *) argument_error "unsupported suite: $2" ;;
@@ -70,21 +72,36 @@ case "$VLAN_E2E_SUITE" in
         SUITE_USES_VN=true
         SUITE_USES_SUBNET_DHCP=true
         SUITE_USES_POOL=true
+        SUITE_USES_CLI=true
+        SUITE_USES_EXTERNAL_IP=false
         ;;
     virtual-network)
         SUITE_USES_VN=true
         SUITE_USES_SUBNET_DHCP=false
         SUITE_USES_POOL=false
+        SUITE_USES_CLI=true
+        SUITE_USES_EXTERNAL_IP=false
         ;;
     subnet-dhcp)
         SUITE_USES_VN=true
         SUITE_USES_SUBNET_DHCP=true
         SUITE_USES_POOL=false
+        SUITE_USES_CLI=true
+        SUITE_USES_EXTERNAL_IP=false
         ;;
     external-ip-pool)
         SUITE_USES_VN=false
         SUITE_USES_SUBNET_DHCP=false
         SUITE_USES_POOL=true
+        SUITE_USES_CLI=false
+        SUITE_USES_EXTERNAL_IP=false
+        ;;
+    external-ip)
+        SUITE_USES_VN=false
+        SUITE_USES_SUBNET_DHCP=false
+        SUITE_USES_POOL=true
+        SUITE_USES_CLI=true
+        SUITE_USES_EXTERNAL_IP=true
         ;;
 esac
 
@@ -124,8 +141,11 @@ IMAGE_SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-list -1 HEAD -- . ':(exclude)vlan
 IMAGE_SOURCE_SHORT="${IMAGE_SOURCE_COMMIT:0:12}"
 AAP_IMAGE="${AAP_IMAGE:-quay.io/ybettan/osac-aap:osac-5530-${IMAGE_SOURCE_SHORT}}"
 OPERATOR_IMAGE="${OPERATOR_IMAGE:-quay.io/ybettan/osac-operator:osac-5530-${IMAGE_SOURCE_SHORT}}"
+FULFILLMENT_IMAGE="${FULFILLMENT_IMAGE:-quay.io/ybettan/fulfillment-service:osac-6307-${IMAGE_SOURCE_SHORT}}"
 OPERATOR_IMAGE_REPOSITORY="${OPERATOR_IMAGE%:*}"
 OPERATOR_IMAGE_TAG="${OPERATOR_IMAGE##*:}"
+FULFILLMENT_IMAGE_REPOSITORY="${FULFILLMENT_IMAGE%:*}"
+FULFILLMENT_IMAGE_TAG="${FULFILLMENT_IMAGE##*:}"
 AAP_PROJECT_GIT_URI="${AAP_PROJECT_GIT_URI:-https://github.com/ybettan/osac}"
 AAP_PROJECT_GIT_BRANCH="${AAP_PROJECT_GIT_BRANCH:-${CURRENT_BRANCH}}"
 AAP_PREFIX="${AAP_PREFIX:-${AAP_ORGANIZATION_NAME:-osac}}"
@@ -161,6 +181,9 @@ SUBNET_TWO_IPV4_CIDR="${SUBNET_TWO_IPV4_CIDR:-}"
 SUBNET_THREE_IPV4_CIDR="${SUBNET_THREE_IPV4_CIDR:-}"
 EXTERNAL_IP_POOL_NAME="agentless-e2e-pool-$(date -u +%Y%m%d%H%M%S)-$$"
 EXTERNAL_IP_POOL_CIDR="198.51.100.0/24"
+EXTERNAL_IP_PREFIX="agentless-eip-$(date -u +%Y%m%d%H%M%S)-$$"
+EXTERNAL_IP_ONE_NAME="${EXTERNAL_IP_PREFIX}-a"
+EXTERNAL_IP_TWO_NAME="${EXTERNAL_IP_PREFIX}-b"
 
 CLI_BIN="${OSAC_CLI_BIN:-}"
 CLI_CONFIG_DIR="${OSAC_CLI_CONFIG_DIR:-}"
@@ -176,6 +199,9 @@ EXTERNAL_IP_POOL_INITIAL_ENTRY=""
 EXTERNAL_IP_POOL_CREATE_AAP_JOB_ID=""
 EXTERNAL_IP_POOL_DELETE_AAP_JOB_ID=""
 EXTERNAL_IP_POOL_PENDING_CLEANUP=false
+EXTERNAL_IP_POOL_INITIAL_ALLOCATED=0
+EXTERNAL_IP_POOL_INITIAL_AVAILABLE=0
+CREATED_EXTERNAL_IP_IDS=()
 BASELINE_STATE_FILE=""
 CURRENT_STATE_FILE=""
 SWITCH_MANIFEST_FILE=""
@@ -226,6 +252,7 @@ require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Required command not fou
 label_selector() { printf 'osac.openshift.io/virtualnetwork-uuid=%s' "$1"; }
 subnet_label_selector() { printf 'osac.openshift.io/subnet-uuid=%s' "$1"; }
 external_ip_pool_label_selector() { printf 'osac.openshift.io/externalippool-uuid=%s' "$1"; }
+external_ip_label_selector() { printf 'osac.openshift.io/externalip-uuid=%s' "$1"; }
 
 assert_provider_schema_v1() {
     python3 - "$AAP_DIR/collections/ansible_collections/osac/templates/plugins/module_utils/agentless_net_state.py" <<'PY'
@@ -282,10 +309,14 @@ STATE_SUBNET_COLUMNS = {
 STATE_POOL_COLUMNS = {
     "uid", "fulfillment_id", "tenant_id", "ip_family", "ipv4_cidr",
 }
-CURRENT_TABLES = {"virtual_networks", "subnets", "external_ip_pools"}
+STATE_EXTERNAL_IP_COLUMNS = {
+    "uid", "fulfillment_id", "tenant_id", "pool_uid", "address",
+}
+CURRENT_TABLES = {"virtual_networks", "subnets", "external_ip_pools", "external_ips"}
 LEGACY_V1_TABLES = (
     {"virtual_networks"},
     {"virtual_networks", "subnets"},
+    {"virtual_networks", "subnets", "external_ip_pools"},
 )
 KNOWN_ACCIDENTAL_V2_TABLES = {"virtual_networks", "subnets"}
 
@@ -342,6 +373,7 @@ def validate_known_columns(connection, tables):
         "virtual_networks": STATE_VN_COLUMNS,
         "subnets": STATE_SUBNET_COLUMNS,
         "external_ip_pools": STATE_POOL_COLUMNS,
+        "external_ips": STATE_EXTERNAL_IP_COLUMNS,
     }
     for table in tables:
         if table_columns(connection, table) != expected[table]:
@@ -426,6 +458,17 @@ def repair_database(database_path):
                                 tenant_id TEXT NOT NULL,
                                 ip_family TEXT NOT NULL,
                                 ipv4_cidr TEXT NOT NULL
+                            )"""
+                        )
+                    if "external_ips" not in tables:
+                        connection.execute(
+                            """CREATE TABLE external_ips (
+                                uid TEXT NOT NULL PRIMARY KEY,
+                                fulfillment_id TEXT NOT NULL UNIQUE,
+                                tenant_id TEXT NOT NULL,
+                                pool_uid TEXT NOT NULL REFERENCES external_ip_pools(uid),
+                                address TEXT NOT NULL,
+                                UNIQUE (pool_uid, address)
                             )"""
                         )
                     connection.execute("PRAGMA user_version = 1")
@@ -1454,6 +1497,12 @@ deployment_settings() {
           tag: .operator.image.tag
         }
       },
+      fulfillment: {
+        image: {
+          repository: .service.images.service.repository,
+          tag: .service.images.service.tag
+        }
+      },
       networking: {
         fabricManager: .global.networking.fabricManager,
         k8sManager: .global.networking.k8sManager,
@@ -1467,18 +1516,21 @@ prepare_upgrade_values() {
     local previous_yaml="$TEMP_DIR/previous-helm-values.yaml"
     helm get values osac -n "$OSAC_NAMESPACE" --all -o json >"$previous_json" \
         || die "Could not capture the existing Helm values for a schema-compatible upgrade"
-    python3 - "$previous_json" "$previous_yaml" <<'PY'
+    python3 - "$previous_json" "$previous_yaml" \
+        "${INSTALLER_DIR}/values/${OSAC_PROFILE}/instance.yaml" <<'PY'
 import json
 import os
 import pathlib
 import sys
 import yaml
 
-source_path, output_path = sys.argv[1:]
+source_path, output_path, profile_path = sys.argv[1:]
 with open(source_path, encoding="utf-8") as stream:
     values = json.load(stream)
 if not isinstance(values, dict):
     raise SystemExit("Existing Helm values must be a mapping")
+with open(profile_path, encoding="utf-8") as stream:
+    profile_values = yaml.safe_load(stream) or {}
 
 # The long-lived lab release can contain fields removed from this checkout's
 # chart schema. Drop only those known legacy fields before validating upgrades.
@@ -1512,6 +1564,23 @@ if isinstance(operator, dict):
     stall = operator.get("stall")
     if isinstance(stall, dict):
         stall.pop("workersJoiningByHostType", None)
+    fulfillment = operator.get("fulfillment")
+    if isinstance(fulfillment, dict):
+        fulfillment.pop("tokenFile", None)
+
+# Older lab releases may lack the diskImage required for their default
+# ClusterVersion. Backfill it from the selected profile's current values.
+profile_cluster_versions = profile_values.get("clusterVersions", {})
+profile_versions = {
+    version.get("version"): version
+    for version in profile_cluster_versions.get("versions", [])
+}
+cluster_versions = values.get("clusterVersions", {})
+for version in cluster_versions.get("versions", []):
+    if version.get("default") and "diskImage" not in version:
+        current = profile_versions.get(version.get("version"), {})
+        if "diskImage" in current:
+            version["diskImage"] = current["diskImage"]
 
 service = values.get("service")
 if service is not None and not isinstance(service, dict):
@@ -2042,6 +2111,494 @@ wait_for_aap_provision_success() {
     die "Timed out waiting for AAP provision job ${job_id} to succeed"
 }
 
+external_ip_crs_json() {
+    local id="$1" selector
+    selector="$(external_ip_label_selector "$id")"
+    oc get externalips -n "$NETWORKING_NAMESPACE" -l "$selector" \
+        -o json --request-timeout=20s
+}
+
+external_ip_cr_json() {
+    local id="$1" json
+    json="$(external_ip_crs_json "$id")" \
+        || die "Kubernetes API failed while looking up ExternalIP UUID ${id}"
+    jq -ce --arg id "$id" --arg pool "$EXTERNAL_IP_POOL_ID" \
+        --arg tenant "$OSAC_TENANT" --arg namespace "$NETWORKING_NAMESPACE" '
+      if (.items | length) != 1 then
+        error("expected one ExternalIP CR for Fulfillment UUID " + $id)
+      else
+        .items[0] as $ip
+        | if $ip.metadata.labels["osac.openshift.io/externalip-uuid"] != $id then
+            error("ExternalIP UUID label does not match the requested resource")
+          elif $ip.metadata.annotations["osac.openshift.io/tenant"] != $tenant then
+            error("ExternalIP tenant annotation does not match the test tenant")
+          elif $ip.metadata.annotations["osac.openshift.io/implementation-strategy"] != "agentless_net" then
+            error("ExternalIP did not resolve to AgentlessNet")
+          elif $ip.metadata.annotations["osac.openshift.io/externalip-contract-version"] != "v1" then
+            error("ExternalIP is not using the v1 contract")
+          elif $ip.metadata.namespace != $namespace or $ip.spec.pool != $pool then
+            error("ExternalIP namespace or pool does not match the test request")
+          else $ip end
+      end' <<<"$json"
+}
+
+external_ip_pool_get_json() {
+    local request_file="${TEMP_DIR}/external-ip-pool-status.request.json"
+    local response_file="${TEMP_DIR}/external-ip-pool-status.response.json"
+    local error_file="${TEMP_DIR}/external-ip-pool-status.error.json"
+    jq -n --arg id "$EXTERNAL_IP_POOL_ID" '{id:$id}' >"$request_file" \
+        || die "Could not write ExternalIPPool Get request"
+    if ! external_ip_pool_rpc Get "$request_file" "$response_file" "$error_file"; then
+        cat "$error_file" >&2
+        return 1
+    fi
+    cat "$response_file"
+}
+
+external_ip_pool_has_delta() {
+    local delta="$1" allocated available response
+    allocated=$((EXTERNAL_IP_POOL_INITIAL_ALLOCATED + delta))
+    available=$((EXTERNAL_IP_POOL_INITIAL_AVAILABLE - delta))
+    response="$(external_ip_pool_get_json)" || return 1
+    jq -e --arg id "$EXTERNAL_IP_POOL_ID" --argjson allocated "$allocated" \
+        --argjson available "$available" '
+      .object.id == $id
+      and ((.object.status.allocated // 0) | tonumber) == $allocated
+      and ((.object.status.available // 0) | tonumber) == $available' \
+        <<<"$response" >/dev/null
+}
+
+external_ip_pool_wait_for_delta() {
+    local delta="$1" deadline=$((SECONDS + 600))
+    while ((SECONDS < deadline)); do
+        if external_ip_pool_has_delta "$delta"; then
+            return 0
+        fi
+        sleep 2
+    done
+    die "ExternalIPPool counters did not reach allocated=$((EXTERNAL_IP_POOL_INITIAL_ALLOCATED + delta)) and available=$((EXTERNAL_IP_POOL_INITIAL_AVAILABLE - delta))"
+}
+
+external_ip_state_entry() {
+    local uid="$1" fulfillment_id="$2"
+    save_current_state
+    jq -ceS --arg uid "$uid" --arg id "$fulfillment_id" '
+      [.external_ips[] | select(.uid == $uid and .fulfillment_id == $id)]
+      | if length == 1 then .[0] else error("expected one saved ExternalIP reservation") end' \
+      "$CURRENT_STATE_FILE"
+}
+
+external_ip_assert_state() {
+    local entry="$1" uid="$2" fulfillment_id="$3" tenant_id="$4" pool_uid="$5" address="$6"
+    jq -e --arg uid "$uid" --arg id "$fulfillment_id" --arg tenant "$tenant_id" \
+        --arg pool "$pool_uid" --arg address "$address" '
+      .uid == $uid
+      and .fulfillment_id == $id
+      and .tenant_id == $tenant
+      and .pool_uid == $pool
+      and .address == $address' <<<"$entry" >/dev/null \
+        || die "AgentlessNet ExternalIP reservation does not match the CR and pool"
+}
+
+external_ip_assert_state_absent() {
+    local uid="$1" fulfillment_id="$2"
+    save_current_state
+    jq -e --arg uid "$uid" --arg id "$fulfillment_id" '
+      all(.external_ips[]; .uid != $uid and .fulfillment_id != $id)' \
+        "$CURRENT_STATE_FILE" >/dev/null \
+        || die "Released ExternalIP ${fulfillment_id} remains in provider state"
+}
+
+external_ip_aap_job_artifacts() (
+    local job_id="$1" route token
+    route="$(oc get route osac-aap -n "$OSAC_NAMESPACE" -o jsonpath='{.spec.host}')" \
+        || return 1
+    token="$(oc exec deployment/osac-operator -n "$OSAC_NAMESPACE" -- \
+        sh -c 'printf %s "$OSAC_AAP_TOKEN"' 2>/dev/null)" \
+        || return 1
+    [[ -n "$route" && -n "$token" ]] || return 1
+    AAP_API_ROUTE="https://$route" AAP_API_TOKEN="$token" \
+        python3 - "$job_id" <<'PY'
+import json
+import os
+import ssl
+import sys
+import urllib.request
+
+base = os.environ["AAP_API_ROUTE"].rstrip("/") + "/api/controller/v2"
+token = os.environ["AAP_API_TOKEN"]
+job_id = sys.argv[1]
+request = urllib.request.Request(
+    f"{base}/jobs/{job_id}/",
+    headers={"Authorization": f"Bearer {token}"},
+)
+with urllib.request.urlopen(request, context=ssl._create_unverified_context(), timeout=20) as response:
+    job = json.load(response)
+if job.get("status") != "successful":
+    raise SystemExit(f"AAP job {job_id} is not successful")
+artifacts = job.get("artifacts")
+if not isinstance(artifacts, dict):
+    raise SystemExit(f"AAP job {job_id} has no result artifacts")
+sys.stdout.write(json.dumps(artifacts, sort_keys=True))
+PY
+)
+
+external_ip_assert_result() {
+    local artifacts="$1" operation="$2" uid="$3" generation="$4" address="${5:-}"
+    jq -e --arg operation "$operation" --arg uid "$uid" \
+        --argjson generation "$generation" --arg address "$address" '
+      .osac_result as $result
+      | $result.schemaVersion == "v1"
+        and $result.operation == $operation
+        and $result.resourceUID == $uid
+        and $result.observedGeneration == $generation
+        and (if $operation == "external_ip.allocate"
+             then ($result.data.address == $address and $address != "")
+             else $result.data == {} end)' <<<"$artifacts" >/dev/null
+}
+
+external_ip_validate_address() {
+    python3 - "$1" "$EXTERNAL_IP_POOL_CIDR" <<'PY'
+import ipaddress
+import sys
+
+address = ipaddress.ip_address(sys.argv[1])
+pool = ipaddress.ip_network(sys.argv[2], strict=True)
+if not isinstance(address, ipaddress.IPv4Address) or str(address) != sys.argv[1] or address not in pool:
+    raise SystemExit("ExternalIP result is not a canonical address in the test pool")
+PY
+}
+
+create_external_ip() {
+    local name="$1" output_file="$2" output id create_status=0
+    if "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" \
+        create externalip --name "$name" --pool "$EXTERNAL_IP_POOL_ID" \
+        >"$output_file" 2>&1; then
+        create_status=0
+    else
+        create_status=$?
+    fi
+    cat "$output_file" >&2 || return 1
+    output="$(cat "$output_file")" || return 1
+    id="$(sed -nE 's/.*\(ID: ([0-9a-f-]+)\).*/\1/p' <<<"$output" | tail -n 1)"
+    if [[ "$id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        CREATED_EXTERNAL_IP_IDS+=("$id")
+        printf '%s\n' "$id" >"${output_file}.id" || return 1
+    fi
+    [[ "$id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+        || { printf 'Could not parse Fulfillment UUID from CLI create output for %s\n' "$name" >&2; return 1; }
+    return "$create_status"
+}
+
+wait_for_external_ip_ready() {
+    local id="$1" deadline=$((SECONDS + 600))
+    local crs count cr phase state provision_job job_id job_state address uid generation artifacts entry
+    info "Waiting for ExternalIP ${id} to become Ready..."
+    while ((SECONDS < deadline)); do
+        if ! crs="$(external_ip_crs_json "$id")"; then
+            die "Kubernetes API failed while looking up ExternalIP UUID ${id}"
+        fi
+        count="$(jq -er '.items | length' <<<"$crs")" \
+            || die "Could not count ExternalIP CRs for UUID ${id}"
+        if [[ "$count" == 0 ]]; then
+            sleep 2
+            continue
+        fi
+        [[ "$count" == 1 ]] || die "Expected one ExternalIP CR for UUID ${id}; found ${count}"
+        cr="$(external_ip_cr_json "$id")"
+        phase="$(jq -r '.status.phase // ""' <<<"$cr")"
+        state="$(jq -r '.status.state // ""' <<<"$cr")"
+        provision_job="$(jq -c '[.status.provisioningJobs[]? | select(.type == "provision")] | last // {}' <<<"$cr")"
+        job_id="$(jq -r '.jobID // ""' <<<"$provision_job")"
+        job_state="$(jq -r '.state // ""' <<<"$provision_job")"
+        if [[ "$phase" == Failed || "$state" == Failed || "$job_state" == Failed || "$job_state" == Canceled ]]; then
+            printf '%s\n' "$cr" >&2
+            die "ExternalIP ${id} failed allocation"
+        fi
+        if [[ "$phase" == Ready && "$state" == Allocated && "$job_state" == Succeeded && -n "$job_id" ]]; then
+            uid="$(jq -er '.metadata.uid' <<<"$cr")"
+            generation="$(jq -er '.metadata.generation' <<<"$cr")"
+            address="$(jq -er '.status.address' <<<"$cr")"
+            jq -e '(.metadata.annotations // {}) | has("osac.openshift.io/allocated-address") | not' \
+                <<<"$cr" >/dev/null \
+                || die "ExternalIP ${id} contains the obsolete allocated-address annotation"
+            if ! artifacts="$(external_ip_aap_job_artifacts "$job_id")"; then
+                die "Could not retrieve allocation artifacts for AAP job ${job_id}"
+            fi
+            external_ip_assert_result "$artifacts" external_ip.allocate "$uid" "$generation" "$address" \
+                || die "AAP allocation artifact does not match ExternalIP ${id}"
+            external_ip_validate_address "$address" \
+                || die "ExternalIP ${id} has an invalid address"
+            entry="$(external_ip_state_entry "$uid" "$id")"
+            external_ip_assert_state "$entry" "$uid" "$id" "$OSAC_TENANT" \
+                "$EXTERNAL_IP_POOL_K8S_UID" "$address"
+            LAST_EXTERNAL_IP_UID="$uid"
+            LAST_EXTERNAL_IP_GENERATION="$generation"
+            LAST_EXTERNAL_IP_ADDRESS="$address"
+            LAST_EXTERNAL_IP_PROVISION_JOB_ID="$job_id"
+            info "ExternalIP ${id} is Ready at ${address}; AAP job ${job_id}"
+            return 0
+        fi
+        sleep 2
+    done
+    die "Timed out waiting for ExternalIP ${id} to become Ready"
+}
+
+external_ip_remove_created_id() {
+    local id="$1" index
+    for index in "${!CREATED_EXTERNAL_IP_IDS[@]}"; do
+        if [[ "${CREATED_EXTERNAL_IP_IDS[$index]}" == "$id" ]]; then
+            unset 'CREATED_EXTERNAL_IP_IDS[index]'
+        fi
+    done
+}
+
+delete_external_ip_and_verify() {
+    local id="$1" uid="$2" generation="$3" capacity_delta="$4"
+    local output_file="${TEMP_DIR}/delete-external-ip-${id}.out"
+    local hold_finalizer="osac.openshift.io/e2e-hold-external-ip"
+    local operator_finalizer="osac.openshift.io/externalip-finalizer"
+    local cr crs count deadline=$((SECONDS + 600)) release_job release_job_id="" job_state artifacts
+    local release_validated=false
+    cr="$(external_ip_cr_json "$id")"
+    if [[ -z "$(jq -r '.metadata.deletionTimestamp // ""' <<<"$cr")" ]]; then
+        jq -e --arg finalizer "$hold_finalizer" \
+            '(.metadata.finalizers // []) | index($finalizer) == null' <<<"$cr" >/dev/null \
+            || die "ExternalIP ${id} already has the E2E hold finalizer"
+        oc patch externalip "$(jq -r '.metadata.name' <<<"$cr")" -n "$NETWORKING_NAMESPACE" \
+            --type=json -p="[{\"op\":\"add\",\"path\":\"/metadata/finalizers/-\",\"value\":\"${hold_finalizer}\"}]" >/dev/null
+        cr="$(external_ip_cr_json "$id")"
+        info "Deleting ExternalIP ${id} through Fulfillment..."
+        if ! "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" \
+            delete externalip "$id" >"$output_file" 2>&1; then
+            cat "$output_file" >&2
+            die "Fulfillment could not delete ExternalIP ${id}"
+        fi
+    fi
+
+    while ((SECONDS < deadline)); do
+        if ! crs="$(external_ip_crs_json "$id")"; then
+            die "Kubernetes API failed while waiting for ExternalIP ${id} deletion"
+        fi
+        count="$(jq -er '.items | length' <<<"$crs")" \
+            || die "Could not count ExternalIP CRs for UUID ${id} during deletion"
+        if [[ "$count" == 0 ]]; then
+            break
+        fi
+        [[ "$count" == 1 ]] || die "Expected one ExternalIP CR for UUID ${id} during deletion"
+        cr="$(jq -c '.items[0]' <<<"$crs")"
+        release_job="$(jq -c '[.status.provisioningJobs[]? | select(.type == "deprovision")] | last // {}' <<<"$cr")"
+        release_job_id="$(jq -r '.jobID // ""' <<<"$release_job")"
+        job_state="$(jq -r '.state // ""' <<<"$release_job")"
+        if [[ -n "$release_job_id" && ( "$job_state" == Failed || "$job_state" == Canceled ) ]]; then
+            die "AAP release job ${release_job_id} ended in ${job_state} for ExternalIP ${id}"
+        fi
+        if [[ -n "$release_job_id" ]] \
+            && jq -e --arg hold "$hold_finalizer" --arg operator "$operator_finalizer" '
+                (.metadata.finalizers // []) as $finalizers
+                | ($finalizers | index($hold) != null)
+                  and ($finalizers | index($operator) == null)' <<<"$cr" >/dev/null; then
+            if artifacts="$(external_ip_aap_job_artifacts "$release_job_id" 2>/dev/null)"; then
+                external_ip_assert_result "$artifacts" external_ip.release "$uid" "$generation" \
+                    || die "AAP release artifact does not match ExternalIP ${id}"
+                release_validated=true
+                break
+            fi
+        fi
+        sleep 2
+    done
+    [[ "$count" == 1 && -n "$release_job_id" && "$release_validated" == true ]] \
+        || die "Timed out waiting for the operator to validate release of ExternalIP ${id}"
+    jq -e --arg hold "$hold_finalizer" --arg operator "$operator_finalizer" '
+        (.metadata.finalizers // []) as $finalizers
+        | ($finalizers | index($hold) != null)
+          and ($finalizers | index($operator) == null)' <<<"$cr" >/dev/null \
+        || die "ExternalIP ${id} was not retained by the test hold finalizer after operator cleanup"
+    external_ip_pool_wait_for_delta "$((capacity_delta + 1))"
+    oc patch externalip "$(jq -r '.metadata.name' <<<"$cr")" -n "$NETWORKING_NAMESPACE" \
+        --type=merge -p="$(jq -c --arg hold "$hold_finalizer" \
+            '{metadata:{finalizers:((.metadata.finalizers // []) | map(select(. != $hold)))}}' <<<"$cr")" >/dev/null
+    deadline=$((SECONDS + 600))
+    while ((SECONDS < deadline)); do
+        crs="$(external_ip_crs_json "$id")" \
+            || die "Kubernetes API failed while removing the E2E hold finalizer from ExternalIP ${id}"
+        count="$(jq -er '.items | length' <<<"$crs")" \
+            || die "Could not count ExternalIP CRs after releasing ${id}"
+        [[ "$count" == 0 ]] && break
+        sleep 2
+    done
+    [[ "$count" == 0 ]] || die "Timed out waiting for ExternalIP ${id} to be removed after cleanup"
+    external_ip_assert_state_absent "$uid" "$id"
+    external_ip_pool_wait_for_delta "$capacity_delta"
+    external_ip_remove_created_id "$id"
+    info "ExternalIP ${id} is released and Fulfillment capacity is updated; AAP job ${release_job_id}"
+}
+
+run_external_ip_lifecycle() {
+    local pool_status initial_total output_file state_after_retry original_job cr name
+    pool_status="$(external_ip_pool_get_json)" \
+        || die "Could not read test ExternalIPPool capacity"
+    initial_total="$(jq -er '.object.status.total | tonumber' <<<"$pool_status")" \
+        || die "ExternalIPPool has no total capacity"
+    EXTERNAL_IP_POOL_INITIAL_AVAILABLE="$(jq -er '.object.status.available | tonumber' <<<"$pool_status")" \
+        || die "ExternalIPPool has no available capacity"
+    EXTERNAL_IP_POOL_INITIAL_ALLOCATED="$(jq -er '(.object.status.allocated // 0) | tonumber' <<<"$pool_status")" \
+        || die "ExternalIPPool has invalid allocated capacity"
+    [[ "$initial_total" -gt 0 && "$EXTERNAL_IP_POOL_INITIAL_ALLOCATED" == 0 ]] \
+        || die "ExternalIPPool must start Ready with capacity available and no allocated ExternalIPs"
+
+    output_file="${TEMP_DIR}/create-external-ip-one.out"
+    create_external_ip "$EXTERNAL_IP_ONE_NAME" "$output_file" \
+        || die "Could not create test ExternalIP ${EXTERNAL_IP_ONE_NAME}"
+    EXTERNAL_IP_ONE_ID="$(<"${output_file}.id")"
+    external_ip_pool_wait_for_delta 1
+    wait_for_external_ip_ready "$EXTERNAL_IP_ONE_ID"
+    EXTERNAL_IP_ONE_UID="$LAST_EXTERNAL_IP_UID"
+    EXTERNAL_IP_ONE_GENERATION="$LAST_EXTERNAL_IP_GENERATION"
+    EXTERNAL_IP_ONE_ADDRESS="$LAST_EXTERNAL_IP_ADDRESS"
+    EXTERNAL_IP_ONE_PROVISION_JOB_ID="$LAST_EXTERNAL_IP_PROVISION_JOB_ID"
+    EXTERNAL_IP_ONE_STATE="$(external_ip_state_entry "$EXTERNAL_IP_ONE_UID" "$EXTERNAL_IP_ONE_ID")"
+
+    output_file="${TEMP_DIR}/create-external-ip-two.out"
+    create_external_ip "$EXTERNAL_IP_TWO_NAME" "$output_file" \
+        || die "Could not create test ExternalIP ${EXTERNAL_IP_TWO_NAME}"
+    EXTERNAL_IP_TWO_ID="$(<"${output_file}.id")"
+    external_ip_pool_wait_for_delta 2
+    wait_for_external_ip_ready "$EXTERNAL_IP_TWO_ID"
+    EXTERNAL_IP_TWO_UID="$LAST_EXTERNAL_IP_UID"
+    EXTERNAL_IP_TWO_GENERATION="$LAST_EXTERNAL_IP_GENERATION"
+    EXTERNAL_IP_TWO_ADDRESS="$LAST_EXTERNAL_IP_ADDRESS"
+    EXTERNAL_IP_TWO_PROVISION_JOB_ID="$LAST_EXTERNAL_IP_PROVISION_JOB_ID"
+    EXTERNAL_IP_TWO_STATE="$(external_ip_state_entry "$EXTERNAL_IP_TWO_UID" "$EXTERNAL_IP_TWO_ID")"
+    [[ "$EXTERNAL_IP_ONE_ADDRESS" != "$EXTERNAL_IP_TWO_ADDRESS" ]] \
+        || die "Two ExternalIPs received the same address from one pool"
+    external_ip_pool_wait_for_delta 2
+
+    info "Retrying ExternalIP ${EXTERNAL_IP_ONE_ID} with the same Kubernetes UID..."
+    original_job="$EXTERNAL_IP_ONE_PROVISION_JOB_ID"
+    cr="$(external_ip_cr_json "$EXTERNAL_IP_ONE_ID")"
+    name="$(jq -er '.metadata.name' <<<"$cr")"
+    oc patch externalip "$name" -n "$NETWORKING_NAMESPACE" --subresource=status \
+        --type=merge -p '{"status":{"phase":"Progressing","state":"Pending","conditions":[],"provisioningJobs":[]}}' >/dev/null
+    wait_for_external_ip_ready "$EXTERNAL_IP_ONE_ID"
+    [[ "$LAST_EXTERNAL_IP_PROVISION_JOB_ID" != "$original_job" ]] \
+        || die "ExternalIP retry did not create a new AAP job"
+    [[ "$LAST_EXTERNAL_IP_UID" == "$EXTERNAL_IP_ONE_UID" \
+        && "$LAST_EXTERNAL_IP_ADDRESS" == "$EXTERNAL_IP_ONE_ADDRESS" ]] \
+        || die "ExternalIP retry changed its UID or reserved address"
+    state_after_retry="$(external_ip_state_entry "$EXTERNAL_IP_ONE_UID" "$EXTERNAL_IP_ONE_ID")"
+    [[ "$state_after_retry" == "$EXTERNAL_IP_ONE_STATE" ]] \
+        || die "ExternalIP retry changed its UID-owned provider reservation"
+    external_ip_pool_wait_for_delta 2
+
+    delete_external_ip_and_verify "$EXTERNAL_IP_ONE_ID" "$EXTERNAL_IP_ONE_UID" \
+        "$EXTERNAL_IP_ONE_GENERATION" 1
+    cr="$(external_ip_cr_json "$EXTERNAL_IP_TWO_ID")"
+    [[ "$(jq -r '.status.address' <<<"$cr")" == "$EXTERNAL_IP_TWO_ADDRESS" ]] \
+        || die "Deleting ExternalIP ${EXTERNAL_IP_ONE_ID} changed its peer address"
+    state_after_retry="$(external_ip_state_entry "$EXTERNAL_IP_TWO_UID" "$EXTERNAL_IP_TWO_ID")"
+    [[ "$state_after_retry" == "$EXTERNAL_IP_TWO_STATE" ]] \
+        || die "Deleting ExternalIP ${EXTERNAL_IP_ONE_ID} changed its peer reservation"
+
+    delete_external_ip_and_verify "$EXTERNAL_IP_TWO_ID" "$EXTERNAL_IP_TWO_UID" \
+        "$EXTERNAL_IP_TWO_GENERATION" 0
+    external_ip_pool_wait_for_delta 0
+    save_current_state
+    assert_baseline_state_unchanged
+}
+
+cleanup_created_external_ips() {
+    [[ "${#CREATED_EXTERNAL_IP_IDS[@]}" -gt 0 ]] || return 0
+    [[ -n "$CLI_BIN" && -x "$CLI_BIN" && -n "$CLI_CONFIG_DIR" && -d "$CLI_CONFIG_DIR" ]] \
+        || return 1
+
+    local id crs count cr uid name output_file release_job job_state
+    local state_file remaining deadline
+    for id in "${CREATED_EXTERNAL_IP_IDS[@]}"; do
+        if ! crs="$(external_ip_crs_json "$id")"; then
+            printf 'Could not read ExternalIP %s while cleaning up\n' "$id" >&2
+            return 1
+        fi
+        count="$(jq -er '.items | length' <<<"$crs")" || return 1
+        if [[ "$count" == 1 ]]; then
+            cr="$(jq -c '.items[0]' <<<"$crs")"
+            uid="$(jq -r '.metadata.uid' <<<"$cr")"
+            name="$(jq -er '.metadata.name' <<<"$cr")" || return 1
+            if [[ -z "$(jq -r '.metadata.deletionTimestamp // ""' <<<"$cr")" ]]; then
+                output_file="${TEMP_DIR}/cleanup-external-ip-${id}.out"
+                if ! "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" \
+                    delete externalip "$id" >"$output_file" 2>&1; then
+                    cat "$output_file" >&2
+                    printf 'Could not request cleanup of test ExternalIP %s\n' "$id" >&2
+                    return 1
+                fi
+            fi
+
+            deadline=$((SECONDS + 600))
+            while ((SECONDS < deadline)); do
+                if ! crs="$(external_ip_crs_json "$id")"; then
+                    printf 'Could not read ExternalIP %s while waiting for cleanup\n' "$id" >&2
+                    return 1
+                fi
+                count="$(jq -er '.items | length' <<<"$crs")" || return 1
+                [[ "$count" != 0 ]] || break
+                [[ "$count" == 1 ]] || return 1
+                cr="$(jq -c '.items[0]' <<<"$crs")"
+                release_job="$(jq -c '[.status.provisioningJobs[]? | select(.type == "deprovision")] | last // {}' <<<"$cr")"
+                job_state="$(jq -r '.state // ""' <<<"$release_job")"
+                if [[ "$job_state" == Failed || "$job_state" == Canceled ]]; then
+                    printf 'ExternalIP %s release job ended in %s; preserving resources\n' "$id" "$job_state" >&2
+                    return 1
+                fi
+                if [[ "$job_state" == Succeeded ]] \
+                    && jq -e --arg hold "osac.openshift.io/e2e-hold-external-ip" \
+                        --arg operator "osac.openshift.io/externalip-finalizer" '
+                        (.metadata.finalizers // []) as $values
+                        | ($values | index($hold) != null)
+                          and ($values | index($operator) == null)' <<<"$cr" >/dev/null; then
+                    oc patch externalip "$name" -n "$NETWORKING_NAMESPACE" \
+                        --type=merge -p="$(jq -c --arg hold "osac.openshift.io/e2e-hold-external-ip" \
+                            '{metadata:{finalizers:((.metadata.finalizers // []) | map(select(. != $hold)))}}' \
+                            <<<"$cr")" >/dev/null \
+                        || return 1
+                fi
+                sleep 2
+            done
+            [[ "$count" == 0 ]] || {
+                printf 'Timed out waiting for test ExternalIP %s cleanup\n' "$id" >&2
+                return 1
+            }
+        elif [[ "$count" == 0 ]]; then
+            uid=""
+        else
+            printf 'Multiple ExternalIP CRs found for Fulfillment UUID %s\n' "$id" >&2
+            return 1
+        fi
+
+        state_file="$(state_snapshot)" || return 1
+        if jq -e --arg uid "$uid" --arg id "$id" \
+            'any(.external_ips[]; .fulfillment_id == $id or ($uid != "" and .uid == $uid))' \
+            <<<"$state_file" >/dev/null; then
+            printf 'Provider reservation for test ExternalIP %s remains after CR cleanup\n' "$id" >&2
+            return 1
+        fi
+        external_ip_remove_created_id "$id"
+        remaining="${#CREATED_EXTERNAL_IP_IDS[@]}"
+        deadline=$((SECONDS + 600))
+        while ((SECONDS < deadline)); do
+            if external_ip_pool_has_delta "$remaining"; then
+                break
+            fi
+            sleep 2
+        done
+        external_ip_pool_has_delta "$remaining" || {
+            printf 'Fulfillment capacity did not return to the expected count after ExternalIP %s cleanup\n' "$id" >&2
+            return 1
+        }
+    done
+    return 0
+}
+
 cleanup_created_subnets() {
     local id selector current test_subnets_clean=true
     if [[ -n "$CLI_BIN" && -x "$CLI_BIN" && -n "$CLI_CONFIG_DIR" && -d "$CLI_CONFIG_DIR" ]]; then
@@ -2157,9 +2714,14 @@ cleanup_created_external_ip_pool() {
 
 cleanup_created_virtual_networks() {
     local cleanup_incomplete=false
-    local test_vns_clean=true test_subnets_clean=true test_external_ip_pool_clean=true
+    local test_vns_clean=true test_subnets_clean=true test_external_ips_clean=true test_external_ip_pool_clean=true
     local id selector current
-    if ! cleanup_created_external_ip_pool; then
+    if ! cleanup_created_external_ips; then
+        test_external_ips_clean=false
+        printf 'ERROR: preserving test ExternalIPs and provider state because cleanup is incomplete\n' >&2
+        cleanup_incomplete=true
+    fi
+    if [[ "$test_external_ips_clean" == true ]] && ! cleanup_created_external_ip_pool; then
         test_external_ip_pool_clean=false
         printf 'ERROR: preserving the ExternalIPPool and provider access because pool cleanup is incomplete\n' >&2
         cleanup_incomplete=true
@@ -2199,7 +2761,8 @@ cleanup_created_virtual_networks() {
             test_vns_clean=false
         fi
     done
-    if [[ "$test_external_ip_pool_clean" == true && "$test_subnets_clean" == true \
+    if [[ "$test_external_ips_clean" == true && "$test_external_ip_pool_clean" == true \
+        && "$test_subnets_clean" == true \
         && "$test_vns_clean" == true ]]; then
         if ! restore_dhcp_supervisor; then
             printf 'ERROR: could not stop the temporary DHCP Supervisor or remove its owned configuration\n' >&2
@@ -2236,6 +2799,8 @@ cleanup_created_virtual_networks() {
     else
         if [[ "$test_external_ip_pool_clean" != true ]]; then
             printf 'ERROR: preserving AAP inventory and provider access because ExternalIPPool cleanup is incomplete\n' >&2
+        elif [[ "$test_external_ips_clean" != true ]]; then
+            printf 'ERROR: preserving test ExternalIPs and provider access because ExternalIP cleanup is incomplete\n' >&2
         elif [[ "$test_subnets_clean" != true ]]; then
             printf 'ERROR: preserving VirtualNetwork and provider access because Subnet cleanup is incomplete\n' >&2
         else
@@ -2317,7 +2882,7 @@ on_exit() {
             cleanup_status=1
         fi
     else
-        printf 'ERROR: preserving the test-owned ExternalIPPool, Subnets, VirtualNetworks, AAP inventory, and provider access for recovery because client-link cleanup failed\n' >&2
+        printf 'ERROR: preserving test ExternalIPs, ExternalIPPool, Subnets, VirtualNetworks, AAP inventory, and provider access for recovery because client-link cleanup failed\n' >&2
     fi
     if [[ "$status" == 0 && "$cleanup_status" != 0 ]]; then
         status=1
@@ -2365,6 +2930,8 @@ fi
     || die "AAP_IMAGE must be a quay.io image reference with a tag"
 [[ "$OPERATOR_IMAGE" =~ ^quay\.io/[A-Za-z0-9._/-]+:[A-Za-z0-9._-]+$ ]] \
     || die "OPERATOR_IMAGE must be a quay.io image reference with a tag"
+[[ "$FULFILLMENT_IMAGE" =~ ^quay\.io/[A-Za-z0-9._/-]+:[A-Za-z0-9._-]+$ ]] \
+    || die "FULFILLMENT_IMAGE must be a quay.io image reference with a tag"
 [[ "$REUSE_PREBUILT_OSAC_IMAGES" == auto || "$REUSE_PREBUILT_OSAC_IMAGES" == true \
     || "$REUSE_PREBUILT_OSAC_IMAGES" == false ]] \
     || die "REUSE_PREBUILT_OSAC_IMAGES must be auto, true, or false"
@@ -2381,8 +2948,16 @@ fi
 if [[ "$SUITE_USES_VN" == true ]]; then
     [[ "$VIRTUAL_NETWORK_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
         || die "VIRTUAL_NETWORK_NAME must be a DNS label"
+fi
+if [[ "$SUITE_USES_CLI" == true ]]; then
     [[ "$OSAC_TENANT" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
         || die "OSAC_TENANT must be a DNS label"
+fi
+if [[ "$SUITE_USES_EXTERNAL_IP" == true ]]; then
+    [[ "$EXTERNAL_IP_ONE_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ \
+        && "$EXTERNAL_IP_TWO_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ \
+        && "$EXTERNAL_IP_ONE_NAME" != "$EXTERNAL_IP_TWO_NAME" ]] \
+        || die "ExternalIP test names must be distinct DNS labels"
 fi
 if [[ "$VLAN_E2E_SUITE" == full ]]; then
     [[ "$PEER_VIRTUAL_NETWORK_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
@@ -2447,7 +3022,7 @@ if [[ "$SUITE_USES_SUBNET_DHCP" == true && "$VLAN_E2E_DEBUG" == true ]]; then
     chmod 0700 "$DEBUG_ARTIFACT_DIR"
     info "Opt-in DHCP traces and logs will be saved to ${DEBUG_ARTIFACT_DIR}"
 fi
-if [[ "$SUITE_USES_VN" == true ]]; then
+if [[ "$SUITE_USES_CLI" == true ]]; then
     if [[ -z "$CLI_BIN" ]]; then
         CLI_BIN="$(mktemp "${TMPDIR:-/tmp}/osac-5530-cli.XXXXXX")"
         GENERATED_CLI_BIN=true
@@ -2492,28 +3067,30 @@ done
 oc wait nodes --all --for=condition=Ready --timeout=20m >/dev/null
 
 # Phase 2: reuse source-matched images, or build and push them if missing.
-# The Ansible provider changes ship in the AAP execution environment. The
-# VirtualNetwork and Subnet controller changes ship in the OSAC operator image. The
-# Fulfillment CLI is compiled later as a local binary; no service image changed.
-step "STEP 2 OF 4: Preparing custom AAP and operator images"
+# ExternalIP capacity behavior and migration 124 ship in the Fulfillment image.
+step "STEP 2 OF 4: Preparing custom AAP, operator, and Fulfillment images"
 REUSE_IMAGES=false
 if [[ "$REUSE_PREBUILT_OSAC_IMAGES" == true ]]; then
     REUSE_IMAGES=true
 elif [[ "$REUSE_PREBUILT_OSAC_IMAGES" == auto ]] \
     && "$CONTAINER_TOOL" image inspect "$AAP_IMAGE" >/dev/null 2>&1 \
-    && "$CONTAINER_TOOL" image inspect "$OPERATOR_IMAGE" >/dev/null 2>&1; then
+    && "$CONTAINER_TOOL" image inspect "$OPERATOR_IMAGE" >/dev/null 2>&1 \
+    && "$CONTAINER_TOOL" image inspect "$FULFILLMENT_IMAGE" >/dev/null 2>&1; then
     REUSE_IMAGES=true
 elif [[ "$REUSE_PREBUILT_OSAC_IMAGES" == auto ]] \
     && "$CONTAINER_TOOL" pull "$AAP_IMAGE" >/dev/null 2>&1 \
-    && "$CONTAINER_TOOL" pull "$OPERATOR_IMAGE" >/dev/null 2>&1; then
+    && "$CONTAINER_TOOL" pull "$OPERATOR_IMAGE" >/dev/null 2>&1 \
+    && "$CONTAINER_TOOL" pull "$FULFILLMENT_IMAGE" >/dev/null 2>&1; then
     REUSE_IMAGES=true
 fi
 if [[ "$REUSE_IMAGES" == true ]]; then
-    info "Reusing prebuilt images for source revision ${IMAGE_SOURCE_SHORT}: ${AAP_IMAGE}, ${OPERATOR_IMAGE}."
+    info "Reusing prebuilt images for source revision ${IMAGE_SOURCE_SHORT}: ${AAP_IMAGE}, ${OPERATOR_IMAGE}, ${FULFILLMENT_IMAGE}."
     "$CONTAINER_TOOL" image inspect "$AAP_IMAGE" >/dev/null 2>&1 \
         || die "Prebuilt AAP image is not available locally: ${AAP_IMAGE}"
     "$CONTAINER_TOOL" image inspect "$OPERATOR_IMAGE" >/dev/null 2>&1 \
         || die "Prebuilt OSAC operator image is not available locally: ${OPERATOR_IMAGE}"
+    "$CONTAINER_TOOL" image inspect "$FULFILLMENT_IMAGE" >/dev/null 2>&1 \
+        || die "Prebuilt Fulfillment image is not available locally: ${FULFILLMENT_IMAGE}"
 else
     info "Building and pushing images for source revision ${IMAGE_SOURCE_SHORT}."
     if ! "$CONTAINER_TOOL" login --get-login quay.io >/dev/null 2>&1; then
@@ -2521,31 +3098,42 @@ else
     fi
     AAP_BUILD_LOG="${TEMP_DIR}/aap-image-build.log"
     OPERATOR_BUILD_LOG="${TEMP_DIR}/operator-image-build.log"
-    info "Building AAP ${AAP_IMAGE} and OSAC operator ${OPERATOR_IMAGE} images in parallel..."
+    FULFILLMENT_BUILD_LOG="${TEMP_DIR}/fulfillment-image-build.log"
+    info "Building AAP, OSAC operator, and Fulfillment images in parallel..."
     make -C "$AAP_DIR" execution-environment-build \
         "IMG=${AAP_IMAGE}" "CONTAINER_TOOL=${CONTAINER_TOOL}" >"$AAP_BUILD_LOG" 2>&1 &
     AAP_BUILD_PID=$!
     make -C "${REPO_ROOT}/osac-operator" image-build \
         "IMG=${OPERATOR_IMAGE}" "CONTAINER_TOOL=${CONTAINER_TOOL}" >"$OPERATOR_BUILD_LOG" 2>&1 &
     OPERATOR_BUILD_PID=$!
+    make -C "${REPO_ROOT}/fulfillment-service" image-build \
+        "IMG=${FULFILLMENT_IMAGE}" "CONTAINER_TOOL=${CONTAINER_TOOL}" >"$FULFILLMENT_BUILD_LOG" 2>&1 &
+    FULFILLMENT_BUILD_PID=$!
     AAP_BUILD_STATUS=0
     OPERATOR_BUILD_STATUS=0
+    FULFILLMENT_BUILD_STATUS=0
     wait "$AAP_BUILD_PID" || AAP_BUILD_STATUS=$?
     wait "$OPERATOR_BUILD_PID" || OPERATOR_BUILD_STATUS=$?
-    if [[ "$AAP_BUILD_STATUS" != 0 || "$OPERATOR_BUILD_STATUS" != 0 ]]; then
+    wait "$FULFILLMENT_BUILD_PID" || FULFILLMENT_BUILD_STATUS=$?
+    if [[ "$AAP_BUILD_STATUS" != 0 || "$OPERATOR_BUILD_STATUS" != 0 || "$FULFILLMENT_BUILD_STATUS" != 0 ]]; then
         if [[ "$AAP_BUILD_STATUS" != 0 ]]; then
             tail -n 80 "$AAP_BUILD_LOG" >&2
         fi
         if [[ "$OPERATOR_BUILD_STATUS" != 0 ]]; then
             tail -n 80 "$OPERATOR_BUILD_LOG" >&2
         fi
-        die "Image build failed (AAP status ${AAP_BUILD_STATUS}, operator status ${OPERATOR_BUILD_STATUS})"
+        if [[ "$FULFILLMENT_BUILD_STATUS" != 0 ]]; then
+            tail -n 80 "$FULFILLMENT_BUILD_LOG" >&2
+        fi
+        die "Image build failed (AAP status ${AAP_BUILD_STATUS}, operator status ${OPERATOR_BUILD_STATUS}, Fulfillment status ${FULFILLMENT_BUILD_STATUS})"
     fi
-    info "Both images built successfully; pushing them to Quay..."
+    info "All three images built successfully; pushing them to Quay..."
     make -C "$AAP_DIR" execution-environment-push \
         "IMG=${AAP_IMAGE}" "CONTAINER_TOOL=${CONTAINER_TOOL}"
     make -C "${REPO_ROOT}/osac-operator" image-push \
         "IMG=${OPERATOR_IMAGE}" "CONTAINER_TOOL=${CONTAINER_TOOL}"
+    make -C "${REPO_ROOT}/fulfillment-service" image-push \
+        "IMG=${FULFILLMENT_IMAGE}" "CONTAINER_TOOL=${CONTAINER_TOOL}"
 fi
 
 # Phase 3: install or upgrade OSAC with the custom AAP and operator images.
@@ -2559,7 +3147,7 @@ info "Refreshing local umbrella-chart dependencies from this checkout..."
 helm dependency build "${INSTALLER_DIR}/charts/osac"
 # This smoke invokes the networking AAP jobs directly; catalog template
 # publication is unrelated and its hook needs a Kubernetes token mount.
-EXTRA_HELM_ARGS="-f ${OVERLAY_FILE} --set-string aap.configAsCode.eeImage=${AAP_IMAGE} --set-string aap.configAsCode.projectGitUri=${AAP_PROJECT_GIT_URI} --set-string aap.configAsCode.projectGitBranch=${AAP_PROJECT_GIT_BRANCH} --set-string operator.image.repository=${OPERATOR_IMAGE_REPOSITORY} --set-string operator.image.tag=${OPERATOR_IMAGE_TAG} --set aap.instanceGroups.publishTemplates.enabled=false"
+EXTRA_HELM_ARGS="-f ${OVERLAY_FILE} --set-string aap.configAsCode.eeImage=${AAP_IMAGE} --set-string aap.configAsCode.projectGitUri=${AAP_PROJECT_GIT_URI} --set-string aap.configAsCode.projectGitBranch=${AAP_PROJECT_GIT_BRANCH} --set-string operator.image.repository=${OPERATOR_IMAGE_REPOSITORY} --set-string operator.image.tag=${OPERATOR_IMAGE_TAG} --set-string service.images.service.repository=${FULFILLMENT_IMAGE_REPOSITORY} --set-string service.images.service.tag=${FULFILLMENT_IMAGE_TAG} --set aap.instanceGroups.publishTemplates.enabled=false"
 EXISTING_OSAC_RELEASE="$(helm list -n "$OSAC_NAMESPACE" --filter '^osac$' --short)"
 PREVIOUS_DEPLOYMENT_SETTINGS="{}"
 if [[ -n "$EXISTING_OSAC_RELEASE" ]]; then
@@ -2590,6 +3178,8 @@ if [[ -n "$EXISTING_OSAC_RELEASE" || "$OSAC_INSTALL_MODE" == upgrade ]]; then
         --set-string "aap.configAsCode.projectGitBranch=${AAP_PROJECT_GIT_BRANCH}" \
         --set-string "operator.image.repository=${OPERATOR_IMAGE_REPOSITORY}" \
         --set-string "operator.image.tag=${OPERATOR_IMAGE_TAG}" \
+        --set-string "service.images.service.repository=${FULFILLMENT_IMAGE_REPOSITORY}" \
+        --set-string "service.images.service.tag=${FULFILLMENT_IMAGE_TAG}" \
         --set-string "ui.auth.oidcIssuerURL=${OIDC_ISSUER_URL}" \
         --values "$OVERLAY_FILE" \
         --wait --timeout 40m
@@ -2645,7 +3235,7 @@ if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
 fi
 prepare_aap_networking_instance_group
 
-if [[ "$SUITE_USES_VN" == true ]]; then
+if [[ "$SUITE_USES_CLI" == true ]]; then
     # The CLI is a local binary, not another container image.
     info "Preparing a temporary CLI CA bundle and building the CLI from this checkout..."
     CLI_CA_FILE="$(mktemp "${TMPDIR:-/tmp}/osac-5530-ca.XXXXXX")"
@@ -3690,6 +4280,7 @@ if not path.exists():
         "virtual_networks": [],
         "subnets": [],
         "external_ip_pools": [],
+        "external_ips": [],
     }, sort_keys=True))
     raise SystemExit(0)
 expected_virtual_network_columns = {
@@ -3704,6 +4295,9 @@ expected_subnet_columns = {
 expected_external_ip_pool_columns = {
     "uid", "fulfillment_id", "tenant_id", "ip_family", "ipv4_cidr",
 }
+expected_external_ip_columns = {
+    "uid", "fulfillment_id", "tenant_id", "pool_uid", "address",
+}
 connection = None
 try:
     connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=60)
@@ -3713,7 +4307,7 @@ try:
         for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
     version = connection.execute("PRAGMA user_version").fetchone()[0]
-    expected_tables = {"virtual_networks", "subnets", "external_ip_pools"}
+    expected_tables = {"virtual_networks", "subnets", "external_ip_pools", "external_ips"}
     if version != 1 or tables != expected_tables:
         raise SystemExit("AgentlessNet SQLite state is incompatible with schema v1; preserving it")
 
@@ -3729,10 +4323,15 @@ try:
         row[1]
         for row in connection.execute("PRAGMA table_info(external_ip_pools)")
     }
+    external_ip_columns = {
+        row[1]
+        for row in connection.execute("PRAGMA table_info(external_ips)")
+    }
     if (
         virtual_network_columns != expected_virtual_network_columns
         or subnet_columns != expected_subnet_columns
         or external_ip_pool_columns != expected_external_ip_pool_columns
+        or external_ip_columns != expected_external_ip_columns
     ):
         raise SystemExit("AgentlessNet SQLite table definitions are incompatible with schema v1; preserving it")
 
@@ -3757,6 +4356,19 @@ try:
                FROM external_ip_pools ORDER BY uid"""
         )
     ]
+    external_ip_entries = [
+        {
+            "uid": row[0],
+            "fulfillment_id": row[1],
+            "tenant_id": row[2],
+            "pool_uid": row[3],
+            "address": row[4],
+        }
+        for row in connection.execute(
+            """SELECT uid, fulfillment_id, tenant_id, pool_uid, address
+               FROM external_ips ORDER BY uid"""
+        )
+    ]
 except (OSError, sqlite3.DatabaseError, json.JSONDecodeError) as error:
     raise SystemExit("AgentlessNet SQLite state is unreadable; preserving it") from error
 finally:
@@ -3767,6 +4379,7 @@ print(json.dumps({
     "virtual_networks": entries,
     "subnets": subnet_entries,
     "external_ip_pools": external_ip_pool_entries,
+    "external_ips": external_ip_entries,
 }, sort_keys=True))
 PY
 }
@@ -3776,14 +4389,15 @@ save_current_state() {
     jq -e '.schema_version == 1
       and (.virtual_networks | type == "array")
       and (.subnets | type == "array")
-      and (.external_ip_pools | type == "array")' \
+      and (.external_ip_pools | type == "array")
+      and (.external_ips | type == "array")' \
         "$CURRENT_STATE_FILE" >/dev/null \
         || die "AgentlessNet state is not a valid schema-v1 snapshot"
 }
 
 assert_baseline_state_unchanged() {
     local collection uid before after
-    for collection in virtual_networks subnets external_ip_pools; do
+    for collection in virtual_networks subnets external_ip_pools external_ips; do
         while IFS= read -r uid; do
             [[ -n "$uid" ]] || continue
             before="$(jq -cS --arg uid "$uid" --arg collection "$collection" \
@@ -4791,6 +5405,16 @@ run_external_ip_pool_suite() {
     assert_baseline_state_unchanged
 }
 
+run_external_ip_suite() {
+    info "Creating the shared IPv4 ExternalIPPool used by the lifecycle test..."
+    create_external_ip_pool
+    run_external_ip_lifecycle
+    info "Deleting the test-owned ExternalIPPool after all ExternalIPs were released..."
+    delete_external_ip_pool
+    save_current_state
+    assert_baseline_state_unchanged
+}
+
 # Preserve the full pre-test JSON snapshot. Only the UIDs created by this run
 # are asserted or removed; any unrelated node state remains untouched.
 if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
@@ -4801,7 +5425,8 @@ state_snapshot > "$BASELINE_STATE_FILE"
 jq -e '(.schema_version == 0 or .schema_version == 1)
       and (.virtual_networks | type == "array")
       and (.subnets | type == "array")
-      and (.external_ip_pools | type == "array")' \
+      and (.external_ip_pools | type == "array")
+      and (.external_ips | type == "array")' \
     "$BASELINE_STATE_FILE" >/dev/null \
     || die "AgentlessNet state must be empty or use the current schema v1 before the test starts"
 
@@ -4811,6 +5436,7 @@ case "$VLAN_E2E_SUITE" in
     virtual-network) run_virtual_network_suite ;;
     subnet-dhcp) run_subnet_dhcp_suite ;;
     external-ip-pool) run_external_ip_pool_suite ;;
+    external-ip) run_external_ip_suite ;;
 esac
 
 HOST_IP_FORWARDING_AFTER="$(netnode sysctl -n net.ipv4.ip_forward)"
@@ -4833,5 +5459,8 @@ case "$VLAN_E2E_SUITE" in
         ;;
     external-ip-pool)
         info "ExternalIPPool-only E2E passed: one pool was created, verified, deleted, and cleaned up."
+        ;;
+    external-ip)
+        info "ExternalIP-only E2E passed: two addresses were allocated, one UID retry reused its reservation, both addresses were released, pool capacity was restored, and the test pool was deleted."
         ;;
 esac
