@@ -3073,7 +3073,7 @@ done
 oc wait nodes --all --for=condition=Ready --timeout=20m >/dev/null
 
 # Phase 2: reuse source-matched images, or build and push them if missing.
-# ExternalIP capacity behavior and migration 124 ship in the Fulfillment image.
+# ExternalIP capacity behavior and migration 125 ship in the Fulfillment image.
 step "STEP 2 OF 4: Preparing custom AAP, operator, and Fulfillment images"
 REUSE_IMAGES=false
 if [[ "$REUSE_PREBUILT_OSAC_IMAGES" == true ]]; then
