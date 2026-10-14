@@ -2333,7 +2333,6 @@ wait_for_external_ip_ready() {
             external_ip_assert_state "$entry" "$uid" "$id" "$OSAC_TENANT" \
                 "$EXTERNAL_IP_POOL_K8S_UID" "$address"
             LAST_EXTERNAL_IP_UID="$uid"
-            LAST_EXTERNAL_IP_GENERATION="$generation"
             LAST_EXTERNAL_IP_ADDRESS="$address"
             LAST_EXTERNAL_IP_PROVISION_JOB_ID="$job_id"
             info "ExternalIP ${id} is Ready at ${address}; AAP job ${job_id}"
@@ -2354,11 +2353,12 @@ external_ip_remove_created_id() {
 }
 
 delete_external_ip_and_verify() {
-    local id="$1" uid="$2" generation="$3" capacity_delta="$4"
+    local id="$1" uid="$2" capacity_delta="$3"
     local output_file="${TEMP_DIR}/delete-external-ip-${id}.out"
     local hold_finalizer="osac.openshift.io/e2e-hold-external-ip"
     local operator_finalizer="osac.openshift.io/externalip-finalizer"
     local cr crs count deadline=$((SECONDS + 600)) release_job release_job_id="" job_state artifacts
+    local release_generation
     local release_validated=false
     cr="$(external_ip_cr_json "$id")"
     if [[ -z "$(jq -r '.metadata.deletionTimestamp // ""' <<<"$cr")" ]]; then
@@ -2387,6 +2387,8 @@ delete_external_ip_and_verify() {
         fi
         [[ "$count" == 1 ]] || die "Expected one ExternalIP CR for UUID ${id} during deletion"
         cr="$(jq -c '.items[0]' <<<"$crs")"
+        release_generation="$(jq -er '.metadata.generation' <<<"$cr")" \
+            || die "Could not read the deleting ExternalIP ${id} generation"
         release_job="$(jq -c '[.status.provisioningJobs[]? | select(.type == "deprovision")] | last // {}' <<<"$cr")"
         release_job_id="$(jq -r '.jobID // ""' <<<"$release_job")"
         job_state="$(jq -r '.state // ""' <<<"$release_job")"
@@ -2399,7 +2401,7 @@ delete_external_ip_and_verify() {
                 | ($finalizers | index($hold) != null)
                   and ($finalizers | index($operator) == null)' <<<"$cr" >/dev/null; then
             if artifacts="$(external_ip_aap_job_artifacts "$release_job_id" 2>/dev/null)"; then
-                external_ip_assert_result "$artifacts" external_ip.release "$uid" "$generation" \
+                external_ip_assert_result "$artifacts" external_ip.release "$uid" "$release_generation" \
                     || die "AAP release artifact does not match ExternalIP ${id}"
                 release_validated=true
                 break
@@ -2454,7 +2456,6 @@ run_external_ip_lifecycle() {
     external_ip_pool_wait_for_delta 1
     wait_for_external_ip_ready "$EXTERNAL_IP_ONE_ID"
     EXTERNAL_IP_ONE_UID="$LAST_EXTERNAL_IP_UID"
-    EXTERNAL_IP_ONE_GENERATION="$LAST_EXTERNAL_IP_GENERATION"
     EXTERNAL_IP_ONE_ADDRESS="$LAST_EXTERNAL_IP_ADDRESS"
     EXTERNAL_IP_ONE_PROVISION_JOB_ID="$LAST_EXTERNAL_IP_PROVISION_JOB_ID"
     EXTERNAL_IP_ONE_STATE="$(external_ip_state_entry "$EXTERNAL_IP_ONE_UID" "$EXTERNAL_IP_ONE_ID")"
@@ -2466,7 +2467,6 @@ run_external_ip_lifecycle() {
     external_ip_pool_wait_for_delta 2
     wait_for_external_ip_ready "$EXTERNAL_IP_TWO_ID"
     EXTERNAL_IP_TWO_UID="$LAST_EXTERNAL_IP_UID"
-    EXTERNAL_IP_TWO_GENERATION="$LAST_EXTERNAL_IP_GENERATION"
     EXTERNAL_IP_TWO_ADDRESS="$LAST_EXTERNAL_IP_ADDRESS"
     EXTERNAL_IP_TWO_PROVISION_JOB_ID="$LAST_EXTERNAL_IP_PROVISION_JOB_ID"
     EXTERNAL_IP_TWO_STATE="$(external_ip_state_entry "$EXTERNAL_IP_TWO_UID" "$EXTERNAL_IP_TWO_ID")"
@@ -2491,8 +2491,7 @@ run_external_ip_lifecycle() {
         || die "ExternalIP retry changed its UID-owned provider reservation"
     external_ip_pool_wait_for_delta 2
 
-    delete_external_ip_and_verify "$EXTERNAL_IP_ONE_ID" "$EXTERNAL_IP_ONE_UID" \
-        "$EXTERNAL_IP_ONE_GENERATION" 1
+    delete_external_ip_and_verify "$EXTERNAL_IP_ONE_ID" "$EXTERNAL_IP_ONE_UID" 1
     cr="$(external_ip_cr_json "$EXTERNAL_IP_TWO_ID")"
     [[ "$(jq -r '.status.address' <<<"$cr")" == "$EXTERNAL_IP_TWO_ADDRESS" ]] \
         || die "Deleting ExternalIP ${EXTERNAL_IP_ONE_ID} changed its peer address"
@@ -2500,8 +2499,7 @@ run_external_ip_lifecycle() {
     [[ "$state_after_retry" == "$EXTERNAL_IP_TWO_STATE" ]] \
         || die "Deleting ExternalIP ${EXTERNAL_IP_ONE_ID} changed its peer reservation"
 
-    delete_external_ip_and_verify "$EXTERNAL_IP_TWO_ID" "$EXTERNAL_IP_TWO_UID" \
-        "$EXTERNAL_IP_TWO_GENERATION" 0
+    delete_external_ip_and_verify "$EXTERNAL_IP_TWO_ID" "$EXTERNAL_IP_TWO_UID" 0
     external_ip_pool_wait_for_delta 0
     save_current_state
     assert_baseline_state_unchanged
@@ -2512,8 +2510,11 @@ cleanup_created_external_ips() {
     [[ -n "$CLI_BIN" && -x "$CLI_BIN" && -n "$CLI_CONFIG_DIR" && -d "$CLI_CONFIG_DIR" ]] \
         || return 1
 
-    local id crs count cr uid name output_file release_job job_state
+    local id crs count cr uid name output_file release_job release_job_id job_state
+    local release_generation artifacts hold_finalizer operator_finalizer
     local state_file remaining deadline
+    hold_finalizer="osac.openshift.io/e2e-hold-external-ip"
+    operator_finalizer="osac.openshift.io/externalip-finalizer"
     for id in "${CREATED_EXTERNAL_IP_IDS[@]}"; do
         if ! crs="$(external_ip_crs_json "$id")"; then
             printf 'Could not read ExternalIP %s while cleaning up\n' "$id" >&2
@@ -2545,22 +2546,27 @@ cleanup_created_external_ips() {
                 [[ "$count" == 1 ]] || return 1
                 cr="$(jq -c '.items[0]' <<<"$crs")"
                 release_job="$(jq -c '[.status.provisioningJobs[]? | select(.type == "deprovision")] | last // {}' <<<"$cr")"
+                release_job_id="$(jq -r '.jobID // ""' <<<"$release_job")"
                 job_state="$(jq -r '.state // ""' <<<"$release_job")"
                 if [[ "$job_state" == Failed || "$job_state" == Canceled ]]; then
                     printf 'ExternalIP %s release job ended in %s; preserving resources\n' "$id" "$job_state" >&2
                     return 1
                 fi
-                if [[ "$job_state" == Succeeded ]] \
-                    && jq -e --arg hold "osac.openshift.io/e2e-hold-external-ip" \
-                        --arg operator "osac.openshift.io/externalip-finalizer" '
+                if [[ -n "$release_job_id" ]] \
+                    && jq -e --arg hold "$hold_finalizer" --arg operator "$operator_finalizer" '
                         (.metadata.finalizers // []) as $values
                         | ($values | index($hold) != null)
                           and ($values | index($operator) == null)' <<<"$cr" >/dev/null; then
-                    oc patch externalip "$name" -n "$NETWORKING_NAMESPACE" \
-                        --type=merge -p="$(jq -c --arg hold "osac.openshift.io/e2e-hold-external-ip" \
-                            '{metadata:{finalizers:((.metadata.finalizers // []) | map(select(. != $hold)))}}' \
-                            <<<"$cr")" >/dev/null \
-                        || return 1
+                    release_generation="$(jq -er '.metadata.generation' <<<"$cr")" || return 1
+                    if artifacts="$(external_ip_aap_job_artifacts "$release_job_id" 2>/dev/null)" \
+                        && external_ip_assert_result "$artifacts" external_ip.release "$uid" \
+                            "$release_generation"; then
+                        oc patch externalip "$name" -n "$NETWORKING_NAMESPACE" \
+                            --type=merge -p="$(jq -c --arg hold "$hold_finalizer" \
+                                '{metadata:{finalizers:((.metadata.finalizers // []) | map(select(. != $hold)))}}' \
+                                <<<"$cr")" >/dev/null \
+                            || return 1
+                    fi
                 fi
                 sleep 2
             done
