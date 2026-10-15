@@ -8,23 +8,25 @@ mgmt:
 
 topology:
   kinds:
-    cvx:
-      image: networkop/cx:5.3.0
     linux:
       image: alpine:3.19
 
   nodes:
     leaf-1:
-      kind: cvx
+      kind: nvidia_cumulusvx
+      image: ${CUMULUS_VX_IMAGE}
       mgmt-ipv4: ${MGMT_PREFIX}.11
-      binds:
-        - /lib/modules:/lib/modules:ro
+      startup-config: ${CUMULUS_STARTUP_CONFIG}
+      healthcheck:
+        start-period: 1200
 
     leaf-2:
-      kind: cvx
+      kind: nvidia_cumulusvx
+      image: ${CUMULUS_VX_IMAGE}
       mgmt-ipv4: ${MGMT_PREFIX}.12
-      binds:
-        - /lib/modules:/lib/modules:ro
+      startup-config: ${CUMULUS_STARTUP_CONFIG}
+      healthcheck:
+        start-period: 1200
 
     net-node:
       kind: linux
