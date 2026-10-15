@@ -25,9 +25,12 @@ Suites:
 
 All suites boot or reuse the SNO, prepare source-matched images, install or
 upgrade OSAC, and initialize the Containerlab fabric before running the
-selected checks. The runner also corrects the known development database
-version marker to schema V1 before creating test resources. Keep the
-AgentlessNet state schema at V1 until OSAC-5528 is complete.
+selected checks. Set CUMULUS_VERSION and CUMULUS_VX_IMAGE to the exact guest
+release and its Boxen image. CUMULUS_LAB_ADMIN_KEY defaults to the ignored
+local lab key path; VLAN_E2E_RUN_DIR optionally retains sanitized run evidence.
+The runner also corrects the known development database version marker to
+schema V1 before creating test resources. Keep the AgentlessNet state schema
+at V1 until OSAC-5528 is complete.
 
 Examples:
   bash ./vlan-e2e.sh
@@ -127,6 +130,15 @@ OSAC_PROFILE="${OSAC_PROFILE:-caas-ci}"
 OSAC_INSTALL_MODE="${OSAC_INSTALL_MODE:-auto}"
 KUBECONFIG="${KUBECONFIG:-${HOME}/.kube/${MGMT_CLONE_NAME}.kubeconfig}"
 export KUBECONFIG
+CUMULUS_VERSION="${CUMULUS_VERSION:-}"
+CUMULUS_VX_IMAGE="${CUMULUS_VX_IMAGE:-}"
+CUMULUS_LAB_ADMIN_KEY="${CUMULUS_LAB_ADMIN_KEY:-${REPO_ROOT}/.artifacts/agentless-net-lab/admin_ed25519}"
+CUMULUS_SSH_CONFIG_FILE="${REPO_ROOT}/.artifacts/agentless-net-lab/ssh_config"
+CUMULUS_STARTUP_CONFIG=""
+CUMULUS_ADMIN_PUBLIC_KEY_FILE=""
+CUMULUS_IMAGE_ID=""
+CUMULUS_IMAGE_PROVENANCE_FILE="${CUMULUS_IMAGE_PROVENANCE_FILE:-}"
+VLAN_E2E_RUN_DIR="${VLAN_E2E_RUN_DIR:-}"
 
 CONTAINER_TOOL="${CONTAINER_TOOL:-podman}"
 # auto reuses images tagged for the latest commit outside this runner; true/false force reuse/build.
@@ -217,6 +229,10 @@ NETNODE_DOCKER_BRIDGE_ATTACHED_BY_RUN=false
 NETNODE_SUDOERS_CREATED_BY_RUN=false
 NETNODE_SSHD_CREATED_BY_RUN=false
 SWITCH_ACCESS_CONFIGURED=false
+RUN_DIR_CREATED=false
+RUN_STARTED_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+CUMULUS_SSH_CONFIG_CREATED_BY_RUN=false
+CURRENT_STAGE="startup"
 SUPERVISOR_CONFIG_CREATED_BY_RUN=false
 SUPERVISOR_DAEMON_STARTED_BY_RUN=false
 ACCESS_PORTS_SNAPSHOT_FILE=""
@@ -244,6 +260,7 @@ UPGRADE_VALUES_FILE=""
 
 info() { printf '==> %s\n' "$*"; }
 step() {
+    CURRENT_STAGE="$*"
     printf '\n========================\n%s\n=============================\n' "$*"
 }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -583,6 +600,174 @@ PY
     SSH_PRIVATE_KEY_FILE="$key_file"
 }
 
+ensure_cumulus_admin_identity() {
+    local key_dir key_mode dir_mode public_key existing_switch
+    key_dir="$(dirname "$CUMULUS_LAB_ADMIN_KEY")"
+    if [[ ! -s "$CUMULUS_LAB_ADMIN_KEY" ]]; then
+        for existing_switch in "${CONTAINERLAB_PREFIX}-leaf-1" "${CONTAINERLAB_PREFIX}-leaf-2"; do
+            if docker inspect "$existing_switch" >/dev/null 2>&1; then
+                die "Cumulus admin key is missing while $existing_switch exists; set CUMULUS_LAB_ADMIN_KEY to its original key or recover the guest before continuing"
+            fi
+        done
+        mkdir -p -- "$key_dir"
+        chmod 0700 "$key_dir"
+        ssh-keygen -q -t ed25519 -N '' -C osac-agentless-lab-admin -f "$CUMULUS_LAB_ADMIN_KEY"
+        chmod 0600 "$CUMULUS_LAB_ADMIN_KEY"
+    fi
+    [[ -f "$CUMULUS_LAB_ADMIN_KEY" && ! -L "$CUMULUS_LAB_ADMIN_KEY" ]] \
+        || die "CUMULUS_LAB_ADMIN_KEY must be a regular private-key file"
+    [[ -d "$key_dir" && ! -L "$key_dir" ]] \
+        || die "The CUMULUS_LAB_ADMIN_KEY parent must be a regular directory"
+    dir_mode="$(stat -c '%a' "$key_dir")" \
+        || die "Could not inspect the CUMULUS_LAB_ADMIN_KEY parent directory"
+    [[ "$dir_mode" =~ ^[0-7]{3,4}$ ]] \
+        || die "Could not parse the CUMULUS_LAB_ADMIN_KEY parent permissions"
+    (( (8#$dir_mode & 077) == 0 )) \
+        || die "The CUMULUS_LAB_ADMIN_KEY parent directory must not be accessible by group or other users"
+    key_mode="$(stat -c '%a' "$CUMULUS_LAB_ADMIN_KEY")" \
+        || die "Could not inspect CUMULUS_LAB_ADMIN_KEY permissions"
+    [[ "$key_mode" =~ ^[0-7]{3,4}$ ]] \
+        || die "Could not parse CUMULUS_LAB_ADMIN_KEY permissions"
+    (( (8#$key_mode & 077) == 0 )) \
+        || die "CUMULUS_LAB_ADMIN_KEY must not be accessible by group or other users"
+    public_key="$(ssh-keygen -y -f "$CUMULUS_LAB_ADMIN_KEY" 2>/dev/null)" \
+        || die "Could not read CUMULUS_LAB_ADMIN_KEY; encrypted or invalid keys are unsupported"
+    CUMULUS_ADMIN_PUBLIC_KEY_FILE="$TEMP_DIR/cumulus-admin.pub"
+    printf '%s\n' "$public_key" >"$CUMULUS_ADMIN_PUBLIC_KEY_FILE"
+    chmod 0600 "$CUMULUS_ADMIN_PUBLIC_KEY_FILE"
+}
+
+prepare_cumulus_startup_config() {
+    [[ -s "$CUMULUS_ADMIN_PUBLIC_KEY_FILE" ]] \
+        || die "Cumulus administrator public key is unavailable for startup configuration"
+    CUMULUS_STARTUP_CONFIG="$TEMP_DIR/cumulus-startup.cfg"
+    python3 - "$CUMULUS_ADMIN_PUBLIC_KEY_FILE" "$CUMULUS_STARTUP_CONFIG" <<'PY'
+import pathlib
+import shlex
+import sys
+
+public_key = pathlib.Path(sys.argv[1]).read_text().strip()
+key_literal = shlex.quote(public_key)
+commands = [
+    "install -d -m 0700 /home/cumulus/.ssh",
+    "touch /home/cumulus/.ssh/authorized_keys",
+    f"grep -Fqx -- {key_literal} /home/cumulus/.ssh/authorized_keys || printf '%s\\n' {key_literal} >> /home/cumulus/.ssh/authorized_keys",
+    "chmod 0600 /home/cumulus/.ssh/authorized_keys",
+]
+pathlib.Path(sys.argv[2]).write_text("\n".join(commands) + "\n")
+PY
+    chmod 0600 "$CUMULUS_STARTUP_CONFIG"
+}
+
+write_cumulus_ssh_config() {
+    local provider_key="${SSH_PRIVATE_KEY_FILE:-}"
+    local known_hosts_file="${TEMP_DIR}/known_hosts"
+    if [[ "${CUMULUS_SSH_CONFIG_CREATED_BY_RUN:-false}" != true \
+        && ( -e "$CUMULUS_SSH_CONFIG_FILE" || -L "$CUMULUS_SSH_CONFIG_FILE" ) ]]; then
+        die "A previous Cumulus SSH config exists at $CUMULUS_SSH_CONFIG_FILE; inspect and remove it before starting another lab run"
+    fi
+    mkdir -p -- "$(dirname "$CUMULUS_SSH_CONFIG_FILE")"
+    chmod 0700 "$(dirname "$CUMULUS_SSH_CONFIG_FILE")"
+    python3 - "$SWITCH_MANIFEST_FILE" "$CONTAINERLAB_PREFIX" \
+        "$CUMULUS_LAB_ADMIN_KEY" "$provider_key" "$known_hosts_file" \
+        "$CUMULUS_SSH_CONFIG_FILE" <<'PY'
+import json
+import pathlib
+import sys
+
+manifest_path, prefix, admin_key, provider_key, known_hosts, output_path = sys.argv[1:]
+manifest = json.loads(pathlib.Path(manifest_path).read_text())
+if not isinstance(manifest, dict) or not isinstance(manifest.get("switches"), list):
+    raise SystemExit("switch manifest must contain a switches array")
+
+def config_value(value):
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+lines = []
+for switch in manifest["switches"]:
+    name = switch["name"]
+    expected_prefix = prefix + "-"
+    if not name.startswith(expected_prefix):
+        raise SystemExit(f"switch name does not match Containerlab topology: {name}")
+    node = name[len(expected_prefix):]
+    if node not in ("leaf-1", "leaf-2"):
+        raise SystemExit(f"unsupported Cumulus switch alias: {node}")
+    for identity, key_path in (("admin", admin_key), ("provider", provider_key)):
+        if identity == "provider" and not key_path:
+            continue
+        alias = f"osac-agentless-{node}-{identity}"
+        lines.extend(
+            [
+                f"Host {alias}",
+                f"  HostName {switch['ansible_host']}",
+                f"  User {switch['ansible_user']}",
+                f"  Port {switch['ansible_port']}",
+                f"  IdentityFile {config_value(key_path)}",
+                "  IdentitiesOnly yes",
+                "  BatchMode yes",
+                "  ConnectTimeout 5",
+                "  StrictHostKeyChecking accept-new",
+                f"  UserKnownHostsFile {config_value(known_hosts)}",
+                "  LogLevel ERROR",
+                "",
+            ]
+        )
+path = pathlib.Path(output_path)
+path.write_text("\n".join(lines))
+path.chmod(0o600)
+PY
+    chmod 0600 "$CUMULUS_SSH_CONFIG_FILE"
+    CUMULUS_SSH_CONFIG_CREATED_BY_RUN=true
+}
+
+switch_ssh() {
+    local identity="$1" use_sudo="$2" switch="$3" node alias remote_command
+    shift 3
+    node="${switch#${CONTAINERLAB_PREFIX}-}"
+    [[ "$node" == leaf-1 || "$node" == leaf-2 ]] \
+        || die "Unknown Cumulus guest in switch manifest: $switch"
+    alias="osac-agentless-${node}-${identity}"
+    remote_command="$(python3 - "$use_sudo" "$@" <<'PY'
+import shlex
+import sys
+
+use_sudo = sys.argv[1] == "true"
+args = sys.argv[2:]
+if not args:
+    raise SystemExit("switch command is empty")
+if use_sudo:
+    args = ["sudo", "-n", *args]
+print(" ".join(shlex.quote(arg) for arg in args))
+PY
+)" || return 1
+    [[ -n "$remote_command" ]] || return 1
+    ssh -F "$CUMULUS_SSH_CONFIG_FILE" "$alias" "$remote_command"
+}
+
+switch_exec() {
+    local switch="$1"
+    shift
+    switch_ssh provider true "$switch" "$@"
+}
+
+switch_provider_user_exec() {
+    local switch="$1"
+    shift
+    switch_ssh provider false "$switch" "$@"
+}
+
+switch_admin_exec() {
+    local switch="$1"
+    shift
+    switch_ssh admin true "$switch" "$@"
+}
+
+switch_admin_user_exec() {
+    local switch="$1"
+    shift
+    switch_ssh admin false "$switch" "$@"
+}
+
 ensure_containerlab_net_node() {
     local node_state existing_names
     [[ -f "$CONTAINERLAB_TOPOLOGY" && -f "$CONTAINERLAB_INVENTORY" \
@@ -593,6 +778,8 @@ ensure_containerlab_net_node() {
         node_state="$(docker inspect -f '{{.State.Running}}' "$CONTAINERLAB_NET_NODE")"
         [[ "$node_state" == true ]] \
             || die "The Containerlab network node exists but is stopped; refusing to modify a partial lab"
+        ensure_containerlab_switches
+        assert_containerlab_switch_images
         info "Reusing the running Containerlab network node."
         return 0
     fi
@@ -605,6 +792,8 @@ ensure_containerlab_net_node() {
         "MGMT_CIDR=$MGMT_CIDR" \
         "MGMT_GW=$MGMT_GW" \
         "MGMT_PREFIX=$MGMT_PREFIX" \
+        "CUMULUS_VX_IMAGE=$CUMULUS_VX_IMAGE" \
+        "CUMULUS_STARTUP_CONFIG=$CUMULUS_STARTUP_CONFIG" \
         "$CONTAINERLAB" deploy -t "$CONTAINERLAB_TOPOLOGY"
     for ((attempt = 1; attempt <= 60; attempt++)); do
         if docker inspect "$CONTAINERLAB_NET_NODE" >/dev/null 2>&1; then
@@ -792,79 +981,129 @@ ensure_containerlab_switches() {
     done < <(jq -r '.switches[].name' "$SWITCH_MANIFEST_FILE")
 }
 
+assert_containerlab_switch_images() {
+    local switch current_image current_image_id
+    while IFS= read -r switch; do
+        [[ -n "$switch" ]] || continue
+        current_image="$(docker inspect -f '{{.Config.Image}}' "$switch")" \
+            || die "Could not inspect the Containerlab switch image for $switch"
+        [[ "$current_image" == "$CUMULUS_VX_IMAGE" ]] \
+            || die "Containerlab switch $switch uses $current_image; expected $CUMULUS_VX_IMAGE. Migrate only leaf-1 and leaf-2 with the documented filtered Containerlab commands."
+        current_image_id="$(docker inspect -f '{{.Image}}' "$switch")" \
+            || die "Could not inspect the resolved Containerlab switch image ID for $switch"
+        [[ "$current_image_id" == "$CUMULUS_IMAGE_ID" ]] \
+            || die "Containerlab switch $switch runs image $current_image_id; expected $CUMULUS_IMAGE_ID. Migrate only leaf-1 and leaf-2 with the documented filtered Containerlab commands."
+    done < <(jq -r '.switches[].name' "$SWITCH_MANIFEST_FILE")
+}
+
+wait_for_cumulus_guests() {
+    local switch expected_address health guest_ready deadline next_report version mgmt_address pending_diff
+    deadline=$((SECONDS + 1200))
+    next_report=$((SECONDS + 60))
+    ensure_containerlab_switches
+    while IFS= read -r switch; do
+        [[ -n "$switch" ]] || continue
+        expected_address="$(jq -er --arg name "$switch" \
+            '.switches[] | select(.name == $name) | .ansible_host' "$SWITCH_MANIFEST_FILE")" \
+            || die "Could not resolve the management address for $switch"
+        guest_ready=false
+        while ((SECONDS < deadline)); do
+            health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$switch" 2>/dev/null || true)"
+            if [[ "$health" == healthy ]] \
+                && switch_admin_user_exec "$switch" true >/dev/null 2>&1; then
+                guest_ready=true
+                break
+            fi
+            if ((SECONDS >= next_report)); then
+                info "Waiting for Boxen guest $switch (health=$health)"
+                next_report=$((SECONDS + 60))
+            fi
+            sleep 5
+        done
+        if [[ "$guest_ready" != true ]]; then
+            printf 'ERROR: Boxen guest %s did not become healthy and SSH-ready within 20 minutes\n' "$switch" >&2
+            docker logs --tail 100 "$switch" >&2 || true
+            return 1
+        fi
+
+        version="$(switch_admin_user_exec "$switch" sh -c '. /etc/os-release; printf "%s" "$VERSION_ID"')" \
+            || die "Could not read the guest release from $switch"
+        [[ "$version" == "$CUMULUS_VERSION" ]] \
+            || die "Cumulus guest $switch reports $version; expected $CUMULUS_VERSION"
+        mgmt_address="$(switch_admin_user_exec "$switch" ip -4 -o addr show dev eth0 \
+            | awk '{print $4}' | cut -d/ -f1)" \
+            || die "Could not read the IPv4 management address from $switch"
+        [[ "$mgmt_address" == "$expected_address" ]] \
+            || die "Cumulus guest $switch has management address $mgmt_address; expected $expected_address"
+        switch_admin_user_exec "$switch" sudo -n true \
+            || die "Cumulus guest $switch does not have the required passwordless sudo baseline"
+        switch_admin_user_exec "$switch" sh -c \
+            'for port in swp1 swp2 swp3 swp4; do ip link show dev "$port" >/dev/null 2>&1 || exit 1; done' \
+            || die "Cumulus guest $switch does not expose swp1 through swp4"
+        pending_diff="$(switch_admin_user_exec "$switch" nv config diff --output commands)" \
+            || die "Could not inspect the pending NVUE candidate on $switch"
+        [[ -z "$pending_diff" ]] \
+            || die "Cumulus guest $switch has unapplied NVUE candidate changes before fabric setup"
+        info "Boxen guest $switch is ready: Cumulus $version, management $mgmt_address, swp1-swp4 present."
+    done < <(jq -r '.switches[].name' "$SWITCH_MANIFEST_FILE")
+}
+
 prepare_containerlab_switches() {
-    local switch public_key user ssh_output address port attempt ready
+    local switch public_key admin_public_key ssh_output user
     [[ -f "$SSH_PUBLIC_KEY_FILE" ]] || die "The temporary AgentlessNet SSH public key is missing"
     public_key="$(<"$SSH_PUBLIC_KEY_FILE")"
+    admin_public_key="$(<"$CUMULUS_ADMIN_PUBLIC_KEY_FILE")"
+    [[ "$public_key" != "$admin_public_key" ]] \
+        || die "The per-run AAP SSH key must differ from the persistent Cumulus administrator key"
     ensure_containerlab_switches
+    write_cumulus_ssh_config
     SWITCH_ACCESS_CONFIGURED=true
     while IFS= read -r switch; do
         [[ -n "$switch" ]] || continue
         user="$(jq -r --arg name "$switch" \
             '.switches[] | select(.name == $name) | .ansible_user' "$SWITCH_MANIFEST_FILE")"
-        if docker exec "$switch" test -f /etc/sudoers.d/osac-agentless-net; then
-            if docker exec "$switch" grep -Fxq '# OSAC-5530 temporary provider access' \
-                /etc/sudoers.d/osac-agentless-net || docker exec "$switch" grep -Fxq \
+        switch_admin_exec "$switch" test -r /etc/sudoers.d/osac-cumulus-lab-bootstrap \
+            || die "Cumulus switch $switch lacks the packaged lab sudo baseline; rebuild its Boxen image"
+        switch_admin_exec "$switch" grep -Fqx \
+            'cumulus ALL=(ALL) NOPASSWD: ALL' /etc/sudoers.d/osac-cumulus-lab-bootstrap \
+            || die "Cumulus switch $switch has an invalid lab sudo baseline"
+        switch_admin_user_exec "$switch" sudo -n true \
+            || die "Cumulus switch $switch does not allow the required sudo -n provider operations"
+        if switch_admin_exec "$switch" test -f /etc/sudoers.d/osac-agentless-net; then
+            if switch_admin_exec "$switch" grep -Fxq '# OSAC-5530 temporary provider access' \
+                /etc/sudoers.d/osac-agentless-net || switch_admin_exec "$switch" grep -Fxq \
                 '# OSAC-5529 temporary provider access' /etc/sudoers.d/osac-agentless-net; then
                 SWITCH_SUDOERS_CREATED_BY_RUN["$switch"]=true
             else
                 die "Cumulus switch $switch already has an unrelated sudoers file at the test path"
             fi
-        else
-            docker exec -i "$switch" sh -s <<'SH'
-set -eu
-printf '%s\n' '# OSAC-5530 temporary provider access' 'cumulus ALL=(ALL) NOPASSWD: ALL' >/etc/sudoers.d/osac-agentless-net
-chmod 0440 /etc/sudoers.d/osac-agentless-net
-visudo -cf /etc/sudoers.d/osac-agentless-net >/dev/null
-SH
-            SWITCH_SUDOERS_CREATED_BY_RUN["$switch"]=true
         fi
-        docker exec "$switch" id "$user" >/dev/null 2>&1 \
+        switch_admin_user_exec "$switch" id "$user" >/dev/null 2>&1 \
             || die "Cumulus switch $switch does not have its expected SSH user"
-        if docker exec "$switch" sh -c 'test -f /home/cumulus/.ssh/authorized_keys'; then
+        if switch_admin_user_exec "$switch" test -f /home/cumulus/.ssh/authorized_keys; then
             SWITCH_AUTHORIZED_KEYS_EXISTED["$switch"]=true
         else
             SWITCH_AUTHORIZED_KEYS_EXISTED["$switch"]=false
         fi
-        if docker exec "$switch" sh -c \
+        if switch_admin_user_exec "$switch" sh -c \
             'test -f /home/cumulus/.ssh/authorized_keys && grep -Fxq "$1" /home/cumulus/.ssh/authorized_keys' \
             sh "$public_key"; then
-            SWITCH_PUBLIC_KEY_INSTALLED_BY_RUN["$switch"]="$SSH_KEY_CREATED_BY_RUN"
+            SWITCH_PUBLIC_KEY_INSTALLED_BY_RUN["$switch"]=false
         else
-            docker exec "$switch" sh -c \
-                'install -d -o cumulus -g cumulus -m 0700 /home/cumulus/.ssh'
-            docker exec -i "$switch" sh -c \
-                'cat >>/home/cumulus/.ssh/authorized_keys' <"$SSH_PUBLIC_KEY_FILE"
-            docker exec "$switch" chown cumulus:cumulus /home/cumulus/.ssh/authorized_keys
-            docker exec "$switch" chmod 0600 /home/cumulus/.ssh/authorized_keys
+            switch_admin_user_exec "$switch" sh -c \
+                'set -eu; install -d -m 0700 /home/cumulus/.ssh; touch /home/cumulus/.ssh/authorized_keys; grep -Fqx -- "$1" /home/cumulus/.ssh/authorized_keys || printf "%s\\n" "$1" >>/home/cumulus/.ssh/authorized_keys; chmod 0600 /home/cumulus/.ssh/authorized_keys' \
+                sh "$public_key"
             SWITCH_PUBLIC_KEY_INSTALLED_BY_RUN["$switch"]=true
         fi
     done < <(jq -r '.switches[].name' "$SWITCH_MANIFEST_FILE")
     while IFS= read -r switch; do
         [[ -n "$switch" ]] || continue
-        address="$(jq -r --arg name "$switch" \
-            '.switches[] | select(.name == $name) | .ansible_host' "$SWITCH_MANIFEST_FILE")"
-        port="$(jq -r --arg name "$switch" \
-            '.switches[] | select(.name == $name) | .ansible_port' "$SWITCH_MANIFEST_FILE")"
         ssh_output="$TEMP_DIR/switch-${switch}-ssh-check.log"
-        ready=false
-        for ((attempt = 1; attempt <= 60; attempt++)); do
-            if ssh -i "$SSH_PRIVATE_KEY_FILE" \
-                -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
-                -o "UserKnownHostsFile=$TEMP_DIR/known_hosts" -o ConnectTimeout=5 \
-                -p "$port" "cumulus@$address" \
-                'sudo -n true && sudo -n bridge -j vlan show >/dev/null && sudo -n nv show bridge --output json >/dev/null' \
-                >"$ssh_output" 2>&1; then
-                ready=true
-                break
-            fi
-            if ((attempt < 60)); then
-                sleep 2
-            fi
-        done
-        if [[ "$ready" != true ]]; then
+        if ! switch_provider_user_exec "$switch" sh -c \
+            'sudo -n true && sudo -n bridge -j vlan show >/dev/null && sudo -n nv show bridge --output json >/dev/null' \
+            >"$ssh_output" 2>&1; then
             tail -n 30 "$ssh_output" >&2
-            die "Cumulus switch $switch did not become ready for VLAN discovery and NVUE configuration"
+            die "Cumulus switch $switch is not reachable through the per-run provider SSH identity"
         fi
     done < <(jq -r '.switches[].name' "$SWITCH_MANIFEST_FILE")
     info "Containerlab Cumulus switches are reachable with the isolated provider SSH key."
@@ -874,7 +1113,7 @@ configure_containerlab_fabric() {
     local switch pending_diff playbook_log
     while IFS= read -r switch; do
         [[ -n "$switch" ]] || continue
-        if ! pending_diff="$(docker exec "$switch" nv config diff --color off)"; then
+        if ! pending_diff="$(switch_exec "$switch" nv config diff --output commands)"; then
             die "Could not inspect pending NVUE changes on $switch"
         fi
         [[ -z "$pending_diff" ]] \
@@ -1368,7 +1607,7 @@ remove_containerlab_switch_keys() {
         [[ -n "$switch" ]] || continue
         [[ "${SWITCH_PUBLIC_KEY_INSTALLED_BY_RUN[$switch]:-false}" == true ]] || continue
         keep_empty="${SWITCH_AUTHORIZED_KEYS_EXISTED[$switch]:-false}"
-        docker exec "$switch" sh -c '
+        switch_admin_exec "$switch" sh -c '
             set -eu
             public_key=$1
             keep_empty=$2
@@ -1394,7 +1633,7 @@ restore_containerlab_switch_access() {
     while IFS= read -r switch; do
         [[ -n "$switch" ]] || continue
         if [[ "${SWITCH_SUDOERS_CREATED_BY_RUN[$switch]:-false}" == true ]]; then
-            docker exec "$switch" sh -c '
+            switch_admin_exec "$switch" sh -c '
                 if grep -Fxq "# OSAC-5530 temporary provider access" /etc/sudoers.d/osac-agentless-net \
                     || grep -Fxq "# OSAC-5529 temporary provider access" /etc/sudoers.d/osac-agentless-net; then
                     rm -f /etc/sudoers.d/osac-agentless-net
@@ -2839,7 +3078,7 @@ cleanup_created_virtual_networks() {
     if [[ -n "$CLI_CA_FILE" ]]; then
         rm -f -- "$CLI_CA_FILE"
     fi
-    if [[ -n "$TEMP_DIR" ]]; then
+    if [[ -n "$TEMP_DIR" && "$RUN_DIR_CREATED" != true ]]; then
         rm -rf -- "$TEMP_DIR"
     fi
     return 0
@@ -2873,6 +3112,94 @@ export_dhcp_debug_artifacts() {
     fi
 }
 
+write_run_evidence() {
+    local status="$1" cleanup_status="$2" switch
+    local switch_rows
+    [[ "$RUN_DIR_CREATED" == true && -n "$VLAN_E2E_RUN_DIR" ]] || return 0
+    switch_rows="$VLAN_E2E_RUN_DIR/switches.jsonl"
+    : >"$switch_rows"
+    if [[ -n "$SWITCH_MANIFEST_FILE" && -f "$SWITCH_MANIFEST_FILE" ]]; then
+        while IFS= read -r switch; do
+            [[ -n "$switch" ]] || continue
+            local container_state guest_version candidate_diff bridge_state
+            container_state="$(docker inspect -f '{{.State.Status}}/{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}/{{.Image}}' "$switch" 2>/dev/null || printf 'missing')"
+            guest_version="unavailable"
+            candidate_diff="unavailable"
+            bridge_state="unavailable"
+            if [[ -f "$CUMULUS_SSH_CONFIG_FILE" ]]; then
+                guest_version="$(switch_admin_user_exec "$switch" sh -c '. /etc/os-release; printf "%s" "$VERSION_ID"' 2>/dev/null || printf 'unavailable')"
+                candidate_diff="$(switch_admin_user_exec "$switch" nv config diff --output commands 2>/dev/null || printf 'unavailable')"
+                bridge_state="$(switch_admin_user_exec "$switch" /usr/sbin/bridge -j vlan show 2>/dev/null || printf 'unavailable')"
+            fi
+            jq -nc --arg name "$switch" --arg container "$container_state" \
+                --arg guest_version "$guest_version" --arg candidate_diff "$candidate_diff" \
+                --arg bridge_state "$bridge_state" \
+                '{name:$name,container:$container,guest_version:$guest_version,candidate_diff:$candidate_diff,bridge_state:$bridge_state}' \
+                >>"$switch_rows" || return 1
+        done < <(jq -r '.switches[].name' "$SWITCH_MANIFEST_FILE")
+    fi
+    python3 - "$VLAN_E2E_RUN_DIR/summary.json" "$RUN_STARTED_AT_UTC" \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$status" "$cleanup_status" "$CURRENT_STAGE" \
+        "$VLAN_E2E_SUITE" "$CURRENT_BRANCH" \
+        "$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || printf 'unknown')" \
+        "$(git -C "$REPO_ROOT" log -1 --format=%H -- osac-aap osac-operator proto 2>/dev/null || true)" \
+        "$AAP_PROJECT_GIT_BRANCH" "$AAP_PROJECT_EXPECTED_REVISION" \
+        "$CUMULUS_VERSION" "$CUMULUS_VX_IMAGE" "$CUMULUS_IMAGE_ID" \
+        "$CUMULUS_IMAGE_PROVENANCE_FILE" "$switch_rows" <<'PY'
+import json
+import pathlib
+import sys
+
+(
+    output_path,
+    started_at,
+    finished_at,
+    exit_status,
+    cleanup_status,
+    failed_stage,
+    suite,
+    branch,
+    repository_sha,
+    runtime_sha,
+    aap_project_branch,
+    aap_project_revision,
+    cumulus_version,
+    cumulus_image,
+    cumulus_image_id,
+    provenance_path,
+    switches_path,
+) = sys.argv[1:]
+provenance = None
+if provenance_path and pathlib.Path(provenance_path).is_file():
+    provenance = json.loads(pathlib.Path(provenance_path).read_text())
+switches = []
+switches_file = pathlib.Path(switches_path)
+if switches_file.is_file():
+    switches = [json.loads(line) for line in switches_file.read_text().splitlines() if line]
+summary = {
+    "started_at_utc": started_at,
+    "finished_at_utc": finished_at,
+    "exit_status": int(exit_status),
+    "cleanup_status": int(cleanup_status),
+    "failed_stage": failed_stage,
+    "suite": suite,
+    "repository": {"branch": branch, "sha": repository_sha, "runtime_sha": runtime_sha},
+    "aap_project": {"branch": aap_project_branch, "expected_revision": aap_project_revision},
+    "cumulus": {
+        "expected_version": cumulus_version,
+        "image": cumulus_image,
+        "image_id": cumulus_image_id,
+        "provenance": provenance,
+    },
+    "switches": switches,
+}
+path = pathlib.Path(output_path)
+path.write_text(json.dumps(summary, indent=2) + "\n")
+path.chmod(0o600)
+switches_file.unlink(missing_ok=True)
+PY
+}
+
 on_exit() {
     local status=$?
     local cleanup_status=0
@@ -2904,6 +3231,11 @@ on_exit() {
     if [[ "$status" == 0 && "$cleanup_status" != 0 ]]; then
         status=1
     fi
+    if ! write_run_evidence "$status" "$cleanup_status"; then
+        printf 'ERROR: could not write the requested E2E evidence to %s\n' "$VLAN_E2E_RUN_DIR" >&2
+        cleanup_status=1
+        status=1
+    fi
     if [[ "$PRESERVE_E2E_RECOVERY_ARTIFACTS" == true ]]; then
         printf 'Recovery artifacts and provider credentials are preserved in %s\n' "$TEMP_DIR" >&2
     else
@@ -2914,6 +3246,10 @@ on_exit() {
             rm -f -- "$CLI_BIN"
         fi
         [[ -z "$CLI_CA_FILE" ]] || rm -f -- "$CLI_CA_FILE"
+        if [[ "$CUMULUS_SSH_CONFIG_CREATED_BY_RUN" == true ]]; then
+            rm -f -- "$CUMULUS_SSH_CONFIG_FILE"
+            CUMULUS_SSH_CONFIG_CREATED_BY_RUN=false
+        fi
         [[ -z "$TEMP_DIR" ]] || rm -rf -- "$TEMP_DIR"
     fi
     set -e
@@ -2921,7 +3257,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-for tool in cluster-tool virsh oc helm go jq python3 awk sed grep sort sleep make ssh-keygen base64 grpcurl docker sudo ssh uv; do
+for tool in cluster-tool virsh oc helm go jq python3 awk sed grep sort cut sleep make ssh-keygen base64 grpcurl docker sudo ssh uv stat; do
     require_cmd "$tool"
 done
 require_cmd "$CONTAINER_TOOL"
@@ -2938,6 +3274,31 @@ fi
     || die "OSAC_INSTALL_MODE must be auto, install, or upgrade"
 [[ "$VLAN_E2E_DEBUG" == true || "$VLAN_E2E_DEBUG" == false ]] \
     || die "VLAN_E2E_DEBUG must be true or false"
+[[ "$CUMULUS_VERSION" =~ ^5\.[0-9]+\.[0-9]+$ ]] \
+    || die "CUMULUS_VERSION must be an exact Cumulus release such as 5.16.5"
+[[ "$CUMULUS_VX_IMAGE" =~ ^[A-Za-z0-9._/-]+:[A-Za-z0-9._-]+$ ]] \
+    || die "CUMULUS_VX_IMAGE must be an explicit image reference with a version tag"
+[[ "${CUMULUS_VX_IMAGE##*:}" == "$CUMULUS_VERSION" ]] \
+    || die "CUMULUS_VX_IMAGE tag must match CUMULUS_VERSION"
+[[ "$CUMULUS_LAB_ADMIN_KEY" =~ ^/[A-Za-z0-9_./-]+$ ]] \
+    || die "CUMULUS_LAB_ADMIN_KEY must be an absolute path with safe path characters"
+if [[ -n "$CUMULUS_IMAGE_PROVENANCE_FILE" ]]; then
+    [[ "$CUMULUS_IMAGE_PROVENANCE_FILE" =~ ^/[A-Za-z0-9_./-]+$ && -f "$CUMULUS_IMAGE_PROVENANCE_FILE" ]] \
+        || die "CUMULUS_IMAGE_PROVENANCE_FILE must name an existing file with a safe absolute path"
+fi
+if [[ -n "$VLAN_E2E_RUN_DIR" ]]; then
+    [[ "$VLAN_E2E_RUN_DIR" =~ ^/[A-Za-z0-9_./-]+$ ]] \
+        || die "VLAN_E2E_RUN_DIR must be an absolute path with safe path characters"
+    [[ ! -e "$VLAN_E2E_RUN_DIR" && ! -L "$VLAN_E2E_RUN_DIR" ]] \
+        || die "VLAN_E2E_RUN_DIR already exists; refusing to overwrite it"
+fi
+if ! CUMULUS_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$CUMULUS_VX_IMAGE")"; then
+    die "CUMULUS_VX_IMAGE is not available in the local Docker image store: $CUMULUS_VX_IMAGE"
+fi
+CUMULUS_IMAGE_VENDOR="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.vendor"}}' "$CUMULUS_VX_IMAGE")" \
+    || die "Could not inspect the Boxen vendor label for CUMULUS_VX_IMAGE"
+[[ "$CUMULUS_IMAGE_VENDOR" == Boxen ]] \
+    || die "CUMULUS_VX_IMAGE is not a Boxen-packaged image"
 if [[ "$SUITE_USES_SUBNET_DHCP" == true \
     && "$VLAN_E2E_DEBUG" == true && -n "$VLAN_E2E_ARTIFACT_DIR" ]]; then
     [[ "$VLAN_E2E_ARTIFACT_DIR" =~ ^/[A-Za-z0-9_./-]+$ ]] \
@@ -3026,6 +3387,10 @@ TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/osac-5530-vlan-e2e.XXXXXX")"
 BASELINE_STATE_FILE="${TEMP_DIR}/baseline-state.json"
 CURRENT_STATE_FILE="${TEMP_DIR}/current-state.json"
 SWITCH_MANIFEST_FILE="${TEMP_DIR}/switches.json"
+if [[ -n "$VLAN_E2E_RUN_DIR" ]]; then
+    mkdir -m 0700 -- "$VLAN_E2E_RUN_DIR"
+    RUN_DIR_CREATED=true
+fi
 if [[ "$SUITE_USES_SUBNET_DHCP" == true && "$VLAN_E2E_DEBUG" == true ]]; then
     if [[ -z "$VLAN_E2E_ARTIFACT_DIR" ]]; then
         DEBUG_ARTIFACT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/osac-5530-dhcp-debug.XXXXXX")"
@@ -3242,8 +3607,13 @@ configure_aap_execution_environment
 )
 resolve_mgmt_network
 write_provider_inventory
+ensure_cumulus_admin_identity
+prepare_cumulus_startup_config
+write_cumulus_ssh_config
 ensure_containerlab_net_node
 prepare_containerlab_net_node
+write_cumulus_ssh_config
+wait_for_cumulus_guests
 repair_provider_schema_v1
 prepare_containerlab_switches
 configure_containerlab_fabric
@@ -3561,7 +3931,7 @@ snapshot_client_access_ports() {
             "$SWITCH_MANIFEST_FILE" >/dev/null \
             || die "Client fixture port ${switch}/${port} overlaps a declared AgentlessNet trunk"
         if [[ "${preflighted_switches[$switch]:-false}" != true ]]; then
-            pending_diff="$(docker exec "$switch" nv config diff --color off)" \
+            pending_diff="$(switch_exec "$switch" nv config diff --output commands)" \
                 || die "Could not inspect pending NVUE changes on ${switch}"
             [[ -z "$pending_diff" ]] \
                 || die "Switch ${switch} has pending NVUE changes; refusing to apply fixture port configuration"
@@ -3570,17 +3940,17 @@ snapshot_client_access_ports() {
         sudo ip link show dev "$parent" >/dev/null 2>&1 \
             || die "Containerlab-owned parent link ${parent} is missing"
         local bridge_state fdb_state link_state nvue_state nvue_error
-        link_state="$(docker exec "$switch" ip -j link show dev "$port" \
+        link_state="$(switch_exec "$switch" ip -j link show dev "$port" \
             | jq -ce '.[0] | {master:(.master // null),admin_up:(.flags | index("UP") != null)}')" \
             || die "Could not snapshot link state on ${switch}/${port}"
         [[ "$(jq -r '.master // ""' <<<"$link_state")" == "" \
             || "$(jq -r '.master // ""' <<<"$link_state")" == br_default ]] \
             || die "Client fixture port ${switch}/${port} is attached to an unrelated bridge; preserving it"
-        bridge_state="$(docker exec "$switch" bridge -j vlan show dev "$port")" \
+        bridge_state="$(switch_exec "$switch" bridge -j vlan show dev "$port")" \
             || die "Could not snapshot VLAN memberships on ${switch}/${port}"
         [[ "$bridge_state" == "[]" ]] \
             || die "Client fixture port ${switch}/${port} already has VLAN membership; preserving its existing configuration"
-        config_state="$(docker exec "$switch" nv config show --output json \
+        config_state="$(switch_exec "$switch" nv config show --output json \
             | jq -c --arg port "$port" '.[0].set.interface[$port] // null')" \
             || die "Could not snapshot the applied NVUE configuration on ${switch}/${port}"
         if [[ "$config_state" != null ]] && ! jq -e \
@@ -3588,13 +3958,13 @@ snapshot_client_access_ports() {
             <<<"$config_state" >/dev/null; then
             die "Client fixture port ${switch}/${port} already has NVUE configuration; preserving it"
         fi
-        fdb_state="$(docker exec "$switch" bridge fdb show dev "$port")" \
+        fdb_state="$(switch_exec "$switch" bridge fdb show dev "$port")" \
             || die "Could not snapshot forwarding entries on ${switch}/${port}"
         if grep -Ev 'self permanent$' <<<"$fdb_state" | grep -q .; then
             die "Client fixture port ${switch}/${port} has learned MAC entries; refusing to disrupt active use"
         fi
         nvue_error="$TEMP_DIR/${client}-nvue.err"
-        if nvue_state="$(docker exec "$switch" nv show interface "$port" bridge domain br_default --output json 2>"$nvue_error")"; then
+        if nvue_state="$(switch_exec "$switch" nv show interface "$port" bridge domain br_default --output json 2>"$nvue_error")"; then
             [[ -z "$nvue_state" ]] \
                 || die "Client fixture port ${switch}/${port} already has NVUE bridge configuration; preserving it"
         elif ! grep -q '404 NOT FOUND' "$nvue_error"; then
@@ -3629,15 +3999,15 @@ configure_client_access_port() {
         CLIENT_PORT_CONFIGURED["$key"]=true
     fi
     CLIENT_PORT_VLAN["$key"]="$vlan_id"
-    docker exec "$CLIENT_SWITCH" nv set interface "$CLIENT_SWITCH_PORT" bridge domain br_default
-    docker exec "$CLIENT_SWITCH" nv set interface "$CLIENT_SWITCH_PORT" \
+    switch_exec "$CLIENT_SWITCH" nv set interface "$CLIENT_SWITCH_PORT" bridge domain br_default
+    switch_exec "$CLIENT_SWITCH" nv set interface "$CLIENT_SWITCH_PORT" \
         bridge domain br_default access "$vlan_id"
     apply_log="$TEMP_DIR/${client}-nvue-apply.log"
-    if ! docker exec "$CLIENT_SWITCH" nv config apply --assume-yes >"$apply_log" 2>&1; then
+    if ! switch_exec "$CLIENT_SWITCH" nv config apply --assume-yes >"$apply_log" 2>&1; then
         cat "$apply_log" >&2
         die "NVUE could not apply fixture access VLAN ${vlan_id} to ${key}"
     fi
-    bridge_state="$(docker exec "$CLIENT_SWITCH" bridge -j vlan show dev "$CLIENT_SWITCH_PORT")"
+    bridge_state="$(switch_exec "$CLIENT_SWITCH" bridge -j vlan show dev "$CLIENT_SWITCH_PORT")"
     jq -e --argjson vlan "$vlan_id" '
       ([.[] | .vlans[]?.vlan] | unique) == [$vlan]
       and any(.[]; any(.vlans[]?; .vlan == $vlan and (.flags | index("PVID") != null)))' \
@@ -3672,9 +4042,9 @@ restore_client_access_port() {
     vlan="${CLIENT_PORT_VLAN[$key]:-}"
     [[ "$vlan" =~ ^[0-9]+$ ]] \
         || { printf 'ERROR: fixture VLAN for %s is invalid; preserving current state\n' "$key" >&2; return 1; }
-    bridge_state="$(docker exec "$CLIENT_SWITCH" bridge -j vlan show dev "$CLIENT_SWITCH_PORT")" \
+    bridge_state="$(switch_exec "$CLIENT_SWITCH" bridge -j vlan show dev "$CLIENT_SWITCH_PORT")" \
         || { printf 'ERROR: could not inspect temporary access port %s before restoration\n' "$key" >&2; return 1; }
-    link_state="$(docker exec "$CLIENT_SWITCH" ip -j link show dev "$CLIENT_SWITCH_PORT" \
+    link_state="$(switch_exec "$CLIENT_SWITCH" ip -j link show dev "$CLIENT_SWITCH_PORT" \
         | jq -ce '.[0] | {master:(.master // null),admin_up:(.flags | index("UP") != null),mac:.address}')" \
         || { printf 'ERROR: could not inspect link state on %s before restoration\n' "$key" >&2; return 1; }
     baseline_admin_up="$(jq -r '.admin_up' <<<"$baseline_link")"
@@ -3684,7 +4054,7 @@ restore_client_access_port() {
     [[ -s "$client_mac_file" ]] \
         || { printf 'ERROR: test client MAC is missing for %s; preserving its port\n' "$key" >&2; return 1; }
     client_mac="$(<"$client_mac_file")"
-    current_config="$(docker exec "$CLIENT_SWITCH" nv config show --output json \
+    current_config="$(switch_exec "$CLIENT_SWITCH" nv config show --output json \
         | jq -c --arg port "$CLIENT_SWITCH_PORT" '.[0].set.interface[$port] // null')" \
         || { printf 'ERROR: could not inspect NVUE configuration on %s before restoration\n' "$key" >&2; return 1; }
     current_link_state="$(jq -c 'del(.mac)' <<<"$link_state")"
@@ -3692,7 +4062,7 @@ restore_client_access_port() {
         && "$(jq -c . <<<"$bridge_state")" == "$baseline_bridge" \
         && "$current_link_state" == "$baseline_link" ]]; then
         nvue_error="$TEMP_DIR/${client}-nvue-restore.err"
-        if nvue_state="$(docker exec "$CLIENT_SWITCH" nv show interface "$CLIENT_SWITCH_PORT" \
+        if nvue_state="$(switch_exec "$CLIENT_SWITCH" nv show interface "$CLIENT_SWITCH_PORT" \
             bridge domain br_default --output json 2>"$nvue_error")"; then
             [[ "$nvue_state" == "$baseline_nvue" ]] \
                 || { printf 'ERROR: access port %s NVUE state differs from its saved baseline\n' "$key" >&2; return 1; }
@@ -3701,7 +4071,7 @@ restore_client_access_port() {
             return 1
         fi
         for ((attempt = 1; attempt <= 30; attempt++)); do
-            dynamic_fdb="$(docker exec "$CLIENT_SWITCH" bridge fdb show dev "$CLIENT_SWITCH_PORT")" \
+            dynamic_fdb="$(switch_exec "$CLIENT_SWITCH" bridge fdb show dev "$CLIENT_SWITCH_PORT")" \
                 || return 1
             if [[ "$(LC_ALL=C sort <<<"$dynamic_fdb")" == "$(LC_ALL=C sort <<<"$baseline_fdb")" ]]; then
                 CLIENT_PORT_CONFIGURED["$key"]=false
@@ -3729,7 +4099,7 @@ restore_client_access_port() {
         printf 'ERROR: bridge master on %s is not the test fixture bridge; preserving it\n' "$key" >&2
         return 1
     fi
-    dynamic_fdb="$(docker exec "$CLIENT_SWITCH" bridge fdb show dev "$CLIENT_SWITCH_PORT")" \
+    dynamic_fdb="$(switch_exec "$CLIENT_SWITCH" bridge fdb show dev "$CLIENT_SWITCH_PORT")" \
         || { printf 'ERROR: could not inspect forwarding entries on %s before restoration\n' "$key" >&2; return 1; }
     if ! awk -v client_mac="$client_mac" -v port_mac="$port_mac" -v vlan="$vlan" '
       /self permanent$/ { next }
@@ -3745,40 +4115,40 @@ restore_client_access_port() {
         return 1
     fi
     if [[ "$baseline_config" == null ]]; then
-        docker exec "$CLIENT_SWITCH" nv unset interface "$CLIENT_SWITCH_PORT" \
+        switch_exec "$CLIENT_SWITCH" nv unset interface "$CLIENT_SWITCH_PORT" \
             || { printf 'ERROR: could not remove the test NVUE access setting from %s\n' "$key" >&2; return 1; }
     else
-        docker exec "$CLIENT_SWITCH" nv unset interface "$CLIENT_SWITCH_PORT" \
+        switch_exec "$CLIENT_SWITCH" nv unset interface "$CLIENT_SWITCH_PORT" \
             bridge domain br_default access \
             || { printf 'ERROR: could not remove the test NVUE access setting from %s\n' "$key" >&2; return 1; }
     fi
     apply_log="$TEMP_DIR/${client}-nvue-restore.log"
-    if ! docker exec "$CLIENT_SWITCH" nv config apply --assume-yes >"$apply_log" 2>&1; then
+    if ! switch_exec "$CLIENT_SWITCH" nv config apply --assume-yes >"$apply_log" 2>&1; then
         cat "$apply_log" >&2
         printf 'ERROR: NVUE could not restore the saved port configuration on %s\n' "$key" >&2
         return 1
     fi
     if [[ "$baseline_admin_up" == true ]]; then
-        docker exec "$CLIENT_SWITCH" ip link set dev "$CLIENT_SWITCH_PORT" up || return 1
+        switch_exec "$CLIENT_SWITCH" ip link set dev "$CLIENT_SWITCH_PORT" up || return 1
     else
-        docker exec "$CLIENT_SWITCH" ip link set dev "$CLIENT_SWITCH_PORT" down || return 1
+        switch_exec "$CLIENT_SWITCH" ip link set dev "$CLIENT_SWITCH_PORT" down || return 1
     fi
-    bridge_state="$(docker exec "$CLIENT_SWITCH" bridge -j vlan show dev "$CLIENT_SWITCH_PORT")" \
+    bridge_state="$(switch_exec "$CLIENT_SWITCH" bridge -j vlan show dev "$CLIENT_SWITCH_PORT")" \
         || return 1
     [[ "$(jq -c . <<<"$bridge_state")" == "$baseline_bridge" ]] \
         || { printf 'ERROR: access port %s did not return to its VLAN snapshot\n' "$key" >&2; return 1; }
-    link_state="$(docker exec "$CLIENT_SWITCH" ip -j link show dev "$CLIENT_SWITCH_PORT" \
+    link_state="$(switch_exec "$CLIENT_SWITCH" ip -j link show dev "$CLIENT_SWITCH_PORT" \
         | jq -ce '.[0] | {master:(.master // null),admin_up:(.flags | index("UP") != null)}')" \
         || return 1
     [[ "$link_state" == "$baseline_link" ]] \
         || { printf 'ERROR: access port %s link state differs from its snapshot\n' "$key" >&2; return 1; }
-    current_config="$(docker exec "$CLIENT_SWITCH" nv config show --output json \
+    current_config="$(switch_exec "$CLIENT_SWITCH" nv config show --output json \
         | jq -c --arg port "$CLIENT_SWITCH_PORT" '.[0].set.interface[$port] // null')" \
         || return 1
     [[ "$current_config" == "$baseline_config" ]] \
         || { printf 'ERROR: access port %s NVUE configuration differs from its snapshot\n' "$key" >&2; return 1; }
     nvue_error="$TEMP_DIR/${client}-nvue-restore.err"
-    if nvue_state="$(docker exec "$CLIENT_SWITCH" nv show interface "$CLIENT_SWITCH_PORT" \
+    if nvue_state="$(switch_exec "$CLIENT_SWITCH" nv show interface "$CLIENT_SWITCH_PORT" \
         bridge domain br_default --output json 2>"$nvue_error")"; then
         [[ "$nvue_state" == "$baseline_nvue" ]] \
             || { printf 'ERROR: access port %s did not return to its NVUE snapshot\n' "$key" >&2; return 1; }
@@ -3788,7 +4158,7 @@ restore_client_access_port() {
     fi
     local fdb_restored=false
     for ((attempt = 1; attempt <= 30; attempt++)); do
-        dynamic_fdb="$(docker exec "$CLIENT_SWITCH" bridge fdb show dev "$CLIENT_SWITCH_PORT")" \
+        dynamic_fdb="$(switch_exec "$CLIENT_SWITCH" bridge fdb show dev "$CLIENT_SWITCH_PORT")" \
             || return 1
         if [[ "$(LC_ALL=C sort <<<"$dynamic_fdb")" == "$(LC_ALL=C sort <<<"$baseline_fdb")" ]]; then
             fdb_restored=true
@@ -4041,15 +4411,15 @@ capture_failed_dhcp_client_state() {
             done
         ' || true
         client_link "$client"
-        docker exec "$CLIENT_SWITCH" ip -o link show dev "$CLIENT_SWITCH_PORT" || true
-        docker exec "$CLIENT_SWITCH" bridge -j vlan show dev "$CLIENT_SWITCH_PORT" || true
-        docker exec "$CLIENT_SWITCH" bridge fdb show dev "$CLIENT_SWITCH_PORT" || true
+        switch_exec "$CLIENT_SWITCH" ip -o link show dev "$CLIENT_SWITCH_PORT" || true
+        switch_exec "$CLIENT_SWITCH" bridge -j vlan show dev "$CLIENT_SWITCH_PORT" || true
+        switch_exec "$CLIENT_SWITCH" bridge fdb show dev "$CLIENT_SWITCH_PORT" || true
         while IFS=$'\t' read -r switch trunk; do
             [[ -n "$switch" && -n "$trunk" ]] || continue
             printf 'switch=%s trunk=%s\n' "$switch" "$trunk"
-            docker exec "$switch" bridge -j vlan show dev "$trunk" || true
-            docker exec "$switch" bridge fdb show dev "$trunk" || true
-            docker exec "$switch" nv config show --output json \
+            switch_exec "$switch" bridge -j vlan show dev "$trunk" || true
+            switch_exec "$switch" bridge fdb show dev "$trunk" || true
+            switch_exec "$switch" nv config show --output json \
                 | jq -c --arg port "$trunk" '.[0].set.interface[$port] // null' || true
         done < <(jq -r '.switches[] | .name as $name | .trunk_ports[] | [$name, .] | @tsv' \
             "$SWITCH_MANIFEST_FILE")
@@ -4072,13 +4442,13 @@ sample_dhcp_bridge_state() {
     output="$TEMP_DIR/dhcp-client-${client}-forwarding-${phase}.log"
     {
         printf 'attempt=%s utc=%s\n' "$attempt" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        docker exec "${CONTAINERLAB_PREFIX}-leaf-2" sh -c '
+        switch_exec "${CONTAINERLAB_PREFIX}-leaf-2" sh -c '
             for port in swp3 swp1; do
                 printf "leaf-2 %s\n" "$port"
                 bridge -d link show dev "$port"
             done
         ' || true
-        docker exec "${CONTAINERLAB_PREFIX}-leaf-1" sh -c '
+        switch_exec "${CONTAINERLAB_PREFIX}-leaf-1" sh -c '
             for port in swp1 swp3; do
                 printf "leaf-1 %s\n" "$port"
                 bridge -d link show dev "$port"
@@ -4163,9 +4533,9 @@ start_dhcp_client() {
             cat "/sys/class/net/eth0/statistics/$stat"
         done
     ' >&2 || true
-    docker exec "$CLIENT_SWITCH" ip -o link show dev "$CLIENT_SWITCH_PORT" >&2 || true
-    docker exec "$CLIENT_SWITCH" bridge -j vlan show dev "$CLIENT_SWITCH_PORT" >&2 || true
-    docker exec "$CLIENT_SWITCH" bridge fdb show dev "$CLIENT_SWITCH_PORT" >&2 || true
+    switch_exec "$CLIENT_SWITCH" ip -o link show dev "$CLIENT_SWITCH_PORT" >&2 || true
+    switch_exec "$CLIENT_SWITCH" bridge -j vlan show dev "$CLIENT_SWITCH_PORT" >&2 || true
+    switch_exec "$CLIENT_SWITCH" bridge fdb show dev "$CLIENT_SWITCH_PORT" >&2 || true
     netnode cat "$lease_db" >&2 || true
     netnode tail -n 40 "$service_log" >&2 || true
     die "Timed out waiting for real DHCP client $client"
@@ -4554,7 +4924,7 @@ assert_vlan_on_switches() {
     local vlan_id="$1" should_exist="$2" switch port switch_json
     while IFS= read -r switch; do
         [[ -n "$switch" ]] || continue
-        switch_json="$(docker exec "$switch" bridge -j vlan show)" \
+        switch_json="$(switch_exec "$switch" bridge -j vlan show)" \
             || die "Could not read VLAN state from Cumulus switch ${switch}"
         if [[ "$should_exist" == true ]]; then
             while IFS= read -r port; do
@@ -4585,9 +4955,9 @@ snapshot_switch_vlan_state() {
     : >"$rows_file"
     while IFS= read -r switch; do
         [[ -n "$switch" ]] || continue
-        bridge_state="$(docker exec "$switch" bridge -j vlan show)" \
+        bridge_state="$(switch_exec "$switch" bridge -j vlan show)" \
             || die "Could not read VLAN state from Cumulus switch ${switch}"
-        reserved_state="$(docker exec "$switch" nv show system global reserved vlan --output json)" \
+        reserved_state="$(switch_exec "$switch" nv show system global reserved vlan --output json)" \
             || die "Could not read reserved VLAN ranges from Cumulus switch ${switch}"
         jq -nc --arg name "$switch" --arg bridge "$bridge_state" \
             --arg reserved "$reserved_state" \
