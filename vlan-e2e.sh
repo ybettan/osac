@@ -1124,9 +1124,11 @@ configure_containerlab_fabric() {
     info "Initializing declared Cumulus trunk ports in br_default..."
     if ! (
         cd "$AAP_DIR"
+        # This is local lab bootstrap; provider-key access is checked above and
+        # is still used by AAP for resource provisioning.
         uv run --locked --group development ansible-playbook \
             --inventory "$TEMP_DIR/inventory.yml" \
-            --private-key "$SSH_PRIVATE_KEY_FILE" \
+            --private-key "$CUMULUS_LAB_ADMIN_KEY" \
             --ssh-extra-args \
             "-o BatchMode=yes -o IdentitiesOnly=yes -o UserKnownHostsFile=$TEMP_DIR/known_hosts -o ConnectTimeout=5" \
             "$CONTAINERLAB_CONFIGURE_PLAYBOOK"
