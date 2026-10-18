@@ -273,3 +273,12 @@ remove_containerlab_switch_keys
     assert result.returncode == 0, result.stderr
     remaining = authorized_keys.read_text().splitlines()
     assert remaining == [admin_key]
+
+
+def test_local_trunk_setup_uses_admin_key_and_checks_provider_key():
+    setup = function_block("configure_containerlab_fabric", "write_provider_inventory")
+    provider_check = function_block("prepare_containerlab_switches", "configure_containerlab_fabric")
+
+    assert '--private-key "$CUMULUS_LAB_ADMIN_KEY"' in setup
+    assert '--private-key "$SSH_PRIVATE_KEY_FILE"' not in setup
+    assert "switch_provider_user_exec \"$switch\"" in provider_check
