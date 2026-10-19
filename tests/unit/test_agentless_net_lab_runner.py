@@ -1,8 +1,12 @@
+import base64
 import json
 import os
 import shlex
 import subprocess
+import sys
 from pathlib import Path
+
+import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -27,6 +31,44 @@ def run_bash(tmp_path: Path, script: str, env: dict[str, str] | None = None):
         env=environment,
         timeout=5,
     )
+
+
+def render_provider_inventory(tmp_path: Path, inventory_path: Path):
+    helper = function_block("write_provider_inventory", "sync_aap_project_revision")
+    heredoc_start = helper.index("<<'PY'\n") + len("<<'PY'\n")
+    heredoc_end = helper.index("\nPY\n", heredoc_start)
+    renderer = helper[heredoc_start:heredoc_end]
+    topology_path = REPO_ROOT / "tests/e2e/agentless_net/lab/agentless-net-lab.clab.yml"
+    output_path = tmp_path / "rendered-inventory.yml"
+    host_path = tmp_path / "net-node-host"
+    user_path = tmp_path / "net-node-user"
+    manifest_path = tmp_path / "switches.json"
+    environment = os.environ.copy()
+    environment.update(
+        MGMT_BRIDGE="virbr-agentless",
+        MGMT_CIDR="192.168.162.0/24",
+        MGMT_GW="192.168.162.1",
+        MGMT_PREFIX="192.168.162",
+        MGMT_DHCP_RANGES="192.168.162.100-192.168.162.200",
+    )
+    return subprocess.run(
+        [
+            sys.executable,
+            "-",
+            str(inventory_path),
+            str(topology_path),
+            str(output_path),
+            str(host_path),
+            str(user_path),
+            str(manifest_path),
+        ],
+        input=renderer,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=5,
+    ), output_path, manifest_path
 
 
 def test_switch_ssh_quotes_remote_argv_as_shell_words(tmp_path):
@@ -58,7 +100,34 @@ switch_exec clab-agentless-net-lab-leaf-1 printf '%s' "$REMOTE_PAYLOAD"
     assert not marker.exists()
 
 
-def test_cumulus_ssh_config_has_only_named_lab_aliases(tmp_path):
+def test_switch_ssh_does_not_consume_remaining_switch_loop_input(tmp_path):
+    helpers = function_block("switch_ssh", "ensure_containerlab_net_node")
+    capture = tmp_path / "ssh-aliases.txt"
+    script = f"""
+set -euo pipefail
+CONTAINERLAB_PREFIX=clab-agentless-net-lab
+CUMULUS_SSH_CONFIG_FILE=/tmp/test-ssh-config
+CAPTURE={shlex.quote(str(capture))}
+ssh() {{
+    cat >/dev/null
+    printf '%s\\n' "$3" >>"$CAPTURE"
+}}
+{helpers}
+while IFS= read -r switch; do
+    switch_admin_user_exec "$switch" true
+done < <(printf '%s\\n' \\
+    clab-agentless-net-lab-leaf-1 clab-agentless-net-lab-leaf-2)
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text().splitlines() == [
+        "osac-agentless-leaf-1-admin",
+        "osac-agentless-leaf-2-admin",
+    ]
+
+
+def test_cumulus_ssh_config_refreshes_stale_config_with_named_lab_aliases(tmp_path):
     helper = function_block("write_cumulus_ssh_config", "switch_ssh")
     manifest = tmp_path / "switches.json"
     manifest.write_text(
@@ -82,6 +151,7 @@ def test_cumulus_ssh_config_has_only_named_lab_aliases(tmp_path):
         )
     )
     config = tmp_path / "ssh_config"
+    config.write_text("stale SSH config from an earlier lab run\n")
     script = f"""
 set -euo pipefail
 SWITCH_MANIFEST_FILE={shlex.quote(str(manifest))}
@@ -102,6 +172,8 @@ write_cumulus_ssh_config
     assert "HostName 192.168.162.11" in content
     assert "IdentityFile \"/keys/admin_ed25519\"" in content
     assert "IdentityFile \"/tmp/provider_ed25519\"" in content
+    assert "stale SSH config" not in content
+    assert 'UserKnownHostsFile "/tmp/osac-run/known_hosts"' in content
     assert "StrictHostKeyChecking accept-new" in content
     assert config.stat().st_mode & 0o777 == 0o600
 
@@ -183,6 +255,436 @@ wait_for_cumulus_guests
     assert "did not become healthy and SSH-ready within 20 minutes" in result.stderr
 
 
+def test_owned_aap_ssh_key_from_interrupted_run_is_adopted_for_cleanup(tmp_path):
+    helper = function_block("ensure_aap_ssh_key", "ensure_cumulus_admin_identity")
+    private_key = "temporary key bytes from an interrupted run"
+    key_base64 = base64.b64encode(private_key.encode()).decode()
+    secret_json = json.dumps(
+        {
+            "metadata": {"annotations": {"osac.openshift.io/agentless-vn-ssh": "OSAC-5529"}},
+            "data": {"AGENTLESS_NET_SSH_PRIVATE_KEY": key_base64},
+        }
+    )
+    script = f"""
+set -euo pipefail
+TEMP_DIR={shlex.quote(str(tmp_path))}
+AAP_NETWORKING_SECRET=network-fulfillment-ig
+OSAC_NAMESPACE=osac-e2e-ci
+AAP_SSH_KEY_SECRET_KEY=AGENTLESS_NET_SSH_PRIVATE_KEY
+AAP_SSH_KEY_SECRET_ANNOTATION=osac.openshift.io/agentless-vn-ssh
+SSH_KEY_CREATED_BY_RUN=false
+SSH_KEY_EXPECTED_BASE64=
+SSH_KEY_ORIGINAL_ANNOTATION=
+SECRET_JSON={shlex.quote(secret_json)}
+oc() {{ printf '%s' "$SECRET_JSON"; }}
+ssh-keygen() {{ printf 'ssh-ed25519 test-key osac-test\\n'; }}
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+{helper}
+ensure_aap_ssh_key
+[[ "$SSH_KEY_CREATED_BY_RUN" == true ]]
+[[ "$SSH_KEY_EXPECTED_BASE64" == {shlex.quote(key_base64)} ]]
+[[ -z "$SSH_KEY_ORIGINAL_ANNOTATION" ]]
+[[ "$SSH_PRIVATE_KEY_FILE" == "$TEMP_DIR/agentless-net-id_ed25519" ]]
+"""
+
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_nvue_interface_config_reads_set_object_after_header(tmp_path):
+    helper = function_block("nvue_interface_config", "create_dhcp_client_container")
+    nvue_output = json.dumps(
+        [
+            {"header": {"model": "Cumulus Linux"}},
+            {
+                "set": {
+                    "interface": {
+                        "swp2": {"bridge": {"domain": {"br_default": {"access": 2}}}},
+                        "swp3": {"bridge": {"domain": {"br_default": {"access": 3}}}},
+                    }
+                }
+            },
+        ]
+    )
+    swp2 = json.dumps({"bridge": {"domain": {"br_default": {"access": 2}}}}, separators=(",", ":"))
+    swp3 = json.dumps({"bridge": {"domain": {"br_default": {"access": 3}}}}, separators=(",", ":"))
+    script = f"""
+set -euo pipefail
+NVUE_OUTPUT={shlex.quote(nvue_output)}
+switch_exec() {{ printf '%s' "$NVUE_OUTPUT"; }}
+{helper}
+[[ "$(nvue_interface_config leaf-2 swp2)" == {shlex.quote(swp2)} ]]
+[[ "$(nvue_interface_config leaf-2 swp3)" == {shlex.quote(swp3)} ]]
+NVUE_OUTPUT='[{{"header":{{"model":"Cumulus Linux"}}}},{{"set":{{"interface":{{}}}}}}]'
+[[ "$(nvue_interface_config leaf-2 swp2)" == null ]]
+NVUE_OUTPUT={shlex.quote(json.dumps({"set": {"interface": {"swp2": {"bridge": {"domain": {"br_default": {"access": 2}}}}}}}))}
+[[ "$(nvue_interface_config leaf-2 swp2)" == {shlex.quote(swp2)} ]]
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_nvue_diff_reader_accepts_exit_one_when_commands_are_returned(tmp_path):
+    helper = function_block("switch_nvue_diff", "ensure_containerlab_net_node")
+    script = f"""
+set -euo pipefail
+ADMIN_DIFF='nv unset system aaa user cumulus ssh authorized-key osac_e2e_test'
+ADMIN_STATUS=1
+PROVIDER_DIFF='nv set interface swp1 bridge domain br_default'
+PROVIDER_STATUS=1
+switch_admin_user_exec() {{ printf '%s' "$ADMIN_DIFF"; return "$ADMIN_STATUS"; }}
+switch_exec() {{ printf '%s' "$PROVIDER_DIFF"; return "$PROVIDER_STATUS"; }}
+{helper}
+[[ "$(switch_nvue_diff admin leaf-1)" == "$ADMIN_DIFF" ]]
+[[ "$(switch_nvue_diff provider leaf-2)" == "$PROVIDER_DIFF" ]]
+ADMIN_DIFF=
+ADMIN_STATUS=0
+[[ -z "$(switch_nvue_diff admin leaf-1)" ]]
+ADMIN_STATUS=1
+if switch_nvue_diff admin leaf-1; then exit 1; fi
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_external_ip_pool_list_normalizes_omitted_empty_items(tmp_path):
+    helper = function_block("external_ip_pool_list_items", "external_ip_pool_rpc_error_is_not_found")
+    response_file = tmp_path / "pool-list.json"
+    script = f"""
+set -euo pipefail
+RESPONSE={shlex.quote(str(response_file))}
+{helper}
+printf '%s' '{{}}' >"$RESPONSE"
+[[ "$(external_ip_pool_list_items "$RESPONSE")" == '[]' ]]
+printf '%s' '{{"items":[]}}' >"$RESPONSE"
+[[ "$(external_ip_pool_list_items "$RESPONSE")" == '[]' ]]
+printf '%s' '{{"items":[{{"id":"pool-id"}}]}}' >"$RESPONSE"
+[[ "$(external_ip_pool_list_items "$RESPONSE")" == '[{{"id":"pool-id"}}]' ]]
+printf '%s' '{{"items":{{}}}}' >"$RESPONSE"
+if external_ip_pool_list_items "$RESPONSE" >/dev/null 2>&1; then exit 1; fi
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_external_ip_pool_cidr_can_be_overridden_for_a_lab_run(tmp_path):
+    assignment = next(
+        line for line in SOURCE.splitlines() if line.startswith("EXTERNAL_IP_POOL_CIDR=")
+    )
+    script = f"""
+set -euo pipefail
+{assignment}
+printf '%s' "$EXTERNAL_IP_POOL_CIDR"
+"""
+    result = run_bash(tmp_path, script, {"EXTERNAL_IP_POOL_CIDR": "203.0.113.0/24"})
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "203.0.113.0/24"
+
+
+def test_external_ip_pool_default_selects_a_non_overlapping_test_cidr(tmp_path):
+    helpers = (
+        function_block("external_ip_pool_list_items", "external_ip_pool_rpc_error_is_not_found")
+        + "\n"
+        + function_block("resolve_external_ip_pool_cidr", "external_ip_pool_rpc_error_is_not_found")
+    )
+    request_file = tmp_path / "shared-pool-list.request.json"
+    script = f"""
+set -euo pipefail
+TEMP_DIR={shlex.quote(str(tmp_path))}
+EXTERNAL_IP_POOL_CIDR_EXPLICIT=false
+EXTERNAL_IP_POOL_CIDR=198.51.100.0/24
+EXTERNAL_IP_POOL_CIDR_RESOLVED=false
+REQUEST_CAPTURE={shlex.quote(str(request_file))}
+info() {{ :; }}
+external_ip_pool_rpc() {{
+    [[ "$1" == List ]]
+    cp "$2" "$REQUEST_CAPTURE"
+    printf '%s' '{{"items":[{{"metadata":{{"name":"leftover-e2e-pool","tenant":"shared"}},"spec":{{"cidrs":["198.51.100.0/24"]}}}}]}}' >"$3"
+}}
+{helpers}
+resolve_external_ip_pool_cidr
+[[ "$EXTERNAL_IP_POOL_CIDR" == 198.18.0.0/24 ]]
+[[ "$EXTERNAL_IP_POOL_CIDR_RESOLVED" == true ]]
+jq -e '.filter == "this.metadata.tenant == \\"shared\\""' "$REQUEST_CAPTURE" >/dev/null
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_external_ip_pool_explicit_cidr_reports_overlap_before_create(tmp_path):
+    helpers = (
+        function_block("external_ip_pool_list_items", "external_ip_pool_rpc_error_is_not_found")
+        + "\n"
+        + function_block("resolve_external_ip_pool_cidr", "external_ip_pool_rpc_error_is_not_found")
+    )
+    script = f"""
+set -euo pipefail
+TEMP_DIR={shlex.quote(str(tmp_path))}
+EXTERNAL_IP_POOL_CIDR_EXPLICIT=true
+EXTERNAL_IP_POOL_CIDR=198.51.100.0/24
+EXTERNAL_IP_POOL_CIDR_RESOLVED=false
+info() {{ :; }}
+external_ip_pool_rpc() {{
+    printf '%s' '{{"items":[{{"metadata":{{"name":"leftover-e2e-pool","tenant":"shared"}},"spec":{{"cidrs":["198.51.100.0/24"]}}}}]}}' >"$3"
+}}
+{helpers}
+if resolve_external_ip_pool_cidr; then exit 1; fi
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert "overlaps existing shared pool leftover-e2e-pool" in result.stderr
+
+
+def test_provider_key_checkpoint_detects_nvues_key_disappearance(tmp_path):
+    helper = function_block("assert_provider_key_survived", "ensure_containerlab_net_node")
+    manifest = tmp_path / "switches.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "switches": [
+                    {"name": "clab-agentless-net-lab-leaf-1"},
+                    {"name": "clab-agentless-net-lab-leaf-2"},
+                ]
+            }
+        )
+    )
+    script = f"""
+set -euo pipefail
+PROVIDER_NVUE_KEY_ID=osac_e2e_test
+SWITCH_MANIFEST_FILE={shlex.quote(str(manifest))}
+KEY_STATE=absent
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+info() {{ :; }}
+switch_admin_user_exec() {{
+    local switch="$1"
+    if [[ "$switch" == clab-agentless-net-lab-leaf-2 && "$KEY_STATE" == absent ]]; then
+        printf '%s' '{{"osac-agentless-lab-admin":{{"type":"ssh-ed25519","key":"redacted"}}}}'
+    else
+        printf '%s' '{{"osac_e2e_test":{{"type":"ssh-ed25519","key":"redacted"}}}}'
+    fi
+}}
+switch_provider_user_exec() {{
+    [[ "$2" == sudo && "$3" == -n && "$4" == true ]]
+    [[ "$1" != clab-agentless-net-lab-leaf-2 || "$KEY_STATE" != absent ]]
+}}
+{helper}
+assert_provider_key_survived 'AAP rehydration'
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode != 0
+    assert "disappeared after AAP rehydration on clab-agentless-net-lab-leaf-2" in result.stderr
+
+
+def test_provider_key_checkpoint_can_focus_on_the_a2_switch(tmp_path):
+    helper = function_block("assert_provider_key_survived", "ensure_containerlab_net_node")
+    manifest = tmp_path / "switches.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "switches": [
+                    {"name": "clab-agentless-net-lab-leaf-1"},
+                    {"name": "clab-agentless-net-lab-leaf-2"},
+                ]
+            }
+        )
+    )
+    capture = tmp_path / "checkpoint.log"
+    script = f"""
+set -euo pipefail
+PROVIDER_NVUE_KEY_ID=osac_e2e_test
+SWITCH_MANIFEST_FILE={shlex.quote(str(manifest))}
+CAPTURE={shlex.quote(str(capture))}
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+info() {{ printf 'INFO: %s\\n' "$*" >>"$CAPTURE"; }}
+switch_admin_user_exec() {{
+    printf 'admin:%s\\n' "$1" >>"$CAPTURE"
+    printf '%s' '{{"osac_e2e_test":{{"type":"ssh-ed25519","key":"redacted"}}}}'
+}}
+switch_provider_user_exec() {{
+    printf 'provider:%s\\n' "$1" >>"$CAPTURE"
+}}
+{helper}
+assert_provider_key_survived 'before A2 provider preflight' clab-agentless-net-lab-leaf-2
+grep -Fxq 'admin:clab-agentless-net-lab-leaf-2' "$CAPTURE"
+grep -Fxq 'provider:clab-agentless-net-lab-leaf-2' "$CAPTURE"
+if grep -Fxq 'admin:clab-agentless-net-lab-leaf-1' "$CAPTURE"; then exit 1; fi
+if grep -Fxq 'provider:clab-agentless-net-lab-leaf-1' "$CAPTURE"; then exit 1; fi
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_provider_key_is_installed_through_nvue(tmp_path):
+    helper = (
+        function_block("switch_nvue_diff", "ensure_containerlab_net_node")
+        + "\n"
+        + function_block("install_containerlab_switch_provider_key", "prepare_containerlab_switches")
+    )
+    capture = tmp_path / "nvue-commands.txt"
+    script = f"""
+set -euo pipefail
+PROVIDER_NVUE_KEY_ID=osac_e2e_test
+declare -A SWITCH_NVUE_KEY_INSTALLED_BY_RUN=()
+APPLIED=false
+CAPTURE={shlex.quote(str(capture))}
+LOG_CAPTURE={shlex.quote(str(tmp_path / "install.log"))}
+info() {{ printf 'INFO: %s\\n' "$*" >>"$LOG_CAPTURE"; }}
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+switch_admin_user_exec() {{
+    local switch="$1"
+    shift
+    [[ "$switch" == clab-agentless-net-lab-leaf-2 ]]
+    printf '%s\\n' "$*" >>"$CAPTURE"
+    case "$*" in
+        'nv config diff --output commands') ;;
+        'nv show system aaa user cumulus ssh authorized-key --output json')
+            if [[ "$APPLIED" == true ]]; then
+                printf '%s' '{{"osac-agentless-lab-admin":{{"type":"ssh-ed25519","key":"adminblob"}},"osac_e2e_test":{{"type":"ssh-ed25519","key":"providerblob"}}}}'
+            else
+                printf '%s' '{{"osac-agentless-lab-admin":{{"type":"ssh-ed25519","key":"adminblob"}}}}'
+            fi
+            ;;
+        'nv set system aaa user cumulus ssh authorized-key osac_e2e_test key providerblob') ;;
+        'nv set system aaa user cumulus ssh authorized-key osac_e2e_test type ssh-ed25519') ;;
+        'nv config apply --assume-yes') APPLIED=true ;;
+        *) return 2 ;;
+    esac
+}}
+{helper}
+install_containerlab_switch_provider_key clab-agentless-net-lab-leaf-2 ssh-ed25519 providerblob
+[[ "${{SWITCH_NVUE_KEY_INSTALLED_BY_RUN[clab-agentless-net-lab-leaf-2]}}" == true ]]
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text().splitlines() == [
+        "nv config diff --output commands",
+        "nv show system aaa user cumulus ssh authorized-key --output json",
+        "nv set system aaa user cumulus ssh authorized-key osac_e2e_test key providerblob",
+        "nv set system aaa user cumulus ssh authorized-key osac_e2e_test type ssh-ed25519",
+        "nv config apply --assume-yes",
+        "nv show system aaa user cumulus ssh authorized-key --output json",
+    ]
+    assert (tmp_path / "install.log").read_text().splitlines() == [
+        "INFO: Installing per-run provider NVUE key on clab-agentless-net-lab-leaf-2.",
+        "INFO: Per-run provider NVUE key installation verified on clab-agentless-net-lab-leaf-2.",
+    ]
+
+
+def test_persistent_admin_key_is_registered_before_nvue_apply(tmp_path):
+    helper = (
+        function_block("switch_nvue_diff", "ensure_containerlab_net_node")
+        + "\n"
+        + function_block("ensure_containerlab_admin_nvue_key", "install_containerlab_switch_provider_key")
+    )
+    public_key = tmp_path / "admin.pub"
+    public_key.write_text("ssh-ed25519 adminblob osac-admin\n")
+    capture = tmp_path / "nvue-admin-commands.txt"
+    script = f"""
+set -euo pipefail
+CUMULUS_ADMIN_NVUE_KEY_ID=osac-agentless-e2e-admin
+CUMULUS_ADMIN_PUBLIC_KEY_FILE={shlex.quote(str(public_key))}
+APPLIED=false
+CAPTURE={shlex.quote(str(capture))}
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+switch_admin_user_exec() {{
+    local switch="$1"
+    shift
+    [[ "$switch" == clab-agentless-net-lab-leaf-1 ]]
+    printf '%s\\n' "$*" >>"$CAPTURE"
+    case "$*" in
+        'nv config diff --output commands') ;;
+        'nv show system aaa user cumulus ssh authorized-key --output json')
+            if [[ "$APPLIED" == true ]]; then
+                printf '%s' '{{"stale-admin":{{"type":"ssh-ed25519","key":"oldblob"}},"osac-agentless-e2e-admin":{{"type":"ssh-ed25519","key":"adminblob"}}}}'
+            else
+                printf '%s' '{{"stale-admin":{{"type":"ssh-ed25519","key":"oldblob"}}}}'
+            fi
+            ;;
+        'nv set system aaa user cumulus ssh authorized-key osac-agentless-e2e-admin key adminblob') ;;
+        'nv set system aaa user cumulus ssh authorized-key osac-agentless-e2e-admin type ssh-ed25519') ;;
+        'nv config apply --assume-yes') APPLIED=true ;;
+        'true') ;;
+        *) return 2 ;;
+    esac
+}}
+{helper}
+ensure_containerlab_admin_nvue_key clab-agentless-net-lab-leaf-1
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text().splitlines() == [
+        "nv config diff --output commands",
+        "nv show system aaa user cumulus ssh authorized-key --output json",
+        "nv set system aaa user cumulus ssh authorized-key osac-agentless-e2e-admin key adminblob",
+        "nv set system aaa user cumulus ssh authorized-key osac-agentless-e2e-admin type ssh-ed25519",
+        "nv config apply --assume-yes",
+        "nv show system aaa user cumulus ssh authorized-key --output json",
+        "true",
+    ]
+
+
+def test_vlan_snapshot_collects_switchd_reserved_range(tmp_path):
+    helper_writer = function_block("write_agentless_e2e_helpers", "nvue_interface_config")
+    snapshotter = function_block("snapshot_switch_vlan_state", "assert_new_vlans_avoid_baseline")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    manifest = run_dir / "switches.json"
+    manifest.write_text(
+        json.dumps({"switches": [{"name": "clab-agentless-net-lab-leaf-1"}]})
+    )
+    script = f"""
+set -euo pipefail
+TEMP_DIR={shlex.quote(str(run_dir))}
+REPO_ROOT={shlex.quote(str(REPO_ROOT))}
+SWITCH_MANIFEST_FILE={shlex.quote(str(manifest))}
+info() {{ :; }}
+die() {{ printf '%s\\n' "$*" >&2; exit 1; }}
+switch_exec() {{
+    local switch="$1"
+    shift
+    [[ "$switch" == clab-agentless-net-lab-leaf-1 ]]
+    case "$1" in
+        bridge) printf '%s\\n' "$BRIDGE_OUTPUT" ;;
+        nv) printf '%s\\n' "$RESERVED_OUTPUT" ;;
+        awk) printf '%s\\n' "$SWITCHD_OUTPUT" ;;
+        *) return 2 ;;
+    esac
+}}
+{helper_writer}
+{snapshotter}
+write_agentless_e2e_helpers
+snapshot_switch_vlan_state
+jq -e '.excluded_vlan_ids == ([1] + [range(3725; 4000)] + [range(4000; 4065)])' \
+    "$SWITCH_VLAN_SNAPSHOT_FILE" >/dev/null
+jq -e '.switches[0].switchd_reserved_vlan_output == "resv_vlan_range = 3725-3999"' \
+    "$SWITCH_VLAN_SNAPSHOT_FILE" >/dev/null
+"""
+    result = run_bash(
+        tmp_path,
+        script,
+        {
+            "BRIDGE_OUTPUT": json.dumps([{"ifname": "br_default", "vlans": [{"vlan": 1}]}]),
+            "RESERVED_OUTPUT": json.dumps(
+                {"internal": {}, "l3-vni-vlan": {"begin": 4000, "end": 4064}}
+            ),
+            "SWITCHD_OUTPUT": "resv_vlan_range = 3725-3999",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_run_evidence_is_retained_after_failed_suite(tmp_path):
     helpers = function_block("write_run_evidence", "on_exit")
     run_dir = tmp_path / "evidence"
@@ -221,58 +723,96 @@ write_run_evidence 1 1
     assert summary_path.stat().st_mode & 0o777 == 0o600
 
 
-def test_per_run_key_cleanup_preserves_admin_key(tmp_path):
-    helpers = function_block("remove_containerlab_switch_keys", "restore_containerlab_switch_access")
-    ssh_dir = tmp_path / "guest-home" / ".ssh"
-    ssh_dir.mkdir(parents=True)
-    admin_key = "ssh-ed25519 AAAAC3Nza-admin osac-admin"
-    provider_key = "ssh-ed25519 AAAAC3Nza-provider osac-provider"
-    authorized_keys = ssh_dir / "authorized_keys"
-    authorized_keys.write_text(f"{admin_key}\n{provider_key}\n")
-    key_file = tmp_path / "provider.pub"
-    key_file.write_text(provider_key + "\n")
-    key_file.chmod(0o600)
+def test_per_run_nvue_key_cleanup_preserves_admin_key(tmp_path):
+    helpers = (
+        function_block("switch_nvue_diff", "ensure_containerlab_net_node")
+        + "\n"
+        + function_block("remove_containerlab_switch_keys", "restore_containerlab_switch_access")
+    )
+    manifest = tmp_path / "switches.json"
+    manifest.write_text(
+        json.dumps({"switches": [{"name": "clab-agentless-net-lab-leaf-1"}]})
+    )
+    admin_config = json.dumps(
+        {
+            "osac-agentless-lab-admin": {"type": "ssh-ed25519", "key": "stale-adminblob"},
+            "osac-agentless-e2e-admin": {"type": "ssh-ed25519", "key": "adminblob"},
+        }
+    )
+    active_config = json.dumps(
+        {
+            "osac-agentless-lab-admin": {"type": "ssh-ed25519", "key": "stale-adminblob"},
+            "osac-agentless-e2e-admin": {"type": "ssh-ed25519", "key": "adminblob"},
+            "osac_e2e_test": {"type": "ssh-ed25519", "key": "providerblob"},
+        }
+    )
     script = f"""
 set -euo pipefail
 SWITCH_ACCESS_CONFIGURED=true
-SSH_PUBLIC_KEY_FILE={shlex.quote(str(key_file))}
-SWITCH_MANIFEST_FILE=/tmp/ignored-switches.json
-declare -A SWITCH_PUBLIC_KEY_INSTALLED_BY_RUN=([clab-agentless-net-lab-leaf-1]=true)
-declare -A SWITCH_AUTHORIZED_KEYS_EXISTED=([clab-agentless-net-lab-leaf-1]=true)
-jq() {{ printf '%s\\n' clab-agentless-net-lab-leaf-1; }}
-switch_admin_exec() {{
+PROVIDER_NVUE_KEY_ID=osac_e2e_test
+SWITCH_MANIFEST_FILE={shlex.quote(str(manifest))}
+ACTIVE_KEYS={shlex.quote(active_config)}
+ADMIN_KEYS={shlex.quote(admin_config)}
+CANDIDATE_DIFF=
+declare -A SWITCH_NVUE_KEY_INSTALLED_BY_RUN=([clab-agentless-net-lab-leaf-1]=true)
+switch_admin_user_exec() {{
     local switch="$1"
     shift
-    [[ "$switch" == clab-agentless-net-lab-leaf-1 && "$1" == sh && "$2" == -c ]]
-    local remote_script="$3"
-    shift 3
-    [[ "$remote_script" == *'awk -v key='* && "$2" == "$PROVIDER_PUBLIC_KEY" ]]
-    awk -v key="$2" '$0 != key' "$TEST_AUTHORIZED_KEYS" >"$TEST_AUTHORIZED_KEYS.tmp"
-    if [[ -s "$TEST_AUTHORIZED_KEYS.tmp" || "$3" == true ]]; then
-        mv "$TEST_AUTHORIZED_KEYS.tmp" "$TEST_AUTHORIZED_KEYS"
-    else
-        rm -f "$TEST_AUTHORIZED_KEYS.tmp" "$TEST_AUTHORIZED_KEYS"
-    fi
+    [[ "$switch" == clab-agentless-net-lab-leaf-1 ]]
+    case "$*" in
+        'nv config diff --output commands') printf '%s' "$CANDIDATE_DIFF"; [[ -z "$CANDIDATE_DIFF" ]] ;;
+        'nv show system aaa user cumulus ssh authorized-key --output json') printf '%s' "$ACTIVE_KEYS" ;;
+        'nv unset system aaa user cumulus ssh authorized-key osac_e2e_test')
+            CANDIDATE_DIFF='nv unset system aaa user cumulus ssh authorized-key osac_e2e_test'
+            ;;
+        'nv config apply --assume-yes') ACTIVE_KEYS="$ADMIN_KEYS"; CANDIDATE_DIFF= ;;
+        *) return 2 ;;
+    esac
 }}
 {helpers}
 remove_containerlab_switch_keys
-[[ "${{SWITCH_PUBLIC_KEY_INSTALLED_BY_RUN[clab-agentless-net-lab-leaf-1]}}" == false ]]
+[[ "${{SWITCH_NVUE_KEY_INSTALLED_BY_RUN[clab-agentless-net-lab-leaf-1]}}" == false ]]
+jq -e 'has("osac-agentless-lab-admin") and has("osac-agentless-e2e-admin") and (has("osac_e2e_test") | not)' <<<"$ACTIVE_KEYS" >/dev/null
+[[ -z "$CANDIDATE_DIFF" ]]
 """
-    env = os.environ.copy()
-    env["TEST_AUTHORIZED_KEYS"] = str(authorized_keys)
-    env["PROVIDER_PUBLIC_KEY"] = provider_key
-    result = subprocess.run(
-        ["bash", "-c", script],
-        check=False,
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=5,
-    )
+    result = run_bash(tmp_path, script)
 
     assert result.returncode == 0, result.stderr
-    remaining = authorized_keys.read_text().splitlines()
-    assert remaining == [admin_key]
+
+
+def test_per_run_nvue_key_cleanup_preserves_unrelated_candidate_changes(tmp_path):
+    helpers = (
+        function_block("switch_nvue_diff", "ensure_containerlab_net_node")
+        + "\n"
+        + function_block("remove_containerlab_switch_keys", "restore_containerlab_switch_access")
+    )
+    manifest = tmp_path / "switches.json"
+    manifest.write_text(
+        json.dumps({"switches": [{"name": "clab-agentless-net-lab-leaf-1"}]})
+    )
+    script = f"""
+set -euo pipefail
+SWITCH_ACCESS_CONFIGURED=true
+PROVIDER_NVUE_KEY_ID=osac_e2e_test
+SWITCH_MANIFEST_FILE={shlex.quote(str(manifest))}
+CANDIDATE_DIFF='nv set system hostname preserved'
+declare -A SWITCH_NVUE_KEY_INSTALLED_BY_RUN=([clab-agentless-net-lab-leaf-1]=true)
+switch_admin_user_exec() {{
+    local switch="$1"
+    shift
+    [[ "$switch" == clab-agentless-net-lab-leaf-1 ]]
+    [[ "$*" == 'nv config diff --output commands' ]]
+    printf '%s' "$CANDIDATE_DIFF"
+    [[ -z "$CANDIDATE_DIFF" ]]
+}}
+{helpers}
+if remove_containerlab_switch_keys; then exit 1; fi
+[[ "$CANDIDATE_DIFF" == 'nv set system hostname preserved' ]]
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert "preserving them and the provider key" in result.stderr
 
 
 def test_local_trunk_setup_uses_admin_key_and_checks_provider_key():
@@ -282,3 +822,717 @@ def test_local_trunk_setup_uses_admin_key_and_checks_provider_key():
     assert '--private-key "$CUMULUS_LAB_ADMIN_KEY"' in setup
     assert '--private-key "$SSH_PRIVATE_KEY_FILE"' not in setup
     assert "switch_provider_user_exec \"$switch\"" in provider_check
+
+
+def test_trunk_initialization_precedes_the_suite_start():
+    lab_prep = SOURCE.index('step "STEP 4 OF 5: Initializing provider and fabric"')
+    trunk_setup = SOURCE.index("\nconfigure_containerlab_fabric\n", lab_prep)
+    suite_start = SOURCE.index('step "STEP 5 OF 5: Running the ${VLAN_E2E_SUITE} E2E suite"')
+    suite_dispatch = SOURCE.index('case "$VLAN_E2E_SUITE" in', suite_start)
+
+    assert lab_prep < trunk_setup < suite_start < suite_dispatch
+
+
+def test_dhcp_client_switch_attachment_uses_production_aap_jobs():
+    assert 'run_agentless_net_aap_job move-network-attachment' in SOURCE
+    assert 'run_agentless_net_aap_job query-dhcp-lease' in SOURCE
+    assert 'configure_client_access_port' not in SOURCE
+    assert 'nv set interface "$CLIENT_SWITCH_PORT"' not in SOURCE
+    assert 'nv unset interface "$CLIENT_SWITCH_PORT"' not in SOURCE
+
+
+def test_provider_inventory_keeps_bmaas_port_mapping_for_aap_jobs(tmp_path):
+    inventory = REPO_ROOT / "tests/e2e/agentless_net/lab/inventory.yml"
+
+    result, output_path, manifest_path = render_provider_inventory(tmp_path, inventory)
+
+    assert result.returncode == 0, result.stderr
+    rendered = yaml.safe_load(output_path.read_text())
+    inventory_vars = rendered["all"]["vars"]
+    assert inventory_vars["agentless_net_provisioning_network"] == {
+        "name": "agentless-provisioning",
+        "vlan_id": 1,
+    }
+    assert inventory_vars["agentless_net_host_ports"] == {
+        "osac-e2e-a1": {"eth0": {"switch": "clab-agentless-net-lab-leaf-1", "port": "swp2"}},
+        "osac-e2e-a2": {"eth0": {"switch": "clab-agentless-net-lab-leaf-2", "port": "swp2"}},
+        "osac-e2e-b1": {"eth0": {"switch": "clab-agentless-net-lab-leaf-2", "port": "swp3"}},
+    }
+    manifest = json.loads(manifest_path.read_text())
+    trunk_ports = {switch["name"]: set(switch["trunk_ports"]) for switch in manifest["switches"]}
+    for host in inventory_vars["agentless_net_host_ports"].values():
+        for mapping in host.values():
+            assert mapping["port"] not in trunk_ports[mapping["switch"]]
+
+
+def test_provider_inventory_rejects_duplicate_bmaas_port_claims(tmp_path):
+    source = yaml.safe_load(
+        (REPO_ROOT / "tests/e2e/agentless_net/lab/inventory.yml").read_text()
+    )
+    source["all"]["vars"]["agentless_net_host_ports"]["osac-e2e-a2"]["eth0"] = {
+        "switch": "clab-agentless-net-lab-leaf-1",
+        "port": "swp2",
+    }
+    inventory = tmp_path / "duplicate-inventory.yml"
+    inventory.write_text(yaml.safe_dump(source, sort_keys=False))
+
+    result, _, _ = render_provider_inventory(tmp_path, inventory)
+
+    assert result.returncode != 0
+    assert "must not be assigned more than once" in result.stderr
+
+
+def test_provider_inventory_upgrade_accepts_matching_legacy_switch_inventory(tmp_path):
+    source_inventory = REPO_ROOT / "tests/e2e/agentless_net/lab/inventory.yml"
+    rendered_result, expected_path, _ = render_provider_inventory(tmp_path, source_inventory)
+    assert rendered_result.returncode == 0, rendered_result.stderr
+    expected_inventory = expected_path.read_text()
+    legacy = yaml.safe_load(expected_inventory)
+    legacy_vars = legacy["all"]["vars"]
+    legacy_vars.pop("agentless_net_provisioning_network")
+    legacy_vars.pop("agentless_net_host_ports")
+    legacy_inventory = yaml.safe_dump(legacy, sort_keys=False)
+    configmap = json.dumps(
+        {"data": {"AGENTLESS_NET_VN_INVENTORY": legacy_inventory}}
+    )
+
+    helper = function_block("write_provider_inventory", "sync_aap_project_revision")
+    marker = "<<'PY'\n"
+    first_start = helper.index(marker) + len(marker)
+    first_end = helper.index("\nPY\n", first_start)
+    second_start = helper.index(marker, first_end) + len(marker)
+    second_end = helper.index("\nPY\n", second_start)
+    migration = helper[second_start:second_end]
+    backup_path = tmp_path / "inventory-backup.json"
+    patch_path = tmp_path / "inventory-patch.json"
+    script = f"""
+set -euo pipefail
+python3 - {shlex.quote(configmap)} {shlex.quote(expected_inventory)} \
+    {shlex.quote(str(backup_path))} {shlex.quote(str(patch_path))} <<'PY'
+{migration}
+PY
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    backup = json.loads(backup_path.read_text())
+    assert backup["original_inventory"] == legacy_inventory
+    assert backup["expected_inventory"] == expected_inventory
+
+    invalid_legacy = yaml.safe_load(legacy_inventory)
+    invalid_legacy["all"]["children"]["switches"]["hosts"][
+        "clab-agentless-net-lab-leaf-2"
+    ]["ansible_host"] = "192.168.162.99"
+    invalid_configmap = json.dumps(
+        {
+            "data": {
+                "AGENTLESS_NET_VN_INVENTORY": yaml.safe_dump(
+                    invalid_legacy, sort_keys=False
+                )
+            }
+        }
+    )
+    script = f"""
+set -euo pipefail
+python3 - {shlex.quote(invalid_configmap)} {shlex.quote(expected_inventory)} \
+    {shlex.quote(str(backup_path))} {shlex.quote(str(patch_path))} <<'PY'
+{migration}
+PY
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode != 0
+    assert "not the known legacy inventory" in result.stderr
+
+
+def test_aap_ca_bundle_combines_osac_and_default_ingress_cas(tmp_path):
+    helper = function_block("prepare_aap_ca_bundle", "sync_aap_project_revision")
+    osac_ca = "-----BEGIN CERTIFICATE-----\nOSAC-CA\n-----END CERTIFICATE-----\n"
+    ingress_ca = "-----BEGIN CERTIFICATE-----\nINGRESS-CA\n-----END CERTIFICATE-----\n"
+    osac_config = json.dumps({"data": {"bundle.pem": osac_ca}})
+    ingress_config = json.dumps({"data": {"ca-bundle.crt": ingress_ca}})
+    ca_file = tmp_path / "combined-ca.pem"
+    script = f"""
+set -euo pipefail
+TEMP_DIR={shlex.quote(str(tmp_path))}
+OSAC_NAMESPACE=osac-e2e-ci
+AAP_API_CA_FILE={shlex.quote(str(ca_file))}
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+oc() {{
+    case "$*" in
+        'get configmap ca-bundle -n osac-e2e-ci -o json') printf '%s' {shlex.quote(osac_config)} ;;
+        'get configmap default-ingress-cert -n openshift-config-managed -o json') printf '%s' {shlex.quote(ingress_config)} ;;
+        *) return 2 ;;
+    esac
+}}
+{helper}
+prepare_aap_ca_bundle
+"""
+
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert ca_file.read_text() == osac_ca.strip() + "\n" + ingress_ca.strip() + "\n"
+    assert ca_file.stat().st_mode & 0o777 == 0o600
+
+
+def test_wait_for_existing_provider_deletions_before_suite(tmp_path):
+    helper = function_block(
+        "wait_for_existing_provider_deletions", "restore_provider_inventory_config"
+    )
+    query_marker = tmp_path / "pending-seen"
+    script = f"""
+set -euo pipefail
+NETWORKING_NAMESPACE=osac-e2e-ci
+PREEXISTING_PROVIDER_CLEANUP_PENDING=true
+QUERY_MARKER={shlex.quote(str(query_marker))}
+oc() {{
+    [[ "$*" == 'get externalippools,subnets,virtualnetworks -n osac-e2e-ci -o json' ]]
+    if [[ ! -e "$QUERY_MARKER" ]]; then
+        touch "$QUERY_MARKER"
+        printf '%s' '{{"items":[{{"kind":"ExternalIPPool","metadata":{{"name":"stale-pool","deletionTimestamp":"now","finalizers":["pool-finalizer"]}}}}]}}'
+    else
+        printf '%s' '{{"items":[]}}'
+    fi
+}}
+sleep() {{ SECONDS=$((SECONDS + 5)); }}
+info() {{ :; }}
+{helper}
+wait_for_existing_provider_deletions
+[[ "$PREEXISTING_PROVIDER_CLEANUP_PENDING" == false ]]
+"""
+
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert query_marker.exists()
+
+
+def test_pending_provider_deletions_preserve_recovery_access_on_timeout(tmp_path):
+    helper = function_block(
+        "wait_for_existing_provider_deletions", "restore_provider_inventory_config"
+    )
+    script = f"""
+set -euo pipefail
+SECONDS=0
+NETWORKING_NAMESPACE=osac-e2e-ci
+PREEXISTING_PROVIDER_CLEANUP_PENDING=false
+oc() {{
+    printf '%s' '{{"items":[{{"kind":"ExternalIPPool","metadata":{{"name":"stale-pool","deletionTimestamp":"now","finalizers":["pool-finalizer"]}}}}]}}'
+}}
+sleep() {{ SECONDS=$((SECONDS + 601)); }}
+info() {{ :; }}
+{helper}
+if wait_for_existing_provider_deletions; then exit 1; fi
+[[ "$PREEXISTING_PROVIDER_CLEANUP_PENDING" == true ]]
+"""
+
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert "existing AgentlessNet provider resources remain in deletion" in result.stderr
+
+
+def test_aap_subnet_reader_uses_scoped_subnet_and_lock_rbac(tmp_path):
+    helper = function_block("configure_aap_subnet_reader", "cleanup_aap_subnet_reader")
+    events = tmp_path / "aap-subnet-reader.log"
+    script = f"""
+set -euo pipefail
+TEMP_DIR={shlex.quote(str(tmp_path))}
+OSAC_NAMESPACE=osac-e2e-ci
+NETWORKING_NAMESPACE=osac-e2e-ci
+SUITE_USES_SUBNET_DHCP=true
+AAP_SUBNET_READER_NAME=vlan-e2e-subnet-reader
+AAP_SUBNET_LOCK_NAME=vlan-e2e-subnet-lock
+AAP_SUBNET_READER_CREDENTIAL_TYPE='OSAC VLAN E2E Kubernetes API'
+AAP_SUBNET_READER_CREDENTIAL=vlan-e2e-subnet-reader
+AAP_PREFIX=osac
+AAP_JOBS_HELPER=/tmp/aap_jobs.py
+AAP_API_CA_FILE=/tmp/aap-ca.pem
+EVENTS={shlex.quote(str(events))}
+info() {{ :; }}
+oc() {{
+    printf '%s\\n' "$*" >>"$EVENTS"
+    case "$*" in
+        'create serviceaccount '*|'create role '*|'create rolebinding '*) printf 'kind: test\\n' ;;
+        'apply -f -') cat >/dev/null ;;
+        'auth can-i list subnets.osac.openshift.io'*) printf 'yes\\n' ;;
+        'auth can-i get leases.coordination.k8s.io'*|'auth can-i create leases.coordination.k8s.io'*|'auth can-i update leases.coordination.k8s.io'*|'auth can-i patch leases.coordination.k8s.io'*) printf 'yes\\n' ;;
+        'create token '*) printf 'service-account-token\\n' ;;
+        'get configmap kube-root-ca.crt '*) printf '{{"data":{{"ca.crt":"test-ca"}}}}' ;;
+        'get route osac-aap '*) printf 'aap.example.test' ;;
+        'exec deployment/osac-operator '*) printf 'operator-api-token' ;;
+        *) return 1 ;;
+    esac
+}}
+python3() {{
+    [[ "$1" == "$AAP_JOBS_HELPER" && "$2" == configure-k8s-credential ]]
+    [[ "$AAP_API_TOKEN" == operator-api-token ]]
+    [[ "$(<"$TEMP_DIR/aap-subnet-reader.token")" == service-account-token ]]
+    [[ "$(<"$TEMP_DIR/aap-subnet-reader-ca.pem")" == test-ca ]]
+    printf '{{"template_id":12,"credential_id":55,"credential_type_id":44}}\\n'
+}}
+{helper}
+configure_aap_subnet_reader
+[[ "$AAP_SUBNET_READER_SETUP_ATTEMPTED" == true ]]
+[[ ! -e "$TEMP_DIR/aap-subnet-reader.token" && ! -e "$TEMP_DIR/aap-subnet-reader-ca.pem" ]]
+grep -Fq -- '--verb=get,list --resource=subnets.osac.openshift.io' "$EVENTS"
+grep -Fq -- '--verb=get,create,update,patch --resource=leases.coordination.k8s.io' "$EVENTS"
+grep -Fq -- '--serviceaccount=osac-e2e-ci:vlan-e2e-subnet-reader' "$EVENTS"
+grep -Fq -- 'create rolebinding vlan-e2e-subnet-lock -n osac-e2e-ci' "$EVENTS"
+! grep -Fq cluster-admin "$EVENTS"
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_aap_subnet_reader_cleanup_removes_credential_before_rbac(tmp_path):
+    helper = function_block("cleanup_aap_subnet_reader", "wait_for_existing_provider_deletions")
+    events = tmp_path / "aap-subnet-reader-cleanup.log"
+    script = f"""
+set -euo pipefail
+OSAC_NAMESPACE=osac-e2e-ci
+NETWORKING_NAMESPACE=osac-e2e-ci
+AAP_SUBNET_READER_NAME=vlan-e2e-subnet-reader
+AAP_SUBNET_LOCK_NAME=vlan-e2e-subnet-lock
+AAP_SUBNET_READER_CREDENTIAL_TYPE='OSAC VLAN E2E Kubernetes API'
+AAP_SUBNET_READER_CREDENTIAL=vlan-e2e-subnet-reader
+AAP_SUBNET_READER_SETUP_ATTEMPTED=true
+AAP_PREFIX=osac
+AAP_JOBS_HELPER=/tmp/aap_jobs.py
+AAP_API_CA_FILE=/tmp/aap-ca.pem
+EVENTS={shlex.quote(str(events))}
+info() {{ :; }}
+oc() {{
+    printf '%s\\n' "$*" >>"$EVENTS"
+    case "$*" in
+        'get route osac-aap '*) printf 'aap.example.test' ;;
+        'exec deployment/osac-operator '*) printf 'operator-api-token' ;;
+        'delete rolebinding '*|'delete role '*|'delete serviceaccount '*) return 0 ;;
+        *) return 1 ;;
+    esac
+}}
+python3() {{
+    [[ "$1" == "$AAP_JOBS_HELPER" && "$2" == cleanup-k8s-credential ]]
+    [[ "$AAP_API_TOKEN" == operator-api-token ]]
+    printf 'AAP credential removed\\n' >>"$EVENTS"
+    printf '{{"status":"removed"}}\\n'
+}}
+{helper}
+cleanup_aap_subnet_reader
+[[ "$AAP_SUBNET_READER_SETUP_ATTEMPTED" == false ]]
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    events = events.read_text().splitlines()
+    assert events.index("AAP credential removed") < events.index(
+        "delete rolebinding vlan-e2e-subnet-reader -n osac-e2e-ci --ignore-not-found=true --wait=true"
+    )
+    assert events.index("delete rolebinding vlan-e2e-subnet-reader -n osac-e2e-ci --ignore-not-found=true --wait=true") < events.index(
+        "delete role vlan-e2e-subnet-reader -n osac-e2e-ci --ignore-not-found=true --wait=true"
+    )
+    assert events.index("delete rolebinding vlan-e2e-subnet-lock -n osac-e2e-ci --ignore-not-found=true --wait=true") < events.index(
+        "delete role vlan-e2e-subnet-lock -n osac-e2e-ci --ignore-not-found=true --wait=true"
+    )
+    assert events.index("delete role vlan-e2e-subnet-reader -n osac-e2e-ci --ignore-not-found=true --wait=true") < events.index(
+        "delete serviceaccount vlan-e2e-subnet-reader -n osac-e2e-ci --ignore-not-found=true --wait=true"
+    )
+
+
+def test_aap_subnet_credential_is_retained_until_provider_cleanup_succeeds(tmp_path):
+    start = SOURCE.index("on_exit() {")
+    end = SOURCE.index("\ntrap on_exit EXIT", start)
+    on_exit = SOURCE[start:end]
+
+    def run_cleanup(provider_succeeds: bool, label: str):
+        events = tmp_path / f"{label}.log"
+        provider_result = "return 0" if provider_succeeds else (
+            "PRESERVE_E2E_RECOVERY_ARTIFACTS=true; return 1"
+        )
+        script = f"""
+set -uo pipefail
+CURRENT_STAGE=test
+SUITE_USES_SUBNET_DHCP=false
+VLAN_E2E_DEBUG=false
+PREEXISTING_PROVIDER_CLEANUP_PENDING=false
+PRESERVE_E2E_RECOVERY_ARTIFACTS=false
+AAP_SUBNET_READER_SETUP_ATTEMPTED=true
+RUN_DIR_CREATED=false
+VLAN_E2E_RUN_DIR=
+GENERATED_CLI_CONFIG=false
+GENERATED_CLI_BIN=false
+CLI_CA_FILE=
+CUMULUS_SSH_CONFIG_CREATED_BY_RUN=false
+TEMP_DIR=
+EVENTS={shlex.quote(str(events))}
+cleanup_created_virtual_networks() {{
+    printf 'provider cleanup\\n' >>"$EVENTS"
+    {provider_result}
+}}
+cleanup_aap_subnet_reader() {{ printf 'AAP credential cleanup\\n' >>"$EVENTS"; }}
+write_run_evidence() {{ return 0; }}
+info() {{ :; }}
+{on_exit}
+set +e
+false
+on_exit
+"""
+        return run_bash(tmp_path, script), events
+
+    successful_run, success_events = run_cleanup(True, "provider-cleanup-success")
+    failed_run, failure_events = run_cleanup(False, "provider-cleanup-failure")
+
+    assert successful_run.returncode == 1
+    assert success_events.read_text().splitlines() == [
+        "provider cleanup",
+        "AAP credential cleanup",
+    ]
+    assert failed_run.returncode == 1
+    assert failure_events.read_text().splitlines() == ["provider cleanup"]
+
+
+def test_provider_cleanup_keeps_aap_ca_until_subnet_credential_cleanup(tmp_path):
+    helper = function_block("cleanup_created_virtual_networks", "export_dhcp_debug_artifacts")
+    ca_file = tmp_path / "aap-api-ca.pem"
+    ca_file.write_text("test CA")
+    script = f"""
+set -euo pipefail
+AAP_SUBNET_READER_SETUP_ATTEMPTED=true
+CLI_CA_FILE={shlex.quote(str(ca_file))}
+TEMP_DIR=
+RUN_DIR_CREATED=false
+GENERATED_CLI_CONFIG=false
+GENERATED_CLI_BIN=false
+CLI_CONFIG_DIR=
+CLI_BIN=
+CREATED_IDS=()
+CREATED_SUBNET_IDS=()
+CREATED_EXTERNAL_IP_IDS=()
+cleanup_created_external_ips() {{ return 0; }}
+cleanup_created_external_ip_pool() {{ return 0; }}
+cleanup_created_subnets() {{ return 0; }}
+restore_dhcp_supervisor() {{ return 0; }}
+remove_netnode_public_key() {{ return 0; }}
+restore_containerlab_netnode_access() {{ return 0; }}
+remove_containerlab_switch_keys() {{ return 0; }}
+restore_containerlab_switch_access() {{ return 0; }}
+restore_netnode_download_network() {{ return 0; }}
+restore_provider_inventory_config() {{ return 0; }}
+restore_aap_ssh_key() {{ return 0; }}
+info() {{ :; }}
+{helper}
+cleanup_created_virtual_networks 1
+[[ -f "$CLI_CA_FILE" ]]
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_bmi_extra_vars_reuse_identity_for_move_and_query_and_mark_offboard(tmp_path):
+    helpers = function_block("write_client_bmi_extra_vars", "attach_client_to_subnet")
+    variables = tmp_path / "client-vars"
+    script = f"""
+set -euo pipefail
+TEMP_DIR={shlex.quote(str(tmp_path))}
+OSAC_NAMESPACE=osac-e2e-ci
+OSAC_TENANT=osac-e2e-ci
+declare -A CLIENT_BMI_UID=([a1]=01234567-89ab-cdef-0123-456789abcdef)
+declare -A CLIENT_PRESERVED_MAC=([a1]=02:00:00:00:00:01)
+{helpers}
+write_client_bmi_extra_vars a1 11234567-89ab-cdef-0123-456789abcdef {shlex.quote(str(variables / 'attach.json'))} false
+write_client_bmi_extra_vars a1 11234567-89ab-cdef-0123-456789abcdef {shlex.quote(str(variables / 'query.json'))} query
+write_client_bmi_extra_vars a1 11234567-89ab-cdef-0123-456789abcdef {shlex.quote(str(variables / 'offboard.json'))} true
+jq -e '
+  .osac_job_vars.resource.kind == "BareMetalInstance"
+  and .osac_job_vars.resource.metadata.annotations["osac.openshift.io/tenant"] == "osac-e2e-ci"
+  and .osac_job_vars.resource.metadata.annotations["osac.openshift.io/owner-reference"] == "vlan-e2e-run"
+  and .osac_job_vars.resource.metadata.annotations["osac.openshift.io/implementation-strategy"] == "agentless_net"
+  and .osac_job_vars.resource.metadata.uid == "01234567-89ab-cdef-0123-456789abcdef"
+  and .osac_job_vars.resource.spec.externalHostID == "osac-e2e-a1"
+  and .osac_job_vars.resource.spec.networkAttachments == [{{"subnetRef":"11234567-89ab-cdef-0123-456789abcdef","interface":"eth0","primary":true}}]
+' {shlex.quote(str(variables / 'attach.json'))} >/dev/null
+jq -e '.osac_job_vars.network_attachment_macs["11234567-89ab-cdef-0123-456789abcdef"] == "02:00:00:00:00:01"' \
+  {shlex.quote(str(variables / 'query.json'))} >/dev/null
+jq -e '
+  .osac_job_vars.resource.metadata.deletionTimestamp
+  | test("^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T.*Z$")
+' {shlex.quote(str(variables / 'offboard.json'))} >/dev/null
+"""
+    variables.mkdir()
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert (variables / "attach.json").stat().st_mode & 0o777 == 0o600
+    assert (variables / "query.json").stat().st_mode & 0o777 == 0o600
+    assert (variables / "offboard.json").stat().st_mode & 0o777 == 0o600
+
+
+def test_client_attachment_is_idempotent_and_offboard_reuses_bmi_uid(tmp_path):
+    helpers = (
+        function_block("write_client_bmi_extra_vars", "attach_client_to_subnet")
+        + "\n"
+        + function_block("attach_client_to_subnet", "discover_client_dhcp_lease")
+        + "\n"
+        + function_block("offboard_client_from_subnet", "write_agentless_e2e_helpers")
+    )
+    mac_file = tmp_path / "client-a1.mac"
+    mac_file.write_text("02:00:00:00:00:01\n")
+    script = f"""
+set -euo pipefail
+TEMP_DIR={shlex.quote(str(tmp_path))}
+OSAC_NAMESPACE=osac-e2e-ci
+OSAC_TENANT=osac-e2e-ci
+declare -A CLIENT_ATTACHMENT_ACTIVE=()
+declare -A CLIENT_ATTACHMENT_PENDING=()
+declare -A CLIENT_ATTACHMENT_SUBNET=()
+declare -A CLIENT_BMI_UID=()
+declare -A CLIENT_PRESERVED_MAC=()
+JOB_CALLS=0
+run_agentless_net_aap_job() {{
+    local suffix="$1" vars="$2" output="$3"
+    [[ "$suffix" == move-network-attachment ]]
+    JOB_CALLS=$((JOB_CALLS + 1))
+    cp "$vars" "$TEMP_DIR/job-$JOB_CALLS.json"
+    printf '{{"job_id":%d,"status":"successful","artifacts":{{}}}}\\n' "$JOB_CALLS" >"$output"
+}}
+info() {{ :; }}
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+{helpers}
+attach_client_to_subnet a1 11234567-89ab-cdef-0123-456789abcdef
+first_uid="${{CLIENT_BMI_UID[a1]}}"
+attach_client_to_subnet a1 11234567-89ab-cdef-0123-456789abcdef
+[[ "$JOB_CALLS" == 1 && "${{CLIENT_ATTACHMENT_ACTIVE[a1]}}" == true ]]
+[[ "${{CLIENT_ATTACHMENT_PENDING[a1]}}" == false ]]
+offboard_client_from_subnet a1
+[[ "$JOB_CALLS" == 2 && "${{CLIENT_ATTACHMENT_ACTIVE[a1]}}" == false ]]
+[[ -z "${{CLIENT_BMI_UID[a1]:-}}" && -z "${{CLIENT_ATTACHMENT_SUBNET[a1]:-}}" ]]
+jq -e --arg uid "$first_uid" '
+  .osac_job_vars.resource.metadata.uid == $uid
+  and .osac_job_vars.resource.metadata.deletionTimestamp != null
+' "$TEMP_DIR/job-2.json" >/dev/null
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_client_cleanup_keeps_links_and_resources_when_offboarding_fails(tmp_path):
+    helper = function_block("cleanup_dhcp_clients_and_attachments", "write_client_lease_expectations")
+    events = tmp_path / "cleanup.log"
+    script = f"""
+set -euo pipefail
+TEMP_DIR={shlex.quote(str(tmp_path))}
+EVENTS={shlex.quote(str(events))}
+declare -a DHCP_CLIENT_CONTAINERS=(test-run-a1)
+declare -a DHCP_CLIENT_HOST_LINKS=(m12345678-a1)
+declare -A CLIENT_ATTACHMENT_ACTIVE=([a1]=true)
+declare -A CLIENT_ATTACHMENT_PENDING=([a1]=false)
+client_container() {{ printf 'test-run-%s' "$1"; }}
+stop_dhcp_client() {{ printf 'stop %s\\n' "$1" >>"$EVENTS"; }}
+offboard_client_from_subnet() {{ return 1; }}
+docker() {{
+    printf 'docker %s\\n' "$*" >>"$EVENTS"
+    case "$1 $2" in
+        'inspect test-run-a1'|'exec test-run-a1') return 0 ;;
+        *) return 2 ;;
+    esac
+}}
+sudo() {{ printf 'sudo %s\\n' "$*" >>"$EVENTS"; return 0; }}
+{helper}
+if cleanup_dhcp_clients_and_attachments; then exit 1; fi
+! grep -Fq 'docker rm -f test-run-a1' "$EVENTS"
+! grep -Fq 'sudo ip link delete dev m12345678-a1' "$EVENTS"
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_dhcp_client_creation_restores_saved_mac_before_moving_macvlan(tmp_path):
+    helper = function_block("create_dhcp_client_container", "create_dhcp_client_containers")
+    events = tmp_path / "events.log"
+    hook = tmp_path / "udhcpc-hook.sh"
+    hook.write_text("#!/bin/sh\n")
+    script = f"""
+set -euo pipefail
+TEMP_DIR={shlex.quote(str(tmp_path))}
+DHCP_CLIENT_PREFIX=test-run
+CLIENT_IMAGE=busybox:1.36.1
+CLIENT_HOST_PARENT=leaf2-swp3
+DHCP_CLIENT_HOOK={shlex.quote(str(hook))}
+EVENTS={shlex.quote(str(events))}
+declare -a DHCP_CLIENT_CONTAINERS=()
+declare -a DHCP_CLIENT_HOST_LINKS=()
+declare -A CLIENT_PRESERVED_MAC=([b1]=02:00:00:00:00:01)
+client_link() {{ CLIENT_HOST_PARENT=leaf2-swp3; }}
+client_container() {{ printf 'test-run-%s' "$1"; }}
+client_macvlan_name() {{ printf 'm12345678-%s' "$1"; }}
+info() {{ :; }}
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+sudo() {{
+    [[ "$1" == ip && "$2" == link ]]
+    printf 'sudo %s\\n' "$*" >>"$EVENTS"
+}}
+docker() {{
+    case "$1 $2" in
+        'run -d') printf 'container-id\\n' ;;
+        'inspect -f') printf '1234\\n' ;;
+        'exec test-run-b1')
+            shift 2
+            if [[ "$1" == cat ]]; then
+                printf '02:00:00:00:00:01\\n'
+            fi
+            printf 'docker exec %s\\n' "$*" >>"$EVENTS"
+            ;;
+        cp*) printf 'docker cp\\n' >>"$EVENTS" ;;
+        *) return 2 ;;
+    esac
+}}
+{helper}
+create_dhcp_client_container b1
+[[ "$(<"$TEMP_DIR/client-b1.mac")" == 02:00:00:00:00:01 ]]
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    operations = events.read_text().splitlines()
+    set_mac = next(i for i, event in enumerate(operations) if "address 02:00:00:00:00:01" in event)
+    move_netns = next(i for i, event in enumerate(operations) if "netns 1234" in event)
+    assert set_mac < move_netns
+
+
+def test_runtime_source_falls_back_to_main_after_fixes_branch_is_deleted(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    def git(*arguments: str) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(repository), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    git("init", "--initial-branch=main")
+    git("config", "user.name", "E2E Test")
+    git("config", "user.email", "e2e@example.invalid")
+    production_file = repository / "osac-aap" / "source.py"
+    production_file.parent.mkdir()
+    production_file.write_text("fix source\n")
+    git("add", "osac-aap/source.py")
+    git("commit", "-m", "base")
+    git("checkout", "-b", "fixes/osac-6307-cumulus-5.16")
+    production_file.write_text("fixed source\n")
+    git("commit", "-am", "fix")
+    fixes_commit = git("rev-parse", "HEAD")
+    git("checkout", "-b", "e2e")
+    (repository / "vlan-e2e.sh").write_text("runner update\n")
+    git("add", "vlan-e2e.sh")
+    git("commit", "-m", "runner")
+    git("checkout", "main")
+    git("merge", "--ff-only", "fixes/osac-6307-cumulus-5.16")
+    (repository / "docs.md").write_text("main documentation update\n")
+    git("add", "docs.md")
+    git("commit", "-m", "docs")
+    main_commit = git("rev-parse", "HEAD")
+    git("branch", "-D", "fixes/osac-6307-cumulus-5.16")
+    git("checkout", "e2e")
+
+    helper_start = SOURCE.index("resolve_runtime_source() {")
+    helper_end = SOURCE.index("\n}\n", helper_start) + 3
+    helper = SOURCE[helper_start:helper_end]
+    script = f"""
+set -euo pipefail
+{helper}
+resolve_runtime_source {shlex.quote(str(repository))} fixes/osac-6307-cumulus-5.16
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["main", main_commit]
+    assert git("merge-base", "main", "HEAD") == fixes_commit
+    assert subprocess.run(
+        ["git", "-C", str(repository), "diff", "--quiet", "main", "HEAD", "--", "osac-aap"]
+    ).returncode == 0
+
+    git("checkout", "main")
+    production_file.write_text("main changed production source\n")
+    git("commit", "-am", "main production update")
+    git("checkout", "e2e")
+    assert subprocess.run(
+        ["git", "-C", str(repository), "diff", "--quiet", "main", "HEAD", "--", "osac-aap"]
+    ).returncode == 1
+    assert fixes_commit != main_commit
+
+
+def test_runtime_source_rejects_fixes_branch_advanced_past_e2e_base(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    def git(*arguments: str) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(repository), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    git("init", "--initial-branch=main")
+    git("config", "user.name", "E2E Test")
+    git("config", "user.email", "e2e@example.invalid")
+    production_file = repository / "osac-aap" / "source.py"
+    production_file.parent.mkdir()
+    production_file.write_text("base source\n")
+    git("add", "osac-aap/source.py")
+    git("commit", "-m", "base")
+    git("checkout", "-b", "fixes/osac-6307-cumulus-5.16")
+    production_file.write_text("fix source\n")
+    git("commit", "-am", "fix")
+    git("checkout", "-b", "e2e")
+    (repository / "vlan-e2e.sh").write_text("runner update\n")
+    git("add", "vlan-e2e.sh")
+    git("commit", "-m", "runner")
+    git("checkout", "fixes/osac-6307-cumulus-5.16")
+    production_file.write_text("advanced fix source\n")
+    git("commit", "-am", "advance fixes base")
+    git("checkout", "e2e")
+
+    helper_start = SOURCE.index("resolve_runtime_source() {")
+    helper_end = SOURCE.index("\n}\n", helper_start) + 3
+    helper = SOURCE[helper_start:helper_end]
+    script = f"""
+set -euo pipefail
+{helper}
+resolve_runtime_source {shlex.quote(str(repository))} fixes/osac-6307-cumulus-5.16
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode != 0
+
+
+def test_runner_stages_are_ordered_and_source_revision_is_pinned():
+    stage_markers = [
+        'step "STEP 1 OF 5:',
+        'step "STEP 2 OF 5:',
+        'step "STEP 3 OF 5:',
+        'step "STEP 4 OF 5:',
+        'step "STEP 5 OF 5:',
+    ]
+    positions = [SOURCE.index(marker) for marker in stage_markers]
+
+    assert positions == sorted(positions)
+    assert 'AAP_PROJECT_GIT_BRANCH" == "$RUNTIME_SOURCE_BRANCH"' in SOURCE
+    assert 'AAP_PROJECT_EXPECTED_REVISION" == "$RUNTIME_SOURCE_COMMIT"' in SOURCE
+    assert 'IMAGE_SOURCE_COMMIT="$RUNTIME_SOURCE_COMMIT"' in SOURCE
+
+
+def test_full_suite_runs_external_ip_lifecycle_before_virtual_networks():
+    suite = function_block("run_full_suite", "run_virtual_network_suite")
+
+    assert suite.index("create_external_ip_pool") < suite.index("run_external_ip_lifecycle")
+    assert suite.index("run_external_ip_lifecycle") < suite.index("create_virtual_network")
