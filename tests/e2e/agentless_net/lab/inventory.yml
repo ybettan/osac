@@ -1,4 +1,21 @@
 all:
+  vars:
+    agentless_net_provisioning_network:
+      name: agentless-provisioning
+      vlan_id: 1
+    agentless_net_host_ports:
+      osac-e2e-a1:
+        eth0:
+          switch: clab-agentless-net-lab-leaf-1
+          port: swp2
+      osac-e2e-a2:
+        eth0:
+          switch: clab-agentless-net-lab-leaf-2
+          port: swp2
+      osac-e2e-b1:
+        eth0:
+          switch: clab-agentless-net-lab-leaf-2
+          port: swp3
   children:
     switches:
       hosts:

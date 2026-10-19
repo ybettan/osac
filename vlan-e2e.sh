@@ -17,20 +17,20 @@ usage() {
 Usage: bash ./vlan-e2e.sh [--suite SUITE]
 
 Suites:
-  full              Run the complete ExternalIPPool, VirtualNetwork, and Subnet/DHCP E2E (default).
+  full              Run the complete ExternalIPPool/ExternalIP, VirtualNetwork, and Subnet/DHCP E2E (default).
   virtual-network   Create, verify, and delete one VirtualNetwork.
   subnet-dhcp       Create a parent VirtualNetwork and run the Subnet/DHCP E2E.
   external-ip-pool  Create, verify, and delete one ExternalIPPool.
   external-ip       Allocate, retry, and release ExternalIPs through Fulfillment.
 
-All suites boot or reuse the SNO, prepare source-matched images, install or
-upgrade OSAC, and initialize the Containerlab fabric before running the
-selected checks. Set CUMULUS_VERSION and CUMULUS_VX_IMAGE to the exact guest
+All suites boot or reuse the SNO, deploy or reuse OSAC and the Containerlab
+fabric, initialize the declared trunks, and run the selected checks. Set
+CUMULUS_VERSION and CUMULUS_VX_IMAGE to the exact guest
 release and its Boxen image. CUMULUS_LAB_ADMIN_KEY defaults to the ignored
 local lab key path; VLAN_E2E_RUN_DIR optionally retains sanitized run evidence.
-The runner also corrects the known development database version marker to
-schema V1 before creating test resources. Keep the AgentlessNet state schema
-at V1 until OSAC-5528 is complete.
+The runner requires a compatible AgentlessNet schema V1 database and preserves
+any incompatible existing state. Keep the AgentlessNet state schema at V1 until
+OSAC-5528 is complete.
 
 Examples:
   bash ./vlan-e2e.sh
@@ -76,7 +76,7 @@ case "$VLAN_E2E_SUITE" in
         SUITE_USES_SUBNET_DHCP=true
         SUITE_USES_POOL=true
         SUITE_USES_CLI=true
-        SUITE_USES_EXTERNAL_IP=false
+        SUITE_USES_EXTERNAL_IP=true
         ;;
     virtual-network)
         SUITE_USES_VN=true
@@ -112,6 +112,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AAP_DIR="${REPO_ROOT}/osac-aap"
 INSTALLER_DIR="${REPO_ROOT}/osac-installer"
 FABRIC_DIR="${REPO_ROOT}/tests/e2e/agentless_net/lab"
+AAP_JOBS_HELPER="${FABRIC_DIR}/aap_jobs.py"
 CONTAINERLAB_TOPOLOGY="${FABRIC_DIR}/agentless-net-lab.clab.yml"
 CONTAINERLAB_INVENTORY="${FABRIC_DIR}/inventory.yml"
 CONTAINERLAB_CONFIGURE_PLAYBOOK="${FABRIC_DIR}/configure_network.yml"
@@ -136,6 +137,7 @@ CUMULUS_LAB_ADMIN_KEY="${CUMULUS_LAB_ADMIN_KEY:-${REPO_ROOT}/.artifacts/agentles
 CUMULUS_SSH_CONFIG_FILE="${REPO_ROOT}/.artifacts/agentless-net-lab/ssh_config"
 CUMULUS_STARTUP_CONFIG=""
 CUMULUS_ADMIN_PUBLIC_KEY_FILE=""
+CUMULUS_ADMIN_NVUE_KEY_ID="osac-agentless-e2e-admin"
 CUMULUS_IMAGE_ID=""
 CUMULUS_IMAGE_PROVENANCE_FILE="${CUMULUS_IMAGE_PROVENANCE_FILE:-}"
 VLAN_E2E_RUN_DIR="${VLAN_E2E_RUN_DIR:-}"
@@ -147,9 +149,57 @@ CLIENT_IMAGE="${CLIENT_IMAGE:-busybox:1.36.1}"
 VLAN_E2E_DEBUG="${VLAN_E2E_DEBUG:-false}"
 VLAN_E2E_ARTIFACT_DIR="${VLAN_E2E_ARTIFACT_DIR:-}"
 DHCP_CLIENT_PREFIX="${DHCP_CLIENT_PREFIX:-osac5530-$(date -u +%Y%m%d%H%M%S)}"
+FIXES_BRANCH_NAME="fixes/osac-6307-cumulus-5.16"
 CURRENT_BRANCH="$(git -C "$REPO_ROOT" branch --show-current)"
-IMAGE_SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-list -1 HEAD -- . ':(exclude)vlan-e2e.sh')"
-[[ -n "$IMAGE_SOURCE_COMMIT" ]] || { printf 'ERROR: could not determine the latest non-runner source commit\n' >&2; exit 1; }
+if [[ "$CURRENT_BRANCH" != e2e ]]; then
+    printf 'ERROR: run vlan-e2e.sh from the e2e branch; current branch is %s\n' "$CURRENT_BRANCH" >&2
+    exit 1
+fi
+
+resolve_runtime_source() {
+    local repo="$1" fixes_branch="$2" source_branch source_commit
+    if source_commit="$(git -C "$repo" rev-parse --verify \
+        "refs/heads/${fixes_branch}^{commit}" 2>/dev/null)"; then
+        source_branch="$fixes_branch"
+        git -C "$repo" merge-base --is-ancestor "$source_commit" HEAD || return 1
+    else
+        source_branch=main
+        if ! source_commit="$(git -C "$repo" rev-parse --verify \
+            'refs/heads/main^{commit}' 2>/dev/null)"; then
+            return 1
+        fi
+        git -C "$repo" merge-base main HEAD >/dev/null || return 1
+    fi
+    printf '%s\n%s\n' "$source_branch" "$source_commit"
+}
+
+if ! RUNTIME_SOURCE_INFO="$(resolve_runtime_source "$REPO_ROOT" "$FIXES_BRANCH_NAME")"; then
+    printf 'ERROR: e2e must be based on local %s, or on main after that branch is merged\n' \
+        "$FIXES_BRANCH_NAME" >&2
+    exit 1
+fi
+mapfile -t RUNTIME_SOURCE_FIELDS <<<"$RUNTIME_SOURCE_INFO"
+RUNTIME_SOURCE_BRANCH="${RUNTIME_SOURCE_FIELDS[0]}"
+RUNTIME_SOURCE_COMMIT="${RUNTIME_SOURCE_FIELDS[1]}"
+# When the base branch advances, require its production source to remain exactly
+# represented in e2e before using that branch for images and the AAP project.
+for runtime_path in osac-aap osac-operator fulfillment-service proto osac-installer bare-metal-fulfillment-operator; do
+    if ! git -C "$REPO_ROOT" diff --quiet "$RUNTIME_SOURCE_COMMIT" HEAD -- "$runtime_path"; then
+        printf 'ERROR: production source under %s differs from the selected runtime branch\n' \
+            "$runtime_path" >&2
+        exit 1
+    fi
+    if [[ -n "$(git -C "$REPO_ROOT" ls-files --others --exclude-standard -- "$runtime_path")" ]]; then
+        printf 'ERROR: untracked production source exists under %s\n' "$runtime_path" >&2
+        exit 1
+    fi
+    if ! git -C "$REPO_ROOT" diff --quiet HEAD -- "$runtime_path" \
+        || ! git -C "$REPO_ROOT" diff --cached --quiet HEAD -- "$runtime_path"; then
+        printf 'ERROR: production source under %s has uncommitted changes\n' "$runtime_path" >&2
+        exit 1
+    fi
+done
+IMAGE_SOURCE_COMMIT="$RUNTIME_SOURCE_COMMIT"
 IMAGE_SOURCE_SHORT="${IMAGE_SOURCE_COMMIT:0:12}"
 AAP_IMAGE="${AAP_IMAGE:-quay.io/ybettan/osac-aap:osac-5530-${IMAGE_SOURCE_SHORT}}"
 OPERATOR_IMAGE="${OPERATOR_IMAGE:-quay.io/ybettan/osac-operator:osac-5530-${IMAGE_SOURCE_SHORT}}"
@@ -159,12 +209,13 @@ OPERATOR_IMAGE_TAG="${OPERATOR_IMAGE##*:}"
 FULFILLMENT_IMAGE_REPOSITORY="${FULFILLMENT_IMAGE%:*}"
 FULFILLMENT_IMAGE_TAG="${FULFILLMENT_IMAGE##*:}"
 AAP_PROJECT_GIT_URI="${AAP_PROJECT_GIT_URI:-https://github.com/ybettan/osac}"
-AAP_PROJECT_GIT_BRANCH="${AAP_PROJECT_GIT_BRANCH:-${CURRENT_BRANCH}}"
+AAP_PROJECT_GIT_BRANCH="${AAP_PROJECT_GIT_BRANCH:-${RUNTIME_SOURCE_BRANCH}}"
 AAP_PREFIX="${AAP_PREFIX:-${AAP_ORGANIZATION_NAME:-osac}}"
 AAP_PROJECT_NAME="${AAP_PROJECT_NAME:-${AAP_PREFIX}}"
-# By default, verify AAP against this checkout's commit. Set this when testing
-# local workflow-only changes that are not part of the AAP project source branch.
-AAP_PROJECT_EXPECTED_REVISION="${AAP_PROJECT_EXPECTED_REVISION:-$(git -C "$REPO_ROOT" rev-parse HEAD)}"
+# AAP executes production project code from fixes during development, then
+# main after that branch is merged and removed. Runner-only commits never change
+# the runtime project revision or image tags.
+AAP_PROJECT_EXPECTED_REVISION="${AAP_PROJECT_EXPECTED_REVISION:-${RUNTIME_SOURCE_COMMIT}}"
 
 OSAC_NAMESPACE="${OSAC_NAMESPACE:-osac-e2e-ci}"
 OSAC_TENANT="${OSAC_TENANT:-osac-e2e-ci}"
@@ -180,8 +231,14 @@ MGMT_GW=""
 MGMT_DHCP_RANGES=""
 AAP_NETWORKING_SECRET="network-fulfillment-ig"
 AAP_EXECUTION_ENVIRONMENT_NAME="${AAP_EXECUTION_ENVIRONMENT_NAME:-osac-ee}"
+AAP_JOB_TIMEOUT="${AAP_JOB_TIMEOUT:-1800}"
 AAP_SSH_KEY_SECRET_KEY="AGENTLESS_NET_SSH_PRIVATE_KEY"
 AAP_SSH_KEY_SECRET_ANNOTATION="osac.openshift.io/agentless-vn-ssh"
+AAP_SUBNET_READER_NAME="vlan-e2e-subnet-reader"
+AAP_SUBNET_LOCK_NAME="vlan-e2e-subnet-lock"
+AAP_SUBNET_READER_CREDENTIAL_TYPE="OSAC VLAN E2E Kubernetes API"
+AAP_SUBNET_READER_CREDENTIAL="vlan-e2e-subnet-reader"
+AAP_SUBNET_READER_SETUP_ATTEMPTED=false
 VIRTUAL_NETWORK_NAME="${VIRTUAL_NETWORK_NAME:-agentless-smoke-vn-$(date -u +%Y%m%d%H%M%S)}"
 PEER_VIRTUAL_NETWORK_NAME="${PEER_VIRTUAL_NETWORK_NAME:-${VIRTUAL_NETWORK_NAME}-peer}"
 VIRTUAL_NETWORK_IPV4_CIDR="${VIRTUAL_NETWORK_IPV4_CIDR:-10.250.0.0/16}"
@@ -191,8 +248,13 @@ SUBNET_THREE_NAME="${SUBNET_THREE_NAME:-${VIRTUAL_NETWORK_NAME}-subnet-30}"
 SUBNET_ONE_IPV4_CIDR="${SUBNET_ONE_IPV4_CIDR:-}"
 SUBNET_TWO_IPV4_CIDR="${SUBNET_TWO_IPV4_CIDR:-}"
 SUBNET_THREE_IPV4_CIDR="${SUBNET_THREE_IPV4_CIDR:-}"
+EXTERNAL_IP_POOL_CIDR_EXPLICIT=false
+if [[ -n "${EXTERNAL_IP_POOL_CIDR:-}" ]]; then
+    EXTERNAL_IP_POOL_CIDR_EXPLICIT=true
+fi
 EXTERNAL_IP_POOL_NAME="agentless-e2e-pool-$(date -u +%Y%m%d%H%M%S)-$$"
-EXTERNAL_IP_POOL_CIDR="198.51.100.0/24"
+EXTERNAL_IP_POOL_CIDR="${EXTERNAL_IP_POOL_CIDR:-198.51.100.0/24}"
+EXTERNAL_IP_POOL_CIDR_RESOLVED=false
 EXTERNAL_IP_PREFIX="agentless-eip-$(date -u +%Y%m%d%H%M%S)-$$"
 EXTERNAL_IP_ONE_NAME="${EXTERNAL_IP_PREFIX}-a"
 EXTERNAL_IP_TWO_NAME="${EXTERNAL_IP_PREFIX}-b"
@@ -200,6 +262,7 @@ EXTERNAL_IP_TWO_NAME="${EXTERNAL_IP_PREFIX}-b"
 CLI_BIN="${OSAC_CLI_BIN:-}"
 CLI_CONFIG_DIR="${OSAC_CLI_CONFIG_DIR:-}"
 CLI_CA_FILE=""
+AAP_API_CA_FILE=""
 TEMP_DIR=""
 GENERATED_CLI_BIN=false
 GENERATED_CLI_CONFIG=false
@@ -231,11 +294,11 @@ NETNODE_SSHD_CREATED_BY_RUN=false
 SWITCH_ACCESS_CONFIGURED=false
 RUN_DIR_CREATED=false
 RUN_STARTED_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+PROVIDER_NVUE_KEY_ID="osac_e2e_$(date -u +%s)_$$"
 CUMULUS_SSH_CONFIG_CREATED_BY_RUN=false
 CURRENT_STAGE="startup"
 SUPERVISOR_CONFIG_CREATED_BY_RUN=false
 SUPERVISOR_DAEMON_STARTED_BY_RUN=false
-ACCESS_PORTS_SNAPSHOT_FILE=""
 SWITCH_VLAN_SNAPSHOT_FILE=""
 CLIENT_EXPECTED_LEASES_FILE=""
 DHCP_CLIENT_HELPER=""
@@ -246,15 +309,18 @@ DEBUG_CAPTURE_PID_FILES=()
 DEBUG_CAPTURE_LAUNCH_PIDS=()
 DEBUG_ARTIFACT_DIR=""
 DEBUG_ARTIFACT_DIR_GENERATED=false
-declare -A SWITCH_AUTHORIZED_KEYS_EXISTED=()
-declare -A SWITCH_PUBLIC_KEY_INSTALLED_BY_RUN=()
+declare -A SWITCH_NVUE_KEY_INSTALLED_BY_RUN=()
 declare -A SWITCH_SUDOERS_CREATED_BY_RUN=()
-declare -A CLIENT_PORT_CONFIGURED=()
-declare -A CLIENT_PORT_VLAN=()
+declare -A CLIENT_BMI_UID=()
+declare -A CLIENT_ATTACHMENT_ACTIVE=()
+declare -A CLIENT_ATTACHMENT_PENDING=()
+declare -A CLIENT_ATTACHMENT_SUBNET=()
+declare -A CLIENT_PRESERVED_MAC=()
 INVENTORY_CONFIGMAP_CHANGED_BY_RUN=false
 INVENTORY_CONFIGMAP_BACKUP=""
 INVENTORY_CONFIGMAP_EXPECTED=""
 PRESERVE_E2E_RECOVERY_ARTIFACTS=false
+PREEXISTING_PROVIDER_CLEANUP_PENDING=false
 AAP_API_ROUTE=""
 UPGRADE_VALUES_FILE=""
 
@@ -298,236 +364,6 @@ if versions != [1]:
 PY
 }
 
-# AgentlessNet schema remains V1 while OSAC-5528 is in progress. Extend V1
-# during this development period; the earlier V2 marker was accidental.
-repair_provider_schema_v1() {
-    local result_file="${TEMP_DIR}/schema-repair.json"
-    if ! docker exec -i "$CONTAINERLAB_NET_NODE" python3 - "$AGENTLESS_NET_STATE_FILE" \
-        >"$result_file" <<'PY_SCHEMA_REPAIR'
-import contextlib
-import fcntl
-import json
-import os
-from pathlib import Path
-import sqlite3
-import stat
-import sys
-import time
-
-STATE_VN_COLUMNS = {
-    "uid", "tenant_id", "virtual_network_cidr", "namespace_name",
-    "namespace_interface", "host_interface", "transit_cidr",
-    "transit_start", "payload",
-}
-STATE_SUBNET_COLUMNS = {
-    "uid", "virtual_network_uid", "tenant_id", "vlan_id",
-    "vlan_interface", "ipv4_cidr", "phase", "payload",
-}
-STATE_POOL_COLUMNS = {
-    "uid", "fulfillment_id", "tenant_id", "ip_family", "ipv4_cidr",
-}
-STATE_EXTERNAL_IP_COLUMNS = {
-    "uid", "fulfillment_id", "tenant_id", "pool_uid", "address",
-}
-CURRENT_TABLES = {"virtual_networks", "subnets", "external_ip_pools", "external_ips"}
-LEGACY_V1_TABLES = (
-    {"virtual_networks"},
-    {"virtual_networks", "subnets"},
-    {"virtual_networks", "subnets", "external_ip_pools"},
-)
-KNOWN_ACCIDENTAL_V2_TABLES = {"virtual_networks", "subnets"}
-
-
-class RepairError(Exception):
-    pass
-
-
-@contextlib.contextmanager
-def database_lock(lock_path):
-    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        lock_fd = os.open(lock_path, flags, 0o600)
-    except OSError as error:
-        raise RepairError(f"could not open AgentlessNet database lock: {error}") from error
-    try:
-        lock_stat = os.fstat(lock_fd)
-        if not stat.S_ISREG(lock_stat.st_mode):
-            raise RepairError("AgentlessNet database lock is not a regular file")
-        if lock_stat.st_uid != os.geteuid() or lock_stat.st_mode & 0o077:
-            raise RepairError("AgentlessNet database lock has unsafe owner or mode")
-        deadline = time.monotonic() + 60
-        while True:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise RepairError("timed out waiting for the AgentlessNet database lock")
-                time.sleep(0.05)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-    finally:
-        os.close(lock_fd)
-
-
-def table_names(connection):
-    return {
-        row[0]
-        for row in connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
-        )
-    }
-
-
-def table_columns(connection, table):
-    return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
-
-
-def validate_known_columns(connection, tables):
-    expected = {
-        "virtual_networks": STATE_VN_COLUMNS,
-        "subnets": STATE_SUBNET_COLUMNS,
-        "external_ip_pools": STATE_POOL_COLUMNS,
-        "external_ips": STATE_EXTERNAL_IP_COLUMNS,
-    }
-    for table in tables:
-        if table_columns(connection, table) != expected[table]:
-            raise RepairError(f"AgentlessNet {table} table has an unsupported V1 layout")
-
-
-def repair_database(database_path):
-    path = Path(database_path)
-    if path.is_symlink():
-        raise RepairError("AgentlessNet state path must not be a symlink")
-    if not path.exists():
-        return {"changed": False, "version": None}
-
-    with database_lock(f"{path}.lock"):
-        try:
-            state_fd = os.open(
-                path,
-                os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
-            )
-        except OSError as error:
-            raise RepairError(f"could not safely open AgentlessNet state: {error}") from error
-
-        try:
-            state_stat = os.fstat(state_fd)
-            if not stat.S_ISREG(state_stat.st_mode):
-                raise RepairError("AgentlessNet state path is not a regular file")
-            if state_stat.st_uid != os.geteuid() or state_stat.st_mode & 0o077:
-                raise RepairError("AgentlessNet state file has unsafe owner or mode")
-
-            database_uri = path.resolve().as_uri() + "?mode=rw"
-            connection = sqlite3.connect(
-                database_uri,
-                uri=True,
-                timeout=60,
-                isolation_level=None,
-            )
-            try:
-                connection.execute("PRAGMA foreign_keys = ON")
-                version = connection.execute("PRAGMA user_version").fetchone()[0]
-                tables = table_names(connection)
-
-                if version == 1:
-                    if tables not in (*LEGACY_V1_TABLES, CURRENT_TABLES):
-                        raise RepairError("AgentlessNet V1 database has an unsupported table set")
-                elif version == 2:
-                    if tables != KNOWN_ACCIDENTAL_V2_TABLES:
-                        raise RepairError("AgentlessNet V2 database is not the known accidental layout")
-                else:
-                    raise RepairError(f"unsupported AgentlessNet schema version: {version}")
-
-                if "virtual_networks" not in tables:
-                    raise RepairError("AgentlessNet state is missing its VirtualNetwork table")
-                validate_known_columns(connection, tables)
-
-                if version == 1 and tables == CURRENT_TABLES:
-                    return {"changed": False, "version": 1}
-
-                connection.execute("BEGIN IMMEDIATE")
-                try:
-                    if "subnets" not in tables:
-                        connection.execute(
-                            """CREATE TABLE subnets (
-                                uid TEXT PRIMARY KEY,
-                                virtual_network_uid TEXT NOT NULL
-                                    REFERENCES virtual_networks(uid),
-                                tenant_id TEXT NOT NULL,
-                                vlan_id INTEGER NOT NULL UNIQUE,
-                                vlan_interface TEXT NOT NULL UNIQUE,
-                                ipv4_cidr TEXT NOT NULL,
-                                phase TEXT NOT NULL,
-                                payload TEXT NOT NULL
-                            )"""
-                        )
-                        connection.execute(
-                            "CREATE INDEX subnets_by_vn ON subnets(virtual_network_uid)"
-                        )
-                    if "external_ip_pools" not in tables:
-                        connection.execute(
-                            """CREATE TABLE external_ip_pools (
-                                uid TEXT NOT NULL PRIMARY KEY,
-                                fulfillment_id TEXT NOT NULL UNIQUE,
-                                tenant_id TEXT NOT NULL,
-                                ip_family TEXT NOT NULL,
-                                ipv4_cidr TEXT NOT NULL
-                            )"""
-                        )
-                    if "external_ips" not in tables:
-                        connection.execute(
-                            """CREATE TABLE external_ips (
-                                uid TEXT NOT NULL PRIMARY KEY,
-                                fulfillment_id TEXT NOT NULL UNIQUE,
-                                tenant_id TEXT NOT NULL,
-                                pool_uid TEXT NOT NULL REFERENCES external_ip_pools(uid),
-                                address TEXT NOT NULL,
-                                UNIQUE (pool_uid, address)
-                            )"""
-                        )
-                    connection.execute("PRAGMA user_version = 1")
-                    if connection.execute("PRAGMA user_version").fetchone()[0] != 1:
-                        raise RepairError("AgentlessNet schema correction did not set version 1")
-                    if table_names(connection) != CURRENT_TABLES:
-                        raise RepairError("AgentlessNet schema correction did not create the V1 table set")
-                    validate_known_columns(connection, CURRENT_TABLES)
-                    connection.commit()
-                except BaseException:
-                    connection.rollback()
-                    raise
-                return {"changed": True, "version": 1}
-            except sqlite3.DatabaseError as error:
-                raise RepairError(f"could not correct AgentlessNet state schema: {error}") from error
-            finally:
-                connection.close()
-        finally:
-            os.close(state_fd)
-
-
-if __name__ == "__main__":
-    try:
-        result = repair_database(sys.argv[1])
-    except (OSError, RepairError) as error:
-        print(f"AgentlessNet schema correction failed: {error}", file=sys.stderr)
-        raise SystemExit(1) from error
-    print(json.dumps(result, sort_keys=True))
-PY_SCHEMA_REPAIR
-    then
-        cat "$result_file" >&2
-        die "Could not normalize the AgentlessNet database to schema V1"
-    fi
-    jq -e '.version == null or .version == 1' "$result_file" >/dev/null \
-        || die "The AgentlessNet schema correction returned an invalid result"
-    if [[ "$(jq -r '.changed' "$result_file")" == true ]]; then
-        info "Corrected the AgentlessNet development database to schema V1."
-    else
-        info "AgentlessNet database is already using schema V1."
-    fi
-}
-
 resolve_mgmt_network() {
     local network_xml network_info
     MGMT_BRIDGE="$(virsh net-info "$MGMT_LIBVIRT_NET" | awk '/^Bridge:/{print $2}')" \
@@ -561,14 +397,20 @@ ensure_aap_ssh_key() {
         || die "AAP networking Secret is missing after OSAC installation"
     key_file="$TEMP_DIR/agentless-net-id_ed25519"
     SSH_PUBLIC_KEY_FILE="$TEMP_DIR/agentless-net-id_ed25519.pub"
+    annotation="$(jq -r --arg key "$AAP_SSH_KEY_SECRET_ANNOTATION" \
+        '.metadata.annotations[$key] // ""' <<<"$secret_json")"
     if jq -e --arg key "$AAP_SSH_KEY_SECRET_KEY" '.data | has($key)' \
         <<<"$secret_json" >/dev/null; then
-        jq -r --arg key "$AAP_SSH_KEY_SECRET_KEY" '.data[$key]' <<<"$secret_json" \
+        SSH_KEY_EXPECTED_BASE64="$(jq -r --arg key "$AAP_SSH_KEY_SECRET_KEY" \
+            '.data[$key]' <<<"$secret_json")"
+        printf '%s' "$SSH_KEY_EXPECTED_BASE64" \
             | base64 -d >"$key_file"
         chmod 0600 "$key_file"
+        if [[ "$annotation" == OSAC-5529 ]]; then
+            SSH_KEY_CREATED_BY_RUN=true
+            SSH_KEY_ORIGINAL_ANNOTATION=""
+        fi
     else
-        annotation="$(jq -r --arg key "$AAP_SSH_KEY_SECRET_ANNOTATION" \
-            '.metadata.annotations[$key] // ""' <<<"$secret_json")"
         [[ -z "$annotation" || "$annotation" == OSAC-5529 ]] \
             || die "Refusing to replace pre-existing AAP SSH-key ownership metadata"
         SSH_KEY_ORIGINAL_ANNOTATION="$annotation"
@@ -662,10 +504,10 @@ PY
 write_cumulus_ssh_config() {
     local provider_key="${SSH_PRIVATE_KEY_FILE:-}"
     local known_hosts_file="${TEMP_DIR}/known_hosts"
-    if [[ "${CUMULUS_SSH_CONFIG_CREATED_BY_RUN:-false}" != true \
-        && ( -e "$CUMULUS_SSH_CONFIG_FILE" || -L "$CUMULUS_SSH_CONFIG_FILE" ) ]]; then
-        die "A previous Cumulus SSH config exists at $CUMULUS_SSH_CONFIG_FILE; inspect and remove it before starting another lab run"
-    fi
+    [[ ! -L "$CUMULUS_SSH_CONFIG_FILE" ]] \
+        || die "Cumulus SSH config path must not be a symlink: $CUMULUS_SSH_CONFIG_FILE"
+    [[ ! -e "$CUMULUS_SSH_CONFIG_FILE" || -f "$CUMULUS_SSH_CONFIG_FILE" ]] \
+        || die "Cumulus SSH config path is not a regular file: $CUMULUS_SSH_CONFIG_FILE"
     mkdir -p -- "$(dirname "$CUMULUS_SSH_CONFIG_FILE")"
     chmod 0700 "$(dirname "$CUMULUS_SSH_CONFIG_FILE")"
     python3 - "$SWITCH_MANIFEST_FILE" "$CONTAINERLAB_PREFIX" \
@@ -741,7 +583,7 @@ print(" ".join(shlex.quote(arg) for arg in args))
 PY
 )" || return 1
     [[ -n "$remote_command" ]] || return 1
-    ssh -F "$CUMULUS_SSH_CONFIG_FILE" "$alias" "$remote_command"
+    ssh -F "$CUMULUS_SSH_CONFIG_FILE" "$alias" "$remote_command" </dev/null
 }
 
 switch_exec() {
@@ -766,6 +608,56 @@ switch_admin_user_exec() {
     local switch="$1"
     shift
     switch_ssh admin false "$switch" "$@"
+}
+
+switch_nvue_diff() {
+    local identity="$1" switch="$2" output="" status=0
+    case "$identity" in
+        admin)
+            if output="$(switch_admin_user_exec "$switch" nv config diff --output commands)"; then
+                status=0
+            else
+                status=$?
+            fi
+            ;;
+        provider)
+            if output="$(switch_exec "$switch" nv config diff --output commands)"; then
+                status=0
+            else
+                status=$?
+            fi
+            ;;
+        *) return 2 ;;
+    esac
+    if [[ -n "$output" ]]; then
+        printf '%s' "$output"
+        return 0
+    fi
+    return "$status"
+}
+
+assert_provider_key_survived() {
+    local context="$1" target_switch="${2:-}" switch key_config found_target=false
+    while IFS= read -r switch; do
+        [[ -n "$switch" ]] || continue
+        [[ -z "$target_switch" || "$switch" == "$target_switch" ]] || continue
+        [[ "$switch" != "$target_switch" ]] || found_target=true
+        info "Provider-key checkpoint after ${context}: inspecting ${switch}."
+        key_config="$(switch_admin_user_exec "$switch" nv show system aaa user cumulus ssh authorized-key --output json)" \
+            || die "Could not inspect the provider NVUE key after ${context} on ${switch}"
+        jq -e --arg id "$PROVIDER_NVUE_KEY_ID" 'has($id)' <<<"$key_config" >/dev/null \
+            || die "Per-run provider NVUE key disappeared after ${context} on ${switch}"
+        switch_provider_user_exec "$switch" sudo -n true \
+            || die "Per-run provider SSH failed after ${context} on ${switch}"
+        info "Provider-key checkpoint after ${context} passed on ${switch}."
+    done < <(jq -r '.switches[].name' "$SWITCH_MANIFEST_FILE")
+    if [[ -n "$target_switch" ]]; then
+        [[ "$found_target" == true ]] \
+            || die "Provider-key checkpoint target ${target_switch} is not in the switch manifest"
+        info "Per-run provider key remains available on ${target_switch} after ${context}."
+    else
+        info "Per-run provider key remains available on all switches after ${context}."
+    fi
 }
 
 ensure_containerlab_net_node() {
@@ -1040,7 +932,7 @@ wait_for_cumulus_guests() {
         switch_admin_user_exec "$switch" sh -c \
             'for port in swp1 swp2 swp3 swp4; do ip link show dev "$port" >/dev/null 2>&1 || exit 1; done' \
             || die "Cumulus guest $switch does not expose swp1 through swp4"
-        pending_diff="$(switch_admin_user_exec "$switch" nv config diff --output commands)" \
+        pending_diff="$(switch_nvue_diff admin "$switch")" \
             || die "Could not inspect the pending NVUE candidate on $switch"
         [[ -z "$pending_diff" ]] \
             || die "Cumulus guest $switch has unapplied NVUE candidate changes before fabric setup"
@@ -1048,13 +940,96 @@ wait_for_cumulus_guests() {
     done < <(jq -r '.switches[].name' "$SWITCH_MANIFEST_FILE")
 }
 
+ensure_containerlab_admin_nvue_key() {
+    local switch="$1" key_type key_data pending_diff key_config
+    read -r key_type key_data _ <"$CUMULUS_ADMIN_PUBLIC_KEY_FILE" \
+        || die "Could not parse the persistent Cumulus administrator public key"
+    case "$key_type" in
+        ssh-ed25519|ssh-rsa|ssh-dss|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521) ;;
+        *) die "Unsupported Cumulus administrator SSH key type: ${key_type:-missing}" ;;
+    esac
+    [[ "$key_data" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] \
+        || die "The persistent Cumulus administrator public key has an invalid payload"
+    pending_diff="$(switch_nvue_diff admin "$switch")" \
+        || die "Could not inspect pending NVUE changes on ${switch} before preserving admin access"
+    [[ -z "$pending_diff" ]] \
+        || die "Switch ${switch} has pending NVUE changes; refusing to apply administrator-key configuration"
+    key_config="$(switch_admin_user_exec "$switch" nv show system aaa user cumulus ssh authorized-key --output json)" \
+        || die "Could not inspect NVUE authorized keys on ${switch}"
+    if jq -e --arg id "$CUMULUS_ADMIN_NVUE_KEY_ID" 'has($id)' \
+        <<<"$key_config" >/dev/null; then
+        jq -e --arg id "$CUMULUS_ADMIN_NVUE_KEY_ID" --arg type "$key_type" \
+            '.[$id].type == $type' <<<"$key_config" >/dev/null \
+            || die "NVUE administrator key ID ${CUMULUS_ADMIN_NVUE_KEY_ID} has a different key type on ${switch}"
+        # NVUE redacts key literals in show output. This command already proves the saved admin identity is accepted.
+        return 0
+    fi
+
+    switch_admin_user_exec "$switch" nv set system aaa user cumulus ssh authorized-key \
+        "$CUMULUS_ADMIN_NVUE_KEY_ID" key "$key_data" \
+        || die "Could not stage the persistent administrator SSH key in NVUE on ${switch}"
+    switch_admin_user_exec "$switch" nv set system aaa user cumulus ssh authorized-key \
+        "$CUMULUS_ADMIN_NVUE_KEY_ID" type "$key_type" \
+        || die "Could not stage the persistent administrator SSH key type in NVUE on ${switch}"
+    switch_admin_user_exec "$switch" nv config apply --assume-yes \
+        || die "Could not apply the persistent administrator SSH key in NVUE on ${switch}"
+
+    key_config="$(switch_admin_user_exec "$switch" nv show system aaa user cumulus ssh authorized-key --output json)" \
+        || die "Could not verify the persistent administrator SSH key on ${switch}"
+    jq -e --arg id "$CUMULUS_ADMIN_NVUE_KEY_ID" --arg type "$key_type" \
+        '.[$id].type == $type' <<<"$key_config" >/dev/null \
+        || die "NVUE did not retain the persistent administrator SSH key on ${switch}"
+    switch_admin_user_exec "$switch" true \
+        || die "The persistent administrator SSH key stopped working on ${switch} after NVUE apply"
+}
+
+install_containerlab_switch_provider_key() {
+    local switch="$1" key_type="$2" key_data="$3" pending_diff key_config
+    info "Installing per-run provider NVUE key on ${switch}."
+    pending_diff="$(switch_nvue_diff admin "$switch")" \
+        || die "Could not inspect pending NVUE changes on ${switch} before adding the provider key"
+    [[ -z "$pending_diff" ]] \
+        || die "Switch ${switch} has pending NVUE changes; refusing to apply provider-key configuration"
+    key_config="$(switch_admin_user_exec "$switch" nv show system aaa user cumulus ssh authorized-key --output json)" \
+        || die "Could not inspect NVUE authorized keys on ${switch}"
+    if jq -e --arg id "$PROVIDER_NVUE_KEY_ID" 'has($id)' <<<"$key_config" >/dev/null; then
+        die "NVUE provider-key ID ${PROVIDER_NVUE_KEY_ID} already exists on ${switch}; preserving it"
+    fi
+
+    # Cumulus manages the cumulus account through NVUE, so direct authorized_keys edits are overwritten by nv config apply.
+    SWITCH_NVUE_KEY_INSTALLED_BY_RUN["$switch"]=true
+    switch_admin_user_exec "$switch" nv set system aaa user cumulus ssh authorized-key \
+        "$PROVIDER_NVUE_KEY_ID" key "$key_data" \
+        || die "Could not stage the provider SSH key in NVUE on ${switch}"
+    switch_admin_user_exec "$switch" nv set system aaa user cumulus ssh authorized-key \
+        "$PROVIDER_NVUE_KEY_ID" type "$key_type" \
+        || die "Could not stage the provider SSH key type in NVUE on ${switch}"
+    switch_admin_user_exec "$switch" nv config apply --assume-yes \
+        || die "Could not apply the provider SSH key in NVUE on ${switch}"
+
+    key_config="$(switch_admin_user_exec "$switch" nv show system aaa user cumulus ssh authorized-key --output json)" \
+        || die "Could not verify the NVUE provider SSH key on ${switch}"
+    jq -e --arg id "$PROVIDER_NVUE_KEY_ID" --arg type "$key_type" \
+        '.[$id].type == $type' <<<"$key_config" >/dev/null \
+        || die "NVUE did not retain the provider SSH key on ${switch}"
+    info "Per-run provider NVUE key installation verified on ${switch}."
+}
+
 prepare_containerlab_switches() {
-    local switch public_key admin_public_key ssh_output user
+    local switch public_key admin_public_key ssh_output user provider_key_type provider_key_data
     [[ -f "$SSH_PUBLIC_KEY_FILE" ]] || die "The temporary AgentlessNet SSH public key is missing"
     public_key="$(<"$SSH_PUBLIC_KEY_FILE")"
     admin_public_key="$(<"$CUMULUS_ADMIN_PUBLIC_KEY_FILE")"
     [[ "$public_key" != "$admin_public_key" ]] \
         || die "The per-run AAP SSH key must differ from the persistent Cumulus administrator key"
+    read -r provider_key_type provider_key_data _ <"$SSH_PUBLIC_KEY_FILE" \
+        || die "Could not parse the per-run provider SSH public key"
+    case "$provider_key_type" in
+        ssh-ed25519|ssh-rsa|ssh-dss|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521) ;;
+        *) die "Unsupported per-run provider SSH key type: ${provider_key_type:-missing}" ;;
+    esac
+    [[ "$provider_key_data" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] \
+        || die "The per-run provider SSH public key has an invalid key payload"
     ensure_containerlab_switches
     write_cumulus_ssh_config
     SWITCH_ACCESS_CONFIGURED=true
@@ -1080,31 +1055,20 @@ prepare_containerlab_switches() {
         fi
         switch_admin_user_exec "$switch" id "$user" >/dev/null 2>&1 \
             || die "Cumulus switch $switch does not have its expected SSH user"
-        if switch_admin_user_exec "$switch" test -f /home/cumulus/.ssh/authorized_keys; then
-            SWITCH_AUTHORIZED_KEYS_EXISTED["$switch"]=true
-        else
-            SWITCH_AUTHORIZED_KEYS_EXISTED["$switch"]=false
-        fi
-        if switch_admin_user_exec "$switch" sh -c \
-            'test -f /home/cumulus/.ssh/authorized_keys && grep -Fxq "$1" /home/cumulus/.ssh/authorized_keys' \
-            sh "$public_key"; then
-            SWITCH_PUBLIC_KEY_INSTALLED_BY_RUN["$switch"]=false
-        else
-            switch_admin_user_exec "$switch" sh -c \
-                'set -eu; install -d -m 0700 /home/cumulus/.ssh; touch /home/cumulus/.ssh/authorized_keys; grep -Fqx -- "$1" /home/cumulus/.ssh/authorized_keys || printf "%s\\n" "$1" >>/home/cumulus/.ssh/authorized_keys; chmod 0600 /home/cumulus/.ssh/authorized_keys' \
-                sh "$public_key"
-            SWITCH_PUBLIC_KEY_INSTALLED_BY_RUN["$switch"]=true
-        fi
+        ensure_containerlab_admin_nvue_key "$switch"
+        install_containerlab_switch_provider_key "$switch" "$provider_key_type" "$provider_key_data"
     done < <(jq -r '.switches[].name' "$SWITCH_MANIFEST_FILE")
     while IFS= read -r switch; do
         [[ -n "$switch" ]] || continue
         ssh_output="$TEMP_DIR/switch-${switch}-ssh-check.log"
+        info "Provider-key SSH checkpoint: testing the per-run identity on ${switch}."
         if ! switch_provider_user_exec "$switch" sh -c \
             'sudo -n true && sudo -n bridge -j vlan show >/dev/null && sudo -n nv show bridge --output json >/dev/null' \
             >"$ssh_output" 2>&1; then
             tail -n 30 "$ssh_output" >&2
             die "Cumulus switch $switch is not reachable through the per-run provider SSH identity"
         fi
+        info "Provider-key SSH checkpoint passed on ${switch}."
     done < <(jq -r '.switches[].name' "$SWITCH_MANIFEST_FILE")
     info "Containerlab Cumulus switches are reachable with the isolated provider SSH key."
 }
@@ -1113,7 +1077,7 @@ configure_containerlab_fabric() {
     local switch pending_diff playbook_log
     while IFS= read -r switch; do
         [[ -n "$switch" ]] || continue
-        if ! pending_diff="$(switch_exec "$switch" nv config diff --output commands)"; then
+        if ! pending_diff="$(switch_nvue_diff provider "$switch")"; then
             die "Could not inspect pending NVUE changes on $switch"
         fi
         [[ -z "$pending_diff" ]] \
@@ -1121,7 +1085,7 @@ configure_containerlab_fabric() {
     done < <(jq -r '.switches[].name' "$SWITCH_MANIFEST_FILE")
 
     playbook_log="$TEMP_DIR/fabric-setup.log"
-    info "Initializing declared Cumulus trunk ports in br_default..."
+    info "Checking declared Cumulus trunks and initializing missing ports in br_default..."
     if ! (
         cd "$AAP_DIR"
         # This is local lab bootstrap; provider-key access is checked above and
@@ -1173,6 +1137,9 @@ for key, env_name in (("bridge", "MGMT_BRIDGE"), ("ipv4-subnet", "MGMT_CIDR"), (
     if env_name not in value and value != expected:
         raise SystemExit("Containerlab management network does not use the existing SNO libvirt network")
 all_group = inventory.get("all", {})
+all_vars = all_group.get("vars", {}) if isinstance(all_group, dict) else {}
+if not isinstance(all_vars, dict):
+    raise SystemExit("local lab all.vars must be a mapping")
 children = all_group.get("children", {}) if isinstance(all_group, dict) else {}
 net_nodes = children.get("net_nodes", {}) if isinstance(children, dict) else {}
 hosts = net_nodes.get("hosts", {}) if isinstance(net_nodes, dict) else {}
@@ -1263,11 +1230,49 @@ for switch_name, switch_vars in switch_hosts.items():
         "ansible_network_os": "cumulus",
         "trunk_ports": trunk_ports,
     }
+provisioning_network = all_vars.get("agentless_net_provisioning_network")
+if not isinstance(provisioning_network, dict):
+    raise SystemExit("local lab inventory must define the AgentlessNet provisioning network")
+provisioning_name = provisioning_network.get("name")
+provisioning_vlan = provisioning_network.get("vlan_id")
+if not isinstance(provisioning_name, str) or not provisioning_name.strip():
+    raise SystemExit("AgentlessNet provisioning network name must be a nonempty string")
+if not isinstance(provisioning_vlan, int) or not 1 <= provisioning_vlan <= 4094:
+    raise SystemExit("AgentlessNet provisioning network VLAN must be between 1 and 4094")
+host_ports = all_vars.get("agentless_net_host_ports")
+if not isinstance(host_ports, dict) or not host_ports:
+    raise SystemExit("local lab inventory must define AgentlessNet BMI host-port mappings")
+claimed_ports = set()
+for host_name, interfaces in host_ports.items():
+    if not isinstance(host_name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,63}", host_name):
+        raise SystemExit("AgentlessNet BMI host mapping contains an invalid host name")
+    if not isinstance(interfaces, dict) or not interfaces:
+        raise SystemExit("AgentlessNet BMI hosts must map at least one logical interface")
+    for interface, mapping in interfaces.items():
+        if not isinstance(interface, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,15}", interface):
+            raise SystemExit("AgentlessNet BMI mapping contains an invalid logical interface")
+        if not isinstance(mapping, dict):
+            raise SystemExit("AgentlessNet BMI interface mapping must be a mapping")
+        switch = mapping.get("switch")
+        port = mapping.get("port")
+        if switch not in switch_inventory_hosts or not isinstance(port, str) or not re.fullmatch(r"swp[0-9]+", port):
+            raise SystemExit("AgentlessNet BMI mapping must reference a known switch and Cumulus swp port")
+        if port in switch_inventory_hosts[switch]["trunk_ports"]:
+            raise SystemExit("AgentlessNet BMI access ports must not overlap declared Subnet trunks")
+        claim = (switch, port)
+        if claim in claimed_ports:
+            raise SystemExit("AgentlessNet BMI switch ports must not be assigned more than once")
+        claimed_ports.add(claim)
 switch_manifest.sort(key=lambda item: item["name"])
 output = {
     "all": {
         "vars": {
             "ansible_ssh_common_args": "-o StrictHostKeyChecking=accept-new",
+            "agentless_net_provisioning_network": {
+                "name": provisioning_name.strip(),
+                "vlan_id": provisioning_vlan,
+            },
+            "agentless_net_host_ports": host_ports,
         },
         "children": {
             "net_nodes": {
@@ -1327,18 +1332,29 @@ if original_inventory is not None and original_inventory.rstrip("\n") != expecte
     try:
         existing_all = existing["all"]
         expected_all = expected["all"]
-        old_net_nodes = existing_all["children"]["net_nodes"]
-        new_net_nodes = expected_all["children"]["net_nodes"]
+        old_children = existing_all["children"]
+        expected_children = expected_all["children"]
+        old_net_nodes = old_children["net_nodes"]
+        new_net_nodes = expected_children["net_nodes"]
+        expected_legacy_vars = {
+            key: value
+            for key, value in expected_all.get("vars", {}).items()
+            if key not in ("agentless_net_provisioning_network", "agentless_net_host_ports")
+        }
         safe_upgrade = (
             set(existing) == {"all"}
-            and existing_all.get("vars", {}) == expected_all.get("vars", {})
-            and set(existing_all["children"]) == {"net_nodes"}
+            and existing_all.get("vars", {}) == expected_legacy_vars
+            and set(old_children) in ({"net_nodes"}, {"net_nodes", "switches"})
             and old_net_nodes == new_net_nodes
+            and (
+                "switches" not in old_children
+                or old_children["switches"] == expected_children["switches"]
+            )
         )
     except (KeyError, TypeError):
         safe_upgrade = False
     if not safe_upgrade:
-        raise SystemExit("existing AgentlessNet inventory is not the known VN-only inventory")
+        raise SystemExit("existing AgentlessNet inventory is not the known legacy inventory")
 
 backup = {
     "original_inventory": original_inventory,
@@ -1365,6 +1381,36 @@ PY
     info "Installed the temporary password-free VN and Cumulus switch inventory."
 }
 
+prepare_aap_ca_bundle() {
+    local ingress_ca_file="${TEMP_DIR}/default-ingress-ca.pem"
+    if ! oc get configmap ca-bundle -n "$OSAC_NAMESPACE" -o json \
+        | jq -er '.data["bundle.pem"] | select(type == "string" and length > 0)' \
+            >"$AAP_API_CA_FILE"; then
+        die "Could not read the OSAC API CA bundle"
+    fi
+    if ! oc get configmap default-ingress-cert -n openshift-config-managed -o json \
+        | jq -er '.data["ca-bundle.crt"] | select(type == "string" and length > 0)' \
+            >"$ingress_ca_file"; then
+        die "Could not read the OpenShift default ingress CA bundle"
+    fi
+    if ! python3 - "$AAP_API_CA_FILE" "$ingress_ca_file" <<'PY'
+import pathlib
+import sys
+
+target, ingress = (pathlib.Path(value) for value in sys.argv[1:])
+osac_bundle = target.read_text().strip()
+ingress_bundle = ingress.read_text().strip()
+if not osac_bundle or not ingress_bundle:
+    raise SystemExit("both CA bundles must be non-empty")
+target.write_text(osac_bundle + "\n" + ingress_bundle + "\n")
+PY
+    then
+        die "Could not combine the OSAC and default ingress CA bundles"
+    fi
+    [[ -s "$AAP_API_CA_FILE" ]] || die "Combined OSAC and ingress CA bundle is empty"
+    chmod 0600 "$AAP_API_CA_FILE"
+}
+
 sync_aap_project_revision() {
     local token route
     route="$(oc get route osac-aap -n "$OSAC_NAMESPACE" -o jsonpath='{.spec.host}')" \
@@ -1375,6 +1421,7 @@ sync_aap_project_revision() {
     [[ -n "$route" && -n "$token" ]] || die "AAP Controller API route or token is unavailable"
     AAP_API_ROUTE="https://$route"
     AAP_API_TOKEN="$token" AAP_API_ROUTE="$AAP_API_ROUTE" \
+        AAP_API_CA_FILE="$AAP_API_CA_FILE" \
         python3 - "$AAP_PROJECT_GIT_URI" "$AAP_PROJECT_GIT_BRANCH" \
         "$AAP_PROJECT_EXPECTED_REVISION" "$AAP_PROJECT_NAME" <<'PY'
 import json
@@ -1388,7 +1435,7 @@ import urllib.request
 base = os.environ["AAP_API_ROUTE"].rstrip("/") + "/api/controller/v2"
 token = os.environ["AAP_API_TOKEN"]
 expected_url, expected_branch, expected_revision, expected_name = sys.argv[1:]
-context = ssl._create_unverified_context()
+context = ssl.create_default_context(cafile=os.environ["AAP_API_CA_FILE"])
 
 def request(url, data=None, method=None):
     headers = {"Authorization": f"Bearer {token}"}
@@ -1464,6 +1511,7 @@ configure_aap_execution_environment() {
     [[ -n "$route" && -n "$token" ]] || die "AAP Controller API route or token is unavailable"
     AAP_API_ROUTE="https://$route"
     AAP_API_TOKEN="$token" AAP_API_ROUTE="$AAP_API_ROUTE" \
+        AAP_API_CA_FILE="$AAP_API_CA_FILE" \
         AAP_EXECUTION_ENVIRONMENT_NAME="$AAP_EXECUTION_ENVIRONMENT_NAME" \
         AAP_IMAGE="$AAP_IMAGE" python3 - <<'PY'
 import json
@@ -1477,7 +1525,7 @@ token = os.environ["AAP_API_TOKEN"]
 expected_name = os.environ["AAP_EXECUTION_ENVIRONMENT_NAME"]
 expected_image = os.environ["AAP_IMAGE"]
 expected_pull = "always"
-context = ssl._create_unverified_context()
+context = ssl.create_default_context(cafile=os.environ["AAP_API_CA_FILE"])
 
 def request(url, data=None, method=None):
     headers = {"Authorization": f"Bearer {token}"}
@@ -1518,6 +1566,179 @@ PY
 
 prepare_aap_networking_instance_group() {
     info "Using the existing network worker Pod configuration and network-fulfillment-ig envFrom for the net-node and switches."
+}
+
+configure_aap_subnet_reader() {
+    [[ "$SUITE_USES_SUBNET_DHCP" == true ]] || return 0
+
+    local token_file="${TEMP_DIR}/aap-subnet-reader.token"
+    local ca_file="${TEMP_DIR}/aap-subnet-reader-ca.pem"
+    local route token result can_list verb can
+    local role_name="$AAP_SUBNET_READER_NAME"
+    AAP_SUBNET_READER_SETUP_ATTEMPTED=true
+
+    oc create serviceaccount "$AAP_SUBNET_READER_NAME" -n "$OSAC_NAMESPACE" \
+        --dry-run=client -o yaml \
+        | oc apply -f - >/dev/null \
+        || { printf 'ERROR: could not ensure the Subnet reader ServiceAccount\n' >&2; return 1; }
+    oc create role "$role_name" -n "$NETWORKING_NAMESPACE" \
+        --verb=get,list --resource=subnets.osac.openshift.io \
+        --dry-run=client -o yaml \
+        | oc apply -f - >/dev/null \
+        || { printf 'ERROR: could not ensure the Subnet reader Role\n' >&2; return 1; }
+    oc create rolebinding "$role_name" -n "$NETWORKING_NAMESPACE" \
+        --role="$role_name" \
+        --serviceaccount="${OSAC_NAMESPACE}:${AAP_SUBNET_READER_NAME}" \
+        --dry-run=client -o yaml \
+        | oc apply -f - >/dev/null \
+        || { printf 'ERROR: could not ensure the Subnet reader RoleBinding\n' >&2; return 1; }
+    oc create role "$AAP_SUBNET_LOCK_NAME" -n "$OSAC_NAMESPACE" \
+        --verb=get,create,update,patch --resource=leases.coordination.k8s.io \
+        --dry-run=client -o yaml \
+        | oc apply -f - >/dev/null \
+        || { printf 'ERROR: could not ensure the Subnet lock Role\n' >&2; return 1; }
+    oc create rolebinding "$AAP_SUBNET_LOCK_NAME" -n "$OSAC_NAMESPACE" \
+        --role="$AAP_SUBNET_LOCK_NAME" \
+        --serviceaccount="${OSAC_NAMESPACE}:${AAP_SUBNET_READER_NAME}" \
+        --dry-run=client -o yaml \
+        | oc apply -f - >/dev/null \
+        || { printf 'ERROR: could not ensure the Subnet lock RoleBinding\n' >&2; return 1; }
+
+    if ! can_list="$(oc auth can-i list subnets.osac.openshift.io \
+        --as="system:serviceaccount:${OSAC_NAMESPACE}:${AAP_SUBNET_READER_NAME}" \
+        -n "$NETWORKING_NAMESPACE")" || [[ "$can_list" != yes ]]; then
+        printf 'ERROR: the temporary AAP ServiceAccount cannot list Subnets in %s\n' \
+            "$NETWORKING_NAMESPACE" >&2
+        return 1
+    fi
+    for verb in get create update patch; do
+        if ! can="$(oc auth can-i "$verb" leases.coordination.k8s.io \
+            --as="system:serviceaccount:${OSAC_NAMESPACE}:${AAP_SUBNET_READER_NAME}" \
+            -n "$OSAC_NAMESPACE")" || [[ "$can" != yes ]]; then
+            printf 'ERROR: the temporary AAP ServiceAccount cannot %s V-Net lock Leases\n' \
+                "$verb" >&2
+            return 1
+        fi
+    done
+
+    if ! oc create token "$AAP_SUBNET_READER_NAME" -n "$OSAC_NAMESPACE" \
+        --duration=24h >"$token_file"; then
+        printf 'ERROR: could not mint the temporary AAP Subnet reader token\n' >&2
+        return 1
+    fi
+    chmod 0600 "$token_file"
+    if ! oc get configmap kube-root-ca.crt -n "$NETWORKING_NAMESPACE" -o json \
+        | jq -er '.data["ca.crt"] | select(type == "string" and length > 0)' >"$ca_file"; then
+        rm -f -- "$token_file"
+        printf 'ERROR: could not read the Kubernetes API CA bundle\n' >&2
+        return 1
+    fi
+    chmod 0600 "$ca_file"
+
+    route="$(oc get route osac-aap -n "$OSAC_NAMESPACE" -o jsonpath='{.spec.host}')" \
+        || { rm -f -- "$token_file" "$ca_file"; printf 'ERROR: could not read the AAP Controller route\n' >&2; return 1; }
+    token="$(oc exec deployment/osac-operator -n "$OSAC_NAMESPACE" -- \
+        sh -c 'printf %s "$OSAC_AAP_TOKEN"' 2>/dev/null)" \
+        || { rm -f -- "$token_file" "$ca_file"; printf 'ERROR: could not obtain the AAP API token\n' >&2; return 1; }
+    if [[ -z "$route" || -z "$token" ]]; then
+        unset token
+        rm -f -- "$token_file" "$ca_file"
+        printf 'ERROR: AAP Controller route or API token is unavailable\n' >&2
+        return 1
+    fi
+    if ! result="$(AAP_API_ROUTE="https://${route}" AAP_API_TOKEN="$token" \
+        AAP_API_CA_FILE="$AAP_API_CA_FILE" \
+        python3 "$AAP_JOBS_HELPER" configure-k8s-credential \
+            --job-template "${AAP_PREFIX}-move-network-attachment" \
+            --credential-name "$AAP_SUBNET_READER_CREDENTIAL" \
+            --credential-type-name "$AAP_SUBNET_READER_CREDENTIAL_TYPE" \
+            --api-host https://kubernetes.default.svc \
+            --token-file "$token_file" --ca-file "$ca_file")"; then
+        unset token
+        rm -f -- "$token_file" "$ca_file"
+        printf 'ERROR: could not attach the temporary Subnet and lock credential to the AAP move job\n' >&2
+        return 1
+    fi
+    unset token
+    rm -f -- "$token_file" "$ca_file"
+    jq -e '.credential_id and .credential_type_id and .template_id' <<<"$result" >/dev/null \
+        || { printf 'ERROR: AAP did not confirm the Subnet credential association\n' >&2; return 1; }
+    info "Configured temporary Subnet and V-Net lock credentials for osac-move-network-attachment."
+}
+
+cleanup_aap_subnet_reader() {
+    [[ "$AAP_SUBNET_READER_SETUP_ATTEMPTED" == true ]] || return 0
+
+    local route token
+    route="$(oc get route osac-aap -n "$OSAC_NAMESPACE" -o jsonpath='{.spec.host}')" \
+        || { printf 'ERROR: could not read the AAP route while removing the Subnet credential\n' >&2; return 1; }
+    token="$(oc exec deployment/osac-operator -n "$OSAC_NAMESPACE" -- \
+        sh -c 'printf %s "$OSAC_AAP_TOKEN"' 2>/dev/null)" \
+        || { printf 'ERROR: could not obtain the AAP API token for credential cleanup\n' >&2; return 1; }
+    if [[ -z "$route" || -z "$token" ]]; then
+        unset token
+        printf 'ERROR: AAP Controller route or API token is unavailable for credential cleanup\n' >&2
+        return 1
+    fi
+    if ! AAP_API_ROUTE="https://${route}" AAP_API_TOKEN="$token" \
+        AAP_API_CA_FILE="$AAP_API_CA_FILE" \
+        python3 "$AAP_JOBS_HELPER" cleanup-k8s-credential \
+            --job-template "${AAP_PREFIX}-move-network-attachment" \
+            --credential-name "$AAP_SUBNET_READER_CREDENTIAL" \
+            --credential-type-name "$AAP_SUBNET_READER_CREDENTIAL_TYPE"; then
+        unset token
+        printf 'ERROR: could not detach and remove the temporary AAP Subnet credential\n' >&2
+        return 1
+    fi
+    unset token
+
+    if ! oc delete rolebinding "$AAP_SUBNET_READER_NAME" -n "$NETWORKING_NAMESPACE" \
+        --ignore-not-found=true --wait=true >/dev/null \
+        || ! oc delete rolebinding "$AAP_SUBNET_LOCK_NAME" -n "$OSAC_NAMESPACE" \
+            --ignore-not-found=true --wait=true >/dev/null \
+        || ! oc delete role "$AAP_SUBNET_READER_NAME" -n "$NETWORKING_NAMESPACE" \
+            --ignore-not-found=true --wait=true >/dev/null \
+        || ! oc delete role "$AAP_SUBNET_LOCK_NAME" -n "$OSAC_NAMESPACE" \
+            --ignore-not-found=true --wait=true >/dev/null \
+        || ! oc delete serviceaccount "$AAP_SUBNET_READER_NAME" -n "$OSAC_NAMESPACE" \
+            --ignore-not-found=true --wait=true >/dev/null; then
+        printf 'ERROR: could not remove the temporary Subnet and lock RBAC resources\n' >&2
+        return 1
+    fi
+    AAP_SUBNET_READER_SETUP_ATTEMPTED=false
+    info "Removed the temporary AAP credential and Subnet/lock ServiceAccount roles."
+}
+
+wait_for_existing_provider_deletions() {
+    local deadline=$((SECONDS + 600)) current pending last_pending=""
+    while ((SECONDS < deadline)); do
+        if ! current="$(oc get externalippools,subnets,virtualnetworks \
+            -n "$NETWORKING_NAMESPACE" -o json)"; then
+            PREEXISTING_PROVIDER_CLEANUP_PENDING=true
+            printf 'ERROR: could not inspect existing AgentlessNet provider deletions\n' >&2
+            return 1
+        fi
+        if ! pending="$(jq -ce '[.items[]? | select(.metadata.deletionTimestamp != null)
+            | {kind:.kind,name:.metadata.name,finalizers:(.metadata.finalizers // [])}]
+            | sort_by(.kind,.name)' <<<"$current")"; then
+            PREEXISTING_PROVIDER_CLEANUP_PENDING=true
+            printf 'ERROR: could not parse existing AgentlessNet provider deletions\n' >&2
+            return 1
+        fi
+        if [[ "$pending" == '[]' ]]; then
+            PREEXISTING_PROVIDER_CLEANUP_PENDING=false
+            return 0
+        fi
+        PREEXISTING_PROVIDER_CLEANUP_PENDING=true
+        if [[ "$pending" != "$last_pending" ]]; then
+            info "Waiting for existing AgentlessNet provider cleanup: ${pending}"
+            last_pending="$pending"
+        fi
+        sleep 5
+    done
+    printf 'ERROR: existing AgentlessNet provider resources remain in deletion: %s\n' \
+        "$pending" >&2
+    return 1
 }
 
 restore_provider_inventory_config() {
@@ -1602,30 +1823,62 @@ restore_containerlab_netnode_access() {
 }
 
 remove_containerlab_switch_keys() {
-    local switch public_key keep_empty
-    [[ "$SWITCH_ACCESS_CONFIGURED" == true && -f "$SSH_PUBLIC_KEY_FILE" ]] || return 0
-    public_key="$(<"$SSH_PUBLIC_KEY_FILE")"
+    local switch pending_diff key_config active_key
+    [[ "$SWITCH_ACCESS_CONFIGURED" == true ]] || return 0
     while IFS= read -r switch; do
         [[ -n "$switch" ]] || continue
-        [[ "${SWITCH_PUBLIC_KEY_INSTALLED_BY_RUN[$switch]:-false}" == true ]] || continue
-        keep_empty="${SWITCH_AUTHORIZED_KEYS_EXISTED[$switch]:-false}"
-        switch_admin_exec "$switch" sh -c '
-            set -eu
-            public_key=$1
-            keep_empty=$2
-            authorized=/home/cumulus/.ssh/authorized_keys
-            [ -f "$authorized" ] || exit 0
-            temporary=/home/cumulus/.ssh/authorized_keys.osac-5530
-            awk -v key="$public_key" "\$0 != key" "$authorized" >"$temporary"
-            if [ -s "$temporary" ] || [ "$keep_empty" = true ]; then
-                chown cumulus:cumulus "$temporary"
-                chmod 0600 "$temporary"
-                mv "$temporary" "$authorized"
-            else
-                rm -f "$temporary" "$authorized"
+        [[ "${SWITCH_NVUE_KEY_INSTALLED_BY_RUN[$switch]:-false}" == true ]] || continue
+        pending_diff="$(switch_nvue_diff admin "$switch")" || {
+            printf 'ERROR: could not inspect NVUE changes before provider-key cleanup on %s\n' "$switch" >&2
+            return 1
+        }
+        if [[ -n "$pending_diff" ]] && grep -Fv -- "$PROVIDER_NVUE_KEY_ID" <<<"$pending_diff" | grep -q .; then
+            printf 'ERROR: unrelated NVUE candidate changes exist on %s; preserving them and the provider key\n' "$switch" >&2
+            return 1
+        fi
+        key_config="$(switch_admin_user_exec "$switch" nv show system aaa user cumulus ssh authorized-key --output json)" || {
+            printf 'ERROR: could not inspect NVUE authorized keys before provider-key cleanup on %s\n' "$switch" >&2
+            return 1
+        }
+        active_key=false
+        if jq -e --arg id "$PROVIDER_NVUE_KEY_ID" 'has($id)' <<<"$key_config" >/dev/null; then
+            active_key=true
+        fi
+        if [[ "$active_key" == true ]] || grep -Fq -- "$PROVIDER_NVUE_KEY_ID" <<<"$pending_diff"; then
+            switch_admin_user_exec "$switch" nv unset system aaa user cumulus ssh authorized-key \
+                "$PROVIDER_NVUE_KEY_ID" || {
+                printf 'ERROR: could not stage removal of the per-run NVUE key on %s\n' "$switch" >&2
+                return 1
+            }
+            pending_diff="$(switch_nvue_diff admin "$switch")" || {
+                printf 'ERROR: could not inspect NVUE provider-key removal on %s\n' "$switch" >&2
+                return 1
+            }
+            if [[ -n "$pending_diff" ]] && grep -Fv -- "$PROVIDER_NVUE_KEY_ID" <<<"$pending_diff" | grep -q .; then
+                printf 'ERROR: unrelated NVUE candidate changes appeared on %s; preserving them\n' "$switch" >&2
+                return 1
             fi
-        ' sh "$public_key" "$keep_empty" || return 1
-        SWITCH_PUBLIC_KEY_INSTALLED_BY_RUN["$switch"]=false
+            if [[ -n "$pending_diff" ]]; then
+                switch_admin_user_exec "$switch" nv config apply --assume-yes || {
+                    printf 'ERROR: could not apply provider-key removal on %s\n' "$switch" >&2
+                    return 1
+                }
+            fi
+        fi
+        key_config="$(switch_admin_user_exec "$switch" nv show system aaa user cumulus ssh authorized-key --output json)" || {
+            printf 'ERROR: could not verify NVUE provider-key cleanup on %s\n' "$switch" >&2
+            return 1
+        }
+        if jq -e --arg id "$PROVIDER_NVUE_KEY_ID" 'has($id)' <<<"$key_config" >/dev/null; then
+            printf 'ERROR: per-run NVUE provider key remains configured on %s\n' "$switch" >&2
+            return 1
+        fi
+        pending_diff="$(switch_nvue_diff admin "$switch")" || return 1
+        [[ -z "$pending_diff" ]] || {
+            printf 'ERROR: NVUE candidate changes remain after provider-key cleanup on %s\n' "$switch" >&2
+            return 1
+        }
+        SWITCH_NVUE_KEY_INSTALLED_BY_RUN["$switch"]=false
     done < <(jq -r '.switches[].name' "$SWITCH_MANIFEST_FILE")
 }
 
@@ -1981,6 +2234,85 @@ external_ip_pool_rpc() (
     return 1
 )
 
+external_ip_pool_list_items() {
+    jq -ce '
+        if . == {} then []
+        elif (.items | type) == "array" then .items
+        else error("items is not an array")
+        end' "$1"
+}
+
+resolve_external_ip_pool_cidr() {
+    [[ "$EXTERNAL_IP_POOL_CIDR_RESOLVED" == false ]] || return 0
+
+    local request_file="${TEMP_DIR}/external-ip-pool-cidr-list.request.json"
+    local response_file="${TEMP_DIR}/external-ip-pool-cidr-list.response.json"
+    local error_file="${TEMP_DIR}/external-ip-pool-cidr-list.error.json"
+    local pool_items pool_cidrs selected_cidr
+    jq -n '{filter:"this.metadata.tenant == \"shared\""}' >"$request_file" \
+        || die "Could not write shared ExternalIPPool CIDR lookup request"
+    if ! external_ip_pool_rpc List "$request_file" "$response_file" "$error_file"; then
+        cat "$error_file" >&2
+        die "Could not inspect shared ExternalIPPool CIDRs before the E2E run"
+    fi
+    pool_items="$(external_ip_pool_list_items "$response_file")" \
+        || die "Private Fulfillment List returned an invalid ExternalIPPool response"
+    pool_cidrs="$(jq -ce '[.[] | {name:(.metadata.name // "unknown"),cidrs:.spec.cidrs}]' \
+        <<<"$pool_items")" \
+        || die "Could not read CIDRs from existing shared ExternalIPPools"
+    if ! selected_cidr="$(EXTERNAL_POOL_LIST_JSON="$pool_cidrs" \
+        python3 - "$EXTERNAL_IP_POOL_CIDR_EXPLICIT" "$EXTERNAL_IP_POOL_CIDR" <<'PY'
+import ipaddress
+import json
+import os
+import sys
+
+explicit, requested = sys.argv[1:]
+pools = json.loads(os.environ["EXTERNAL_POOL_LIST_JSON"])
+existing = []
+for pool in pools:
+    cidrs = pool.get("cidrs")
+    if not isinstance(cidrs, list):
+        raise SystemExit(f"shared ExternalIPPool {pool.get('name', 'unknown')} has no CIDR list")
+    for value in cidrs:
+        try:
+            network = ipaddress.ip_network(value, strict=True)
+        except (TypeError, ValueError) as error:
+            raise SystemExit(f"shared ExternalIPPool has invalid CIDR {value!r}") from error
+        existing.append((pool.get("name", "unknown"), network))
+
+if explicit == "true":
+    try:
+        candidate = ipaddress.ip_network(requested, strict=True)
+    except ValueError as error:
+        raise SystemExit(f"EXTERNAL_IP_POOL_CIDR must be a canonical CIDR: {error}") from error
+    if not isinstance(candidate, ipaddress.IPv4Network) or str(candidate) != requested:
+        raise SystemExit("EXTERNAL_IP_POOL_CIDR must be a canonical IPv4 CIDR")
+    conflict = next(((name, network) for name, network in existing if candidate.overlaps(network)), None)
+    if conflict:
+        raise SystemExit(
+            f"EXTERNAL_IP_POOL_CIDR {candidate} overlaps existing shared pool "
+            f"{conflict[0]} CIDR {conflict[1]}"
+        )
+else:
+    candidate = None
+    for option in ipaddress.ip_network("198.18.0.0/15").subnets(new_prefix=24):
+        if not any(option.overlaps(network) for _, network in existing):
+            candidate = option
+            break
+    if candidate is None:
+        raise SystemExit("No free /24 test CIDR remains in 198.18.0.0/15; set EXTERNAL_IP_POOL_CIDR")
+
+print(candidate)
+PY
+    )"; then
+        return 1
+    fi
+    EXTERNAL_IP_POOL_CIDR="$selected_cidr"
+    EXTERNAL_IP_POOL_CIDR_RESOLVED=true
+    info "Selected non-overlapping ExternalIPPool test CIDR ${EXTERNAL_IP_POOL_CIDR}."
+}
+
 external_ip_pool_rpc_error_is_not_found() {
     local response_file
     for response_file in "$@"; do
@@ -2144,7 +2476,10 @@ wait_for_subnet_aap_provision_success() {
             '[.status.provisioningJobs[]? | select(.jobID == $id) | .state] | last // ""' \
             <<<"$cr_json")"
         case "$job_state" in
-            Succeeded) return 0 ;;
+            Succeeded)
+                assert_provider_key_survived "AAP Subnet job ${job_id}"
+                return 0
+                ;;
             Failed|Canceled)
                 die "AAP provision job ${job_id} ended in ${job_state} for test Subnet ${id}"
                 ;;
@@ -2353,7 +2688,10 @@ wait_for_aap_provision_success() {
             '[.status.provisioningJobs[]? | select(.jobID == $id) | .state] | last // ""' \
             <<<"$cr_json")"
         case "$job_state" in
-            Succeeded) return 0 ;;
+            Succeeded)
+                assert_provider_key_survived "AAP VirtualNetwork job ${job_id}"
+                return 0
+                ;;
             Failed|Canceled)
                 die "AAP provision job ${job_id} ended in ${job_state} for test resource ${fulfillment_id}"
                 ;;
@@ -2470,6 +2808,7 @@ external_ip_aap_job_artifacts() (
         || return 1
     [[ -n "$route" && -n "$token" ]] || return 1
     AAP_API_ROUTE="https://$route" AAP_API_TOKEN="$token" \
+        AAP_API_CA_FILE="$AAP_API_CA_FILE" \
         python3 - "$job_id" <<'PY'
 import json
 import os
@@ -2479,12 +2818,13 @@ import urllib.request
 
 base = os.environ["AAP_API_ROUTE"].rstrip("/") + "/api/controller/v2"
 token = os.environ["AAP_API_TOKEN"]
+context = ssl.create_default_context(cafile=os.environ["AAP_API_CA_FILE"])
 job_id = sys.argv[1]
 request = urllib.request.Request(
     f"{base}/jobs/{job_id}/",
     headers={"Authorization": f"Bearer {token}"},
 )
-with urllib.request.urlopen(request, context=ssl._create_unverified_context(), timeout=20) as response:
+with urllib.request.urlopen(request, context=context, timeout=20) as response:
     job = json.load(response)
 if job.get("status") != "successful":
     raise SystemExit(f"AAP job {job_id} is not successful")
@@ -2912,8 +3252,7 @@ cleanup_created_external_ip_pool() {
             printf 'Could not recover the ExternalIPPool ID for cleanup\n' >&2
             return 1
         fi
-        if ! list_json="$(jq -ce '.items | if type == "array" then . else error("items is not an array") end' \
-            "$list_response")"; then
+        if ! list_json="$(external_ip_pool_list_items "$list_response")"; then
             printf 'Private Fulfillment List returned an invalid ExternalIPPool response\n' >&2
             return 1
         fi
@@ -3077,7 +3416,7 @@ cleanup_created_virtual_networks() {
     if [[ "$GENERATED_CLI_BIN" == true && -n "$CLI_BIN" ]]; then
         rm -f -- "$CLI_BIN"
     fi
-    if [[ -n "$CLI_CA_FILE" ]]; then
+    if [[ -n "$CLI_CA_FILE" && "$AAP_SUBNET_READER_SETUP_ATTEMPTED" != true ]]; then
         rm -f -- "$CLI_CA_FILE"
     fi
     if [[ -n "$TEMP_DIR" && "$RUN_DIR_CREATED" != true ]]; then
@@ -3130,7 +3469,7 @@ write_run_evidence() {
             bridge_state="unavailable"
             if [[ -f "$CUMULUS_SSH_CONFIG_FILE" ]]; then
                 guest_version="$(switch_admin_user_exec "$switch" sh -c '. /etc/os-release; printf "%s" "$VERSION_ID"' 2>/dev/null || printf 'unavailable')"
-                candidate_diff="$(switch_admin_user_exec "$switch" nv config diff --output commands 2>/dev/null || printf 'unavailable')"
+                candidate_diff="$(switch_nvue_diff admin "$switch" 2>/dev/null || printf 'unavailable')"
                 bridge_state="$(switch_admin_user_exec "$switch" /usr/sbin/bridge -j vlan show 2>/dev/null || printf 'unavailable')"
             fi
             jq -nc --arg name "$switch" --arg container "$container_state" \
@@ -3214,13 +3553,19 @@ on_exit() {
         cleanup_status=1
     fi
     if [[ "$SUITE_USES_SUBNET_DHCP" == true ]] \
-        && declare -F cleanup_dhcp_clients_and_ports >/dev/null; then
-        if ! cleanup_dhcp_clients_and_ports; then
-            printf 'ERROR: DHCP client or access-port cleanup is incomplete\n' >&2
+        && declare -F cleanup_dhcp_clients_and_attachments >/dev/null; then
+        if ! cleanup_dhcp_clients_and_attachments; then
+            printf 'ERROR: simulated BMI, DHCP client, or client-link cleanup is incomplete\n' >&2
             cleanup_status=1
             provider_cleanup_allowed=false
             PRESERVE_E2E_RECOVERY_ARTIFACTS=true
         fi
+    fi
+    if [[ "$PREEXISTING_PROVIDER_CLEANUP_PENDING" == true ]]; then
+        printf 'ERROR: preserving AAP inventory and provider access while existing provider deletions remain pending\n' >&2
+        cleanup_status=1
+        provider_cleanup_allowed=false
+        PRESERVE_E2E_RECOVERY_ARTIFACTS=true
     fi
     if [[ "$provider_cleanup_allowed" == true ]]; then
         cleanup_created_virtual_networks "$status"
@@ -3228,7 +3573,16 @@ on_exit() {
             cleanup_status=1
         fi
     else
-        printf 'ERROR: preserving test ExternalIPs, ExternalIPPool, Subnets, VirtualNetworks, AAP inventory, and provider access for recovery because client-link cleanup failed\n' >&2
+        printf 'ERROR: preserving test resources, AAP inventory, and provider access because provider cleanup is incomplete\n' >&2
+    fi
+    if [[ "$AAP_SUBNET_READER_SETUP_ATTEMPTED" == true ]]; then
+        if [[ "$provider_cleanup_allowed" != true || "$PRESERVE_E2E_RECOVERY_ARTIFACTS" == true ]]; then
+            printf 'ERROR: preserving the AAP Subnet credential until provider cleanup completes\n' >&2
+        elif ! cleanup_aap_subnet_reader; then
+            printf 'ERROR: AAP Subnet credential cleanup is incomplete; preserving recovery state\n' >&2
+            cleanup_status=1
+            PRESERVE_E2E_RECOVERY_ARTIFACTS=true
+        fi
     fi
     if [[ "$status" == 0 && "$cleanup_status" != 0 ]]; then
         status=1
@@ -3259,7 +3613,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-for tool in cluster-tool virsh oc helm go jq python3 awk sed grep sort cut sleep make ssh-keygen base64 grpcurl docker sudo ssh uv stat; do
+for tool in cluster-tool virsh oc helm go jq python3 awk sed grep sort cut sleep make ssh-keygen base64 grpcurl docker sudo ssh uv stat tr; do
     require_cmd "$tool"
 done
 require_cmd "$CONTAINER_TOOL"
@@ -3267,6 +3621,7 @@ require_cmd "$CONTAINERLAB"
 [[ -f "$CONTAINERLAB_TOPOLOGY" ]] || die "Containerlab topology is missing: $CONTAINERLAB_TOPOLOGY"
 [[ -f "$CONTAINERLAB_INVENTORY" ]] || die "Containerlab inventory is missing: $CONTAINERLAB_INVENTORY"
 [[ -f "$CONTAINERLAB_CONFIGURE_PLAYBOOK" ]] || die "Containerlab trunk playbook is missing: $CONTAINERLAB_CONFIGURE_PLAYBOOK"
+[[ -f "$AAP_JOBS_HELPER" ]] || die "AAP job helper is missing: $AAP_JOBS_HELPER"
 if [[ "$SUITE_USES_SUBNET_DHCP" == true && "$VLAN_E2E_DEBUG" == true ]]; then
     require_cmd tcpdump
     require_cmd nsenter
@@ -3319,8 +3674,19 @@ fi
     || die "AAP_PROJECT_GIT_URI must be an HTTPS Git URL"
 [[ "$AAP_PROJECT_GIT_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] \
     || die "AAP_PROJECT_GIT_BRANCH contains unsupported characters"
+[[ "$AAP_PROJECT_GIT_BRANCH" == "$RUNTIME_SOURCE_BRANCH" ]] \
+    || die "AAP_PROJECT_GIT_BRANCH must match the selected source branch ${RUNTIME_SOURCE_BRANCH}"
 [[ "$AAP_PROJECT_EXPECTED_REVISION" =~ ^[0-9a-f]{40}$ ]] \
     || die "AAP_PROJECT_EXPECTED_REVISION must be a full lowercase Git commit SHA"
+[[ "$AAP_PROJECT_EXPECTED_REVISION" == "$RUNTIME_SOURCE_COMMIT" ]] \
+    || die "AAP_PROJECT_EXPECTED_REVISION must match selected source commit ${RUNTIME_SOURCE_COMMIT}"
+for runtime_image in "$AAP_IMAGE" "$OPERATOR_IMAGE" "$FULFILLMENT_IMAGE"; do
+    [[ "${runtime_image##*:}" == *-"$IMAGE_SOURCE_SHORT" ]] \
+        || die "Runtime image tag must end in the selected source revision ${IMAGE_SOURCE_SHORT}: ${runtime_image}"
+done
+[[ "$AAP_JOB_TIMEOUT" =~ ^[0-9]+$ ]] \
+    && ((10#$AAP_JOB_TIMEOUT >= 60 && 10#$AAP_JOB_TIMEOUT <= 7200)) \
+    || die "AAP_JOB_TIMEOUT must be between 60 and 7200 seconds"
 [[ "$AGENTLESS_NET_STATE_FILE" =~ ^/[A-Za-z0-9_./-]+$ ]] \
     || die "AGENTLESS_NET_STATE_FILE must be an absolute path with safe path characters"
 [[ "$OSAC_NAMESPACE" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
@@ -3344,6 +3710,8 @@ if [[ "$VLAN_E2E_SUITE" == full ]]; then
         || die "PEER_VIRTUAL_NETWORK_NAME must be a DNS label"
 fi
 if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
+    [[ "$AAP_PREFIX" == osac && "$AAP_PROJECT_NAME" == osac ]] \
+        || die "BMaaS attachment E2E requires the osac AAP project and job-template prefix"
     [[ "$SUBNET_ONE_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
         || die "SUBNET_ONE_NAME must be a DNS label"
     [[ "$SUBNET_TWO_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] \
@@ -3417,16 +3785,31 @@ if [[ "$SUITE_USES_CLI" == true ]]; then
     fi
 fi
 
-# Phase 1: boot or reuse the SNO with cluster-tool.
-step "STEP 1 OF 4: Deploying or reusing the SNO cluster"
+# Step 1: deploy or reuse the SNO with cluster-tool.
+step "STEP 1 OF 5: Deploying or reusing the SNO cluster"
 if ! cluster-tool servers 2>/dev/null | awk 'NR > 2 && $1 == "local" { found = 1 } END { exit !found }'; then
     die "cluster-tool is not configured for the local development host"
 fi
 
-if VM_STATE="$(virsh domstate "$MGMT_VM_NAME" 2>/dev/null)" && [[ "$VM_STATE" == running ]]; then
-    info "Reusing the running SNO VM ${MGMT_VM_NAME}"
+if VM_STATE="$(virsh domstate "$MGMT_VM_NAME" 2>/dev/null)"; then
+    case "$VM_STATE" in
+        running)
+            info "Reusing the running SNO VM ${MGMT_VM_NAME}"
+            ;;
+        paused)
+            info "Resuming the paused SNO VM ${MGMT_VM_NAME}"
+            virsh resume "$MGMT_VM_NAME" >/dev/null \
+                || die "Could not resume the paused SNO VM ${MGMT_VM_NAME}"
+            ;;
+        "shut off")
+            info "Starting the existing SNO VM ${MGMT_VM_NAME}"
+            virsh start "$MGMT_VM_NAME" >/dev/null \
+                || die "Could not start the existing SNO VM ${MGMT_VM_NAME}"
+            ;;
+        *) die "SNO VM ${MGMT_VM_NAME} is in unsupported state ${VM_STATE}" ;;
+    esac
 elif virsh dominfo "$MGMT_VM_NAME" >/dev/null 2>&1; then
-    die "SNO VM ${MGMT_VM_NAME} exists but is not running; start it through cluster-tool before continuing"
+    die "SNO VM ${MGMT_VM_NAME} exists but its state could not be read"
 else
     [[ -f "$PULL_SECRET" ]] || die "Pull secret not found: ${PULL_SECRET}"
     FLAVORS="$(cluster-tool flavors 2>/dev/null || true)"
@@ -3450,9 +3833,9 @@ done
 [[ "$api_ready" == true ]] || die "OpenShift API did not become available"
 oc wait nodes --all --for=condition=Ready --timeout=20m >/dev/null
 
-# Phase 2: reuse source-matched images, or build and push them if missing.
+# Step 2: prepare source-matched images and deploy or reuse OSAC.
 # ExternalIP capacity behavior and migration 125 ship in the Fulfillment image.
-step "STEP 2 OF 4: Preparing custom AAP, operator, and Fulfillment images"
+step "STEP 2 OF 5: Deploying OSAC with source-pinned images"
 REUSE_IMAGES=false
 if [[ "$REUSE_PREBUILT_OSAC_IMAGES" == true ]]; then
     REUSE_IMAGES=true
@@ -3520,24 +3903,41 @@ else
         "IMG=${FULFILLMENT_IMAGE}" "CONTAINER_TOOL=${CONTAINER_TOOL}"
 fi
 
-# Phase 3: install or upgrade OSAC with the custom AAP and operator images.
-step "STEP 3 OF 4: Deploying OSAC with the custom images"
+# Phase 2 continues with the idempotent OSAC install or upgrade.
 OVERLAY_FILE="${INSTALLER_DIR}/values/agentless-net-stub.yaml"
 [[ -f "$OVERLAY_FILE" ]] || die "AgentlessNet VirtualNetwork/Subnet overlay is missing: ${OVERLAY_FILE}"
 CLUSTER_DOMAIN="$(oc get ingresses.config/cluster -o jsonpath='{.spec.domain}')"
 [[ -n "$CLUSTER_DOMAIN" ]] || die "Could not read the OpenShift cluster domain"
 OIDC_ISSUER_URL="https://keycloak-keycloak.${CLUSTER_DOMAIN}/realms/osac"
-info "Refreshing local umbrella-chart dependencies from this checkout..."
-helm dependency build "${INSTALLER_DIR}/charts/osac"
 # This smoke invokes the networking AAP jobs directly; catalog template
 # publication is unrelated and its hook needs a Kubernetes token mount.
 EXTRA_HELM_ARGS="-f ${OVERLAY_FILE} --set-string aap.configAsCode.eeImage=${AAP_IMAGE} --set-string aap.configAsCode.projectGitUri=${AAP_PROJECT_GIT_URI} --set-string aap.configAsCode.projectGitBranch=${AAP_PROJECT_GIT_BRANCH} --set-string operator.image.repository=${OPERATOR_IMAGE_REPOSITORY} --set-string operator.image.tag=${OPERATOR_IMAGE_TAG} --set-string service.images.service.repository=${FULFILLMENT_IMAGE_REPOSITORY} --set-string service.images.service.tag=${FULFILLMENT_IMAGE_TAG} --set aap.instanceGroups.publishTemplates.enabled=false"
 EXISTING_OSAC_RELEASE="$(helm list -n "$OSAC_NAMESPACE" --filter '^osac$' --short)"
 PREVIOUS_DEPLOYMENT_SETTINGS="{}"
+EXPECTED_DEPLOYMENT_SETTINGS="$(jq -ncS \
+    --arg ee "$AAP_IMAGE" \
+    --arg project_uri "$AAP_PROJECT_GIT_URI" \
+    --arg project_branch "$AAP_PROJECT_GIT_BRANCH" \
+    --arg operator_repository "$OPERATOR_IMAGE_REPOSITORY" \
+    --arg operator_tag "$OPERATOR_IMAGE_TAG" \
+    --arg fulfillment_repository "$FULFILLMENT_IMAGE_REPOSITORY" \
+    --arg fulfillment_tag "$FULFILLMENT_IMAGE_TAG" \
+    '{aap:{eeImage:$ee,projectGitUri:$project_uri,projectGitBranch:$project_branch},
+      operator:{image:{repository:$operator_repository,tag:$operator_tag}},
+      fulfillment:{image:{repository:$fulfillment_repository,tag:$fulfillment_tag}},
+      networking:{fabricManager:"agentless_net",k8sManager:"",
+        networkClassTitle:"AgentlessNet VirtualNetwork and Subnet baseline"}}')"
+OSAC_DEPLOYMENT_NEEDED=true
 if [[ -n "$EXISTING_OSAC_RELEASE" ]]; then
     PREVIOUS_DEPLOYMENT_SETTINGS="$(deployment_settings)" \
         || die "Could not capture the existing AAP and networking values"
-    prepare_upgrade_values
+    if [[ "$OSAC_INSTALL_MODE" == auto ]] \
+        && [[ "$(jq -cS . <<<"$PREVIOUS_DEPLOYMENT_SETTINGS")" == "$EXPECTED_DEPLOYMENT_SETTINGS" ]]; then
+        OSAC_DEPLOYMENT_NEEDED=false
+        info "The existing OSAC release already matches the fixes-branch deployment settings."
+    else
+        prepare_upgrade_values
+    fi
 fi
 if [[ "$OSAC_INSTALL_MODE" == install && -n "$EXISTING_OSAC_RELEASE" ]]; then
     die "OSAC_INSTALL_MODE=install but an OSAC release already exists; use auto or upgrade"
@@ -3546,7 +3946,11 @@ if [[ "$OSAC_INSTALL_MODE" == upgrade && -z "$EXISTING_OSAC_RELEASE" ]]; then
     die "OSAC_INSTALL_MODE=upgrade but no OSAC release exists"
 fi
 
-if [[ -n "$EXISTING_OSAC_RELEASE" || "$OSAC_INSTALL_MODE" == upgrade ]]; then
+if [[ "$OSAC_DEPLOYMENT_NEEDED" == false ]]; then
+    info "Skipping the OSAC Helm operation because the desired release is already deployed."
+elif [[ -n "$EXISTING_OSAC_RELEASE" || "$OSAC_INSTALL_MODE" == upgrade ]]; then
+    info "Refreshing local umbrella-chart dependencies from this checkout..."
+    helm dependency build "${INSTALLER_DIR}/charts/osac"
     info "Upgrading the existing OSAC release with the custom AAP and operator images..."
     # Skip the existing config-as-code hook on upgrades: AAP rejects the
     # pre-existing cluster-fulfillment-ig Secret volume. Phase 4 syncs the
@@ -3568,6 +3972,8 @@ if [[ -n "$EXISTING_OSAC_RELEASE" || "$OSAC_INSTALL_MODE" == upgrade ]]; then
         --values "$OVERLAY_FILE" \
         --wait --timeout 40m
 else
+    info "Refreshing local umbrella-chart dependencies from this checkout..."
+    helm dependency build "${INSTALLER_DIR}/charts/osac"
     [[ -f "$AAP_LICENSE_FILE" ]] || die "AAP license file not found: ${AAP_LICENSE_FILE}"
     info "Installing OSAC with the AgentlessNet VirtualNetwork/Subnet profile in ${OSAC_NAMESPACE}..."
     make -C "$INSTALLER_DIR" install \
@@ -3599,10 +4005,8 @@ EXPECTED_AAP_BRANCH="${AAP_PROJECT_GIT_BRANCH:-$CURRENT_BRANCH}"
     || die "AAP project branch is ${AAP_BRANCH}; expected ${EXPECTED_AAP_BRANCH}. Update the existing AAP project before running this E2E."
 info "AAP project branch: ${AAP_BRANCH}"
 
-# Phase 4: prepare the provider and run the selected networking suite.
-step "STEP 4 OF 4: Running the ${VLAN_E2E_SUITE} E2E suite"
-sync_aap_project_revision
-configure_aap_execution_environment
+# Step 3: deploy or reuse the Containerlab topology.
+step "STEP 3 OF 5: Deploying or reusing the Containerlab fabric"
 (
     cd "$AAP_DIR"
     uv sync --locked --group development
@@ -3613,24 +4017,35 @@ ensure_cumulus_admin_identity
 prepare_cumulus_startup_config
 write_cumulus_ssh_config
 ensure_containerlab_net_node
+assert_containerlab_switch_images
+wait_for_cumulus_guests
+
+# Step 4: prepare provider access and initialize the declared fabric trunks.
+step "STEP 4 OF 5: Initializing provider and fabric"
+AAP_API_CA_FILE="$TEMP_DIR/aap-api-ca.pem"
+prepare_aap_ca_bundle
+sync_aap_project_revision
+configure_aap_execution_environment
 prepare_containerlab_net_node
 write_cumulus_ssh_config
-wait_for_cumulus_guests
-repair_provider_schema_v1
 prepare_containerlab_switches
 configure_containerlab_fabric
+assert_provider_key_survived "trunk initialization"
 if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
     prepare_containerlab_dhcp_supervisor
 fi
 prepare_aap_networking_instance_group
+wait_for_existing_provider_deletions \
+    || die "Existing AgentlessNet resources are still deleting; provider access is preserved for recovery"
+if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
+    configure_aap_subnet_reader \
+        || die "Could not configure AAP Kubernetes authentication for BMaaS attachment jobs"
+fi
 
 if [[ "$SUITE_USES_CLI" == true ]]; then
     # The CLI is a local binary, not another container image.
     info "Preparing a temporary CLI CA bundle and building the CLI from this checkout..."
-    CLI_CA_FILE="$(mktemp "${TMPDIR:-/tmp}/osac-5530-ca.XXXXXX")"
-    oc get configmap ca-bundle -n "$OSAC_NAMESPACE" \
-        -o jsonpath='{.data.bundle\.pem}' > "$CLI_CA_FILE"
-    [[ -s "$CLI_CA_FILE" ]] || die "OSAC CA bundle is empty"
+    CLI_CA_FILE="$AAP_API_CA_FILE"
     (
         cd "${REPO_ROOT}/fulfillment-service"
         go build -o "$CLI_BIN" ./cmd/osac
@@ -3681,6 +4096,181 @@ client_macvlan_name() {
     printf 'm%s-%s' "$suffix" "$1"
 }
 
+run_agentless_net_aap_job() {
+    local job_suffix="$1" extra_vars_file="$2" result_file="$3"
+    local route token template job_id
+    template="${AAP_PREFIX}-${job_suffix}"
+    if ! route="$(oc get route osac-aap -n "$OSAC_NAMESPACE" -o jsonpath='{.spec.host}')"; then
+        printf 'ERROR: could not read the AAP Controller route before launching %s\n' "$template" >&2
+        return 1
+    fi
+    if ! token="$(oc exec deployment/osac-operator -n "$OSAC_NAMESPACE" -- \
+        sh -c 'printf %s "$OSAC_AAP_TOKEN"' 2>/dev/null)"; then
+        printf 'ERROR: could not obtain the AAP API token before launching %s\n' "$template" >&2
+        return 1
+    fi
+    if [[ -z "$route" || -z "$token" ]]; then
+        printf 'ERROR: AAP Controller route or API token is unavailable for %s\n' "$template" >&2
+        unset token
+        return 1
+    fi
+    if ! AAP_API_ROUTE="https://${route}" AAP_API_TOKEN="$token" \
+        AAP_API_CA_FILE="$AAP_API_CA_FILE" \
+        python3 "$AAP_JOBS_HELPER" launch \
+            --job-template "$template" \
+            --extra-vars "$extra_vars_file" \
+            --output "$result_file" \
+            --project-name "$AAP_PROJECT_NAME" \
+            --project-revision "$RUNTIME_SOURCE_COMMIT" \
+            --ee-name "$AAP_EXECUTION_ENVIRONMENT_NAME" \
+            --ee-image "$AAP_IMAGE" \
+            --timeout "$AAP_JOB_TIMEOUT"; then
+        unset token
+        return 1
+    fi
+    unset token
+    if ! job_id="$(jq -er '.job_id' "$result_file")"; then
+        printf 'ERROR: AAP helper returned invalid job metadata for %s\n' "$template" >&2
+        return 1
+    fi
+    info "AAP ${template} completed as job ${job_id} at source revision ${RUNTIME_SOURCE_COMMIT}."
+}
+
+write_client_bmi_extra_vars() {
+    local client="$1" subnet_ref="$2" output_file="$3" offboard="$4"
+    local uid="${CLIENT_BMI_UID[$client]:-}" mac="${CLIENT_PRESERVED_MAC[$client]:-}"
+    [[ -n "$mac" ]] || mac="$(<"$TEMP_DIR/client-${client}.mac")"
+    [[ "$uid" =~ ^[0-9a-f-]{36}$ ]] || {
+        printf 'ERROR: DHCP client %s has no valid simulated BMI UID\n' "$client" >&2
+        return 1
+    }
+    [[ "$subnet_ref" =~ ^[0-9a-f-]{36}$ ]] || {
+        printf 'ERROR: DHCP client %s has no valid Fulfillment Subnet UUID\n' "$client" >&2
+        return 1
+    }
+    [[ "$mac" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]] || {
+        printf 'ERROR: DHCP client %s has no valid simulated BMI NIC MAC\n' "$client" >&2
+        return 1
+    }
+    python3 - "$client" "$OSAC_NAMESPACE" "$OSAC_TENANT" "$subnet_ref" \
+        "$uid" "$mac" "$offboard" "$output_file" <<'PY'
+import datetime
+import json
+import os
+import pathlib
+import sys
+
+client, namespace, tenant, subnet_ref, uid, mac, offboard, output_path = sys.argv[1:]
+host_id = f"osac-e2e-{client}"
+resource = {
+    "apiVersion": "osac.openshift.io/v1alpha1",
+    "kind": "BareMetalInstance",
+    "metadata": {
+        "name": host_id,
+        "namespace": namespace,
+        "uid": uid,
+        "annotations": {
+            "osac.openshift.io/tenant": tenant,
+            "osac.openshift.io/owner-reference": "vlan-e2e-run",
+            "osac.openshift.io/implementation-strategy": "agentless_net",
+        },
+    },
+    "spec": {
+        "externalHostID": host_id,
+        "networkAttachments": [{
+            "subnetRef": subnet_ref,
+            "interface": "eth0",
+            "primary": True,
+        }],
+    },
+}
+if offboard == "true":
+    resource["metadata"]["deletionTimestamp"] = (
+        datetime.datetime.now(datetime.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+payload = {"osac_job_vars": {"resource": resource}}
+if offboard == "query":
+    payload["osac_job_vars"]["network_attachment_macs"] = {
+        subnet_ref: mac.lower(),
+    }
+path = pathlib.Path(output_path)
+path.write_text(json.dumps(payload, separators=(",", ":")) + "\n")
+path.chmod(0o600)
+PY
+}
+
+attach_client_to_subnet() {
+    local client="$1" subnet_ref="$2" extra_vars result_file
+    if [[ "${CLIENT_ATTACHMENT_ACTIVE[$client]:-false}" == true ]]; then
+        [[ "${CLIENT_ATTACHMENT_SUBNET[$client]:-}" == "$subnet_ref" ]] \
+            || die "DHCP client ${client} is already attached to a different Subnet"
+        info "DHCP client ${client} already has the requested simulated BMI attachment."
+        return 0
+    fi
+    CLIENT_BMI_UID["$client"]="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+    CLIENT_ATTACHMENT_SUBNET["$client"]="$subnet_ref"
+    CLIENT_ATTACHMENT_PENDING["$client"]=true
+    extra_vars="$TEMP_DIR/${client}-move-network-attachment.json"
+    result_file="$TEMP_DIR/${client}-move-network-attachment-result.json"
+    write_client_bmi_extra_vars "$client" "$subnet_ref" "$extra_vars" false
+    run_agentless_net_aap_job move-network-attachment "$extra_vars" "$result_file" \
+        || die "AAP could not attach DHCP client ${client} to Subnet ${subnet_ref}"
+    CLIENT_ATTACHMENT_ACTIVE["$client"]=true
+    CLIENT_ATTACHMENT_PENDING["$client"]=false
+    CLIENT_PRESERVED_MAC["$client"]="$(<"$TEMP_DIR/client-${client}.mac")"
+}
+
+discover_client_dhcp_lease() {
+    local client="$1" subnet_ref mac extra_vars result_file lease_ip expected_mac
+    subnet_ref="${CLIENT_ATTACHMENT_SUBNET[$client]:-}"
+    [[ -n "$subnet_ref" && "${CLIENT_ATTACHMENT_ACTIVE[$client]:-false}" == true ]] \
+        || die "DHCP client ${client} has no active simulated BMI attachment to query"
+    mac="$(<"$TEMP_DIR/client-${client}.mac")"
+    expected_mac="$(tr '[:upper:]' '[:lower:]' <<<"$mac" | tr -d '\r\n')"
+    lease_ip="$(jq -er '.address' "$TEMP_DIR/client-${client}.lease.json")" \
+        || die "DHCP client ${client} has no IPv4 lease to query"
+    extra_vars="$TEMP_DIR/${client}-query-dhcp-lease.json"
+    result_file="$TEMP_DIR/${client}-query-dhcp-lease-result.json"
+    write_client_bmi_extra_vars "$client" "$subnet_ref" "$extra_vars" query
+    run_agentless_net_aap_job query-dhcp-lease "$extra_vars" "$result_file" \
+        || die "AAP could not discover the DHCP lease for client ${client}"
+    jq -e --arg subnet "$subnet_ref" --arg ip "$lease_ip" \
+        --arg mac "$expected_mac" '
+      (.artifacts.leases | type == "array" and length == 1)
+      and .artifacts.leases[0].subnet_ref == $subnet
+      and .artifacts.leases[0].interface == "eth0"
+      and ((.artifacts.leases[0].mac_address | ascii_downcase) == $mac)
+      and .artifacts.leases[0].ip_address == $ip
+    ' "$result_file" >/dev/null \
+        || die "AAP DHCP lease result for ${client} did not match its Subnet, eth0, MAC, and client lease"
+    info "AAP verified client ${client} lease ${lease_ip} on Subnet ${subnet_ref} for MAC ${expected_mac}."
+}
+
+offboard_client_from_subnet() {
+    local client="$1" subnet_ref extra_vars result_file
+    if [[ "${CLIENT_ATTACHMENT_PENDING[$client]:-false}" != true \
+        && "${CLIENT_ATTACHMENT_ACTIVE[$client]:-false}" != true ]]; then
+        return 0
+    fi
+    subnet_ref="${CLIENT_ATTACHMENT_SUBNET[$client]:-}"
+    [[ -n "$subnet_ref" ]] || {
+        printf 'ERROR: cannot offboard client %s without its original Subnet reference\n' "$client" >&2
+        return 1
+    }
+    extra_vars="$TEMP_DIR/${client}-offboard-network-attachment.json"
+    result_file="$TEMP_DIR/${client}-offboard-network-attachment-result.json"
+    write_client_bmi_extra_vars "$client" "$subnet_ref" "$extra_vars" true \
+        || return 1
+    run_agentless_net_aap_job move-network-attachment "$extra_vars" "$result_file" \
+        || return 1
+    CLIENT_ATTACHMENT_ACTIVE["$client"]=false
+    CLIENT_ATTACHMENT_PENDING["$client"]=false
+    unset "CLIENT_ATTACHMENT_SUBNET[$client]" "CLIENT_BMI_UID[$client]"
+}
+
 write_agentless_e2e_helpers() {
     DHCP_CLIENT_HELPER="$TEMP_DIR/dhcp_clients.py"
     DHCP_CLIENT_HOOK="$TEMP_DIR/udhcpc-hook.sh"
@@ -3704,7 +4294,7 @@ from typing import TypeVar, cast
 _JSON = TypeVar("_JSON")
 
 
-def _load_runtime_vlan_parser() -> Callable[[str, str], set[int]]:
+def _load_runtime_vlan_parser() -> Callable[[str, str, str | None], set[int]]:
     repo_root = Path(os.environ["OSAC_REPO_ROOT"]).resolve()
     sys.path.insert(0, str(repo_root / "osac-aap" / "collections"))
     from ansible_collections.osac.templates.plugins.module_utils.agentless_net_subnet import (
@@ -3734,7 +4324,13 @@ def snapshot_vlan_ids(args: argparse.Namespace) -> None:
         if switch["name"] in seen:
             raise ValueError(f"switch snapshot repeats {switch['name']}")
         seen.add(switch["name"])
-        excluded.update(parser(switch.get("bridge_vlan_output"), switch.get("reserved_vlan_output")))
+        excluded.update(
+            parser(
+                switch.get("bridge_vlan_output"),
+                switch.get("reserved_vlan_output"),
+                switch.get("switchd_reserved_vlan_output"),
+            )
+        )
     Path(args.output).write_text(
         json.dumps({"switches": switches, "excluded_vlan_ids": sorted(excluded)}, sort_keys=True) + "\n"
     )
@@ -3919,270 +4515,17 @@ SH
     chmod 0700 "$DHCP_CLIENT_HOOK"
 }
 
-snapshot_client_access_ports() {
-    local raw_file="$TEMP_DIR/access-ports.jsonl" client switch port parent
-    local pending_diff config_state
-    local -A preflighted_switches=()
-    ACCESS_PORTS_SNAPSHOT_FILE="$TEMP_DIR/access-ports-snapshot.json"
-    : >"$raw_file"
-    for client in a1 a2 b1; do
-        client_link "$client"
-        switch="$CLIENT_SWITCH" port="$CLIENT_SWITCH_PORT" parent="$CLIENT_HOST_PARENT"
-        jq -e --arg switch "$switch" --arg port "$port" \
-            'all(.switches[] | select(.name == $switch).trunk_ports[]; . != $port)' \
-            "$SWITCH_MANIFEST_FILE" >/dev/null \
-            || die "Client fixture port ${switch}/${port} overlaps a declared AgentlessNet trunk"
-        if [[ "${preflighted_switches[$switch]:-false}" != true ]]; then
-            pending_diff="$(switch_exec "$switch" nv config diff --output commands)" \
-                || die "Could not inspect pending NVUE changes on ${switch}"
-            [[ -z "$pending_diff" ]] \
-                || die "Switch ${switch} has pending NVUE changes; refusing to apply fixture port configuration"
-            preflighted_switches["$switch"]=true
-        fi
-        sudo ip link show dev "$parent" >/dev/null 2>&1 \
-            || die "Containerlab-owned parent link ${parent} is missing"
-        local bridge_state fdb_state link_state nvue_state nvue_error
-        link_state="$(switch_exec "$switch" ip -j link show dev "$port" \
-            | jq -ce '.[0] | {master:(.master // null),admin_up:(.flags | index("UP") != null)}')" \
-            || die "Could not snapshot link state on ${switch}/${port}"
-        [[ "$(jq -r '.master // ""' <<<"$link_state")" == "" \
-            || "$(jq -r '.master // ""' <<<"$link_state")" == br_default ]] \
-            || die "Client fixture port ${switch}/${port} is attached to an unrelated bridge; preserving it"
-        bridge_state="$(switch_exec "$switch" bridge -j vlan show dev "$port")" \
-            || die "Could not snapshot VLAN memberships on ${switch}/${port}"
-        [[ "$bridge_state" == "[]" ]] \
-            || die "Client fixture port ${switch}/${port} already has VLAN membership; preserving its existing configuration"
-        config_state="$(switch_exec "$switch" nv config show --output json \
-            | jq -c --arg port "$port" '.[0].set.interface[$port] // null')" \
-            || die "Could not snapshot the applied NVUE configuration on ${switch}/${port}"
-        if [[ "$config_state" != null ]] && ! jq -e \
-            '. == {"bridge":{"domain":{"br_default":{}}}}' \
-            <<<"$config_state" >/dev/null; then
-            die "Client fixture port ${switch}/${port} already has NVUE configuration; preserving it"
-        fi
-        fdb_state="$(switch_exec "$switch" bridge fdb show dev "$port")" \
-            || die "Could not snapshot forwarding entries on ${switch}/${port}"
-        if grep -Ev 'self permanent$' <<<"$fdb_state" | grep -q .; then
-            die "Client fixture port ${switch}/${port} has learned MAC entries; refusing to disrupt active use"
-        fi
-        nvue_error="$TEMP_DIR/${client}-nvue.err"
-        if nvue_state="$(switch_exec "$switch" nv show interface "$port" bridge domain br_default --output json 2>"$nvue_error")"; then
-            [[ -z "$nvue_state" ]] \
-                || die "Client fixture port ${switch}/${port} already has NVUE bridge configuration; preserving it"
-        elif ! grep -q '404 NOT FOUND' "$nvue_error"; then
-            cat "$nvue_error" >&2
-            die "Could not verify the baseline NVUE configuration on ${switch}/${port}"
-        else
-            nvue_state=""
-        fi
-        printf '%s\n' "$(jq -nc --arg client "$client" --arg switch "$switch" \
-            --arg port "$port" --arg parent "$parent" --argjson link "$link_state" \
-            --arg nvue "$nvue_state" \
-            --argjson config "$config_state" --argjson bridge "$bridge_state" \
-            --arg fdb "$fdb_state" \
-            '{client:$client,switch:$switch,port:$port,parent:$parent,link:$link,nvue:$nvue,config:$config,bridge:$bridge,fdb:$fdb}')" \
-            >>"$raw_file"
-    done
-    jq -s . "$raw_file" >"$ACCESS_PORTS_SNAPSHOT_FILE"
-    chmod 0600 "$ACCESS_PORTS_SNAPSHOT_FILE"
-    info "Snapshotted the three idle access links; their switch ports are outside all declared trunks."
-}
-
-configure_client_access_port() {
-    local client="$1" vlan_id="$2" key bridge_state apply_log
-    client_link "$client"
-    key="${CLIENT_SWITCH}/${CLIENT_SWITCH_PORT}"
-    if jq -e --arg switch "$CLIENT_SWITCH" --arg port "$CLIENT_SWITCH_PORT" \
-        'any(.switches[] | select(.name == $switch).trunk_ports[]; . == $port)' \
-        "$SWITCH_MANIFEST_FILE" >/dev/null; then
-        die "Refusing to configure client access port ${key} because it is a declared trunk"
-    fi
-    if [[ "${CLIENT_PORT_CONFIGURED[$key]:-false}" != true ]]; then
-        CLIENT_PORT_CONFIGURED["$key"]=true
-    fi
-    CLIENT_PORT_VLAN["$key"]="$vlan_id"
-    switch_exec "$CLIENT_SWITCH" nv set interface "$CLIENT_SWITCH_PORT" bridge domain br_default
-    switch_exec "$CLIENT_SWITCH" nv set interface "$CLIENT_SWITCH_PORT" \
-        bridge domain br_default access "$vlan_id"
-    apply_log="$TEMP_DIR/${client}-nvue-apply.log"
-    if ! switch_exec "$CLIENT_SWITCH" nv config apply --assume-yes >"$apply_log" 2>&1; then
-        cat "$apply_log" >&2
-        die "NVUE could not apply fixture access VLAN ${vlan_id} to ${key}"
-    fi
-    bridge_state="$(switch_exec "$CLIENT_SWITCH" bridge -j vlan show dev "$CLIENT_SWITCH_PORT")"
-    jq -e --argjson vlan "$vlan_id" '
-      ([.[] | .vlans[]?.vlan] | unique) == [$vlan]
-      and any(.[]; any(.vlans[]?; .vlan == $vlan and (.flags | index("PVID") != null)))' \
-      <<<"$bridge_state" >/dev/null \
-        || die "Fixture access port ${key} did not converge to VLAN ${vlan_id}"
-    printf 'Client %s access port %s -> VLAN %s\n' "$client" "$key" "$vlan_id"
-}
-
-restore_client_access_port() {
-    local client="$1" key vlan bridge_state dynamic_fdb baseline_bridge baseline_fdb baseline_nvue
-    local link_state baseline_link current_link_state nvue_state nvue_error baseline_config current_config apply_log
-    local current_master baseline_admin_up client_mac client_mac_file port_mac
-    client_link "$client"
-    key="${CLIENT_SWITCH}/${CLIENT_SWITCH_PORT}"
-    [[ "${CLIENT_PORT_CONFIGURED[$key]:-false}" == true ]] || return 0
-    [[ -s "$ACCESS_PORTS_SNAPSHOT_FILE" ]] \
-        || { printf 'ERROR: access-port snapshot is missing during restoration\n' >&2; return 1; }
-    baseline_bridge="$(jq -c --arg client "$client" \
-        '.[] | select(.client == $client) | .bridge' "$ACCESS_PORTS_SNAPSHOT_FILE")"
-    baseline_fdb="$(jq -r --arg client "$client" \
-        '.[] | select(.client == $client) | .fdb' "$ACCESS_PORTS_SNAPSHOT_FILE")"
-    baseline_nvue="$(jq -r --arg client "$client" \
-        '.[] | select(.client == $client) | .nvue' "$ACCESS_PORTS_SNAPSHOT_FILE")"
-    baseline_config="$(jq -c --arg client "$client" \
-        '.[] | select(.client == $client) | .config' "$ACCESS_PORTS_SNAPSHOT_FILE")"
-    baseline_link="$(jq -c --arg client "$client" \
-        '.[] | select(.client == $client) | .link' "$ACCESS_PORTS_SNAPSHOT_FILE")"
-    [[ -n "$baseline_bridge" && "$baseline_bridge" == "[]" \
-        && ("$baseline_config" == null || "$baseline_config" == '{"bridge":{"domain":{"br_default":{}}}}') \
-        && -n "$baseline_link" && -z "$baseline_nvue" ]] \
-        || { printf 'ERROR: access-port snapshot for %s is invalid; preserving current state\n' "$key" >&2; return 1; }
-    vlan="${CLIENT_PORT_VLAN[$key]:-}"
-    [[ "$vlan" =~ ^[0-9]+$ ]] \
-        || { printf 'ERROR: fixture VLAN for %s is invalid; preserving current state\n' "$key" >&2; return 1; }
-    bridge_state="$(switch_exec "$CLIENT_SWITCH" bridge -j vlan show dev "$CLIENT_SWITCH_PORT")" \
-        || { printf 'ERROR: could not inspect temporary access port %s before restoration\n' "$key" >&2; return 1; }
-    link_state="$(switch_exec "$CLIENT_SWITCH" ip -j link show dev "$CLIENT_SWITCH_PORT" \
-        | jq -ce '.[0] | {master:(.master // null),admin_up:(.flags | index("UP") != null),mac:.address}')" \
-        || { printf 'ERROR: could not inspect link state on %s before restoration\n' "$key" >&2; return 1; }
-    baseline_admin_up="$(jq -r '.admin_up' <<<"$baseline_link")"
-    current_master="$(jq -r '.master // ""' <<<"$link_state")"
-    port_mac="$(jq -r '.mac' <<<"$link_state")"
-    client_mac_file="$TEMP_DIR/client-${client}.mac"
-    [[ -s "$client_mac_file" ]] \
-        || { printf 'ERROR: test client MAC is missing for %s; preserving its port\n' "$key" >&2; return 1; }
-    client_mac="$(<"$client_mac_file")"
-    current_config="$(switch_exec "$CLIENT_SWITCH" nv config show --output json \
-        | jq -c --arg port "$CLIENT_SWITCH_PORT" '.[0].set.interface[$port] // null')" \
-        || { printf 'ERROR: could not inspect NVUE configuration on %s before restoration\n' "$key" >&2; return 1; }
-    current_link_state="$(jq -c 'del(.mac)' <<<"$link_state")"
-    if [[ "$current_config" == "$baseline_config" \
-        && "$(jq -c . <<<"$bridge_state")" == "$baseline_bridge" \
-        && "$current_link_state" == "$baseline_link" ]]; then
-        nvue_error="$TEMP_DIR/${client}-nvue-restore.err"
-        if nvue_state="$(switch_exec "$CLIENT_SWITCH" nv show interface "$CLIENT_SWITCH_PORT" \
-            bridge domain br_default --output json 2>"$nvue_error")"; then
-            [[ "$nvue_state" == "$baseline_nvue" ]] \
-                || { printf 'ERROR: access port %s NVUE state differs from its saved baseline\n' "$key" >&2; return 1; }
-        elif [[ -n "$baseline_nvue" ]] || ! grep -q '404 NOT FOUND' "$nvue_error"; then
-            printf 'ERROR: could not verify the original NVUE state of %s\n' "$key" >&2
-            return 1
-        fi
-        for ((attempt = 1; attempt <= 30; attempt++)); do
-            dynamic_fdb="$(switch_exec "$CLIENT_SWITCH" bridge fdb show dev "$CLIENT_SWITCH_PORT")" \
-                || return 1
-            if [[ "$(LC_ALL=C sort <<<"$dynamic_fdb")" == "$(LC_ALL=C sort <<<"$baseline_fdb")" ]]; then
-                CLIENT_PORT_CONFIGURED["$key"]=false
-                return 0
-            fi
-            sleep 1
-        done
-        printf 'ERROR: access port %s reached its link/config baseline but its FDB did not settle\n' "$key" >&2
-        return 1
-    fi
-    jq -e --argjson vlan "$vlan" '
-      type == "object"
-      and ((keys - ["bridge", "type"]) | length) == 0
-      and ((has("type") | not) or .type == "swp")
-      and .bridge == {domain:{br_default:{access:$vlan}}}
-    ' <<<"$current_config" >/dev/null \
-        || { printf 'ERROR: NVUE configuration on %s is not the exact test fixture; preserving it\n' "$key" >&2; return 1; }
-    jq -e --argjson vlan "$vlan" '
-      ([.[] | .vlans[]?.vlan] | unique) == [$vlan]
-      and any(.[]; any(.vlans[]?; .vlan == $vlan and (.flags | index("PVID") != null)))' \
-      <<<"$bridge_state" >/dev/null \
-        || { printf 'ERROR: VLAN state on %s changed unexpectedly; preserving it\n' "$key" >&2; return 1; }
-    current_master="$(jq -r '.master // ""' <<<"$link_state")"
-    if [[ "$current_master" != br_default ]]; then
-        printf 'ERROR: bridge master on %s is not the test fixture bridge; preserving it\n' "$key" >&2
-        return 1
-    fi
-    dynamic_fdb="$(switch_exec "$CLIENT_SWITCH" bridge fdb show dev "$CLIENT_SWITCH_PORT")" \
-        || { printf 'ERROR: could not inspect forwarding entries on %s before restoration\n' "$key" >&2; return 1; }
-    if ! awk -v client_mac="$client_mac" -v port_mac="$port_mac" -v vlan="$vlan" '
-      /self permanent$/ { next }
-      $1 == client_mac && $2 == "vlan" && $3 == vlan && $4 == "master" \
-        && $5 == "br_default" && NF == 5 { next }
-      $1 == port_mac && (($2 == "master" && $3 == "br_default" && $4 == "permanent" && NF == 4) \
-        || ($2 == "vlan" && $3 ~ /^[0-9]+$/ && $4 == "master" \
-            && $5 == "br_default" && $6 == "permanent" && NF == 6)) { next }
-      { unexpected = 1 }
-      END { exit unexpected }
-    ' <<<"$dynamic_fdb"; then
-        printf 'ERROR: unknown forwarding entries remain on %s; preserving it\n' "$key" >&2
-        return 1
-    fi
-    if [[ "$baseline_config" == null ]]; then
-        switch_exec "$CLIENT_SWITCH" nv unset interface "$CLIENT_SWITCH_PORT" \
-            || { printf 'ERROR: could not remove the test NVUE access setting from %s\n' "$key" >&2; return 1; }
-    else
-        switch_exec "$CLIENT_SWITCH" nv unset interface "$CLIENT_SWITCH_PORT" \
-            bridge domain br_default access \
-            || { printf 'ERROR: could not remove the test NVUE access setting from %s\n' "$key" >&2; return 1; }
-    fi
-    apply_log="$TEMP_DIR/${client}-nvue-restore.log"
-    if ! switch_exec "$CLIENT_SWITCH" nv config apply --assume-yes >"$apply_log" 2>&1; then
-        cat "$apply_log" >&2
-        printf 'ERROR: NVUE could not restore the saved port configuration on %s\n' "$key" >&2
-        return 1
-    fi
-    if [[ "$baseline_admin_up" == true ]]; then
-        switch_exec "$CLIENT_SWITCH" ip link set dev "$CLIENT_SWITCH_PORT" up || return 1
-    else
-        switch_exec "$CLIENT_SWITCH" ip link set dev "$CLIENT_SWITCH_PORT" down || return 1
-    fi
-    bridge_state="$(switch_exec "$CLIENT_SWITCH" bridge -j vlan show dev "$CLIENT_SWITCH_PORT")" \
-        || return 1
-    [[ "$(jq -c . <<<"$bridge_state")" == "$baseline_bridge" ]] \
-        || { printf 'ERROR: access port %s did not return to its VLAN snapshot\n' "$key" >&2; return 1; }
-    link_state="$(switch_exec "$CLIENT_SWITCH" ip -j link show dev "$CLIENT_SWITCH_PORT" \
-        | jq -ce '.[0] | {master:(.master // null),admin_up:(.flags | index("UP") != null)}')" \
-        || return 1
-    [[ "$link_state" == "$baseline_link" ]] \
-        || { printf 'ERROR: access port %s link state differs from its snapshot\n' "$key" >&2; return 1; }
-    current_config="$(switch_exec "$CLIENT_SWITCH" nv config show --output json \
-        | jq -c --arg port "$CLIENT_SWITCH_PORT" '.[0].set.interface[$port] // null')" \
-        || return 1
-    [[ "$current_config" == "$baseline_config" ]] \
-        || { printf 'ERROR: access port %s NVUE configuration differs from its snapshot\n' "$key" >&2; return 1; }
-    nvue_error="$TEMP_DIR/${client}-nvue-restore.err"
-    if nvue_state="$(switch_exec "$CLIENT_SWITCH" nv show interface "$CLIENT_SWITCH_PORT" \
-        bridge domain br_default --output json 2>"$nvue_error")"; then
-        [[ "$nvue_state" == "$baseline_nvue" ]] \
-            || { printf 'ERROR: access port %s did not return to its NVUE snapshot\n' "$key" >&2; return 1; }
-    elif [[ -n "$baseline_nvue" ]] || ! grep -q '404 NOT FOUND' "$nvue_error"; then
-        printf 'ERROR: could not verify the original NVUE state of %s\n' "$key" >&2
-        return 1
-    fi
-    local fdb_restored=false
-    for ((attempt = 1; attempt <= 30; attempt++)); do
-        dynamic_fdb="$(switch_exec "$CLIENT_SWITCH" bridge fdb show dev "$CLIENT_SWITCH_PORT")" \
-            || return 1
-        if [[ "$(LC_ALL=C sort <<<"$dynamic_fdb")" == "$(LC_ALL=C sort <<<"$baseline_fdb")" ]]; then
-            fdb_restored=true
-            break
-        fi
-        sleep 1
-    done
-    [[ "$fdb_restored" == true ]] \
-        || { printf 'ERROR: access port %s forwarding state differs from its snapshot after settling\n' "$key" >&2; return 1; }
-    CLIENT_PORT_CONFIGURED["$key"]=false
-}
-
-restore_client_access_ports() {
-    local client failed=false
-    for client in a1 a2 b1; do
-        restore_client_access_port "$client" || failed=true
-    done
-    [[ "$failed" == false ]]
+nvue_interface_config() {
+    local switch="$1" port="$2"
+    switch_exec "$switch" nv config show --output json \
+        | jq -c --arg port "$port" '
+            (if type == "array" then . else [.] end)
+            | ([.[] | .set? // empty] | last) as $set
+            | ($set // {}).interface[$port] // null'
 }
 
 create_dhcp_client_container() {
-    local client="$1" container macvlan pid mac
+    local client="$1" container macvlan pid mac preserved_mac="${CLIENT_PRESERVED_MAC[$1]:-}"
     client_link "$client"
     container="$(client_container "$client")"
     macvlan="$(client_macvlan_name "$client")"
@@ -4191,6 +4534,11 @@ create_dhcp_client_container() {
     DHCP_CLIENT_CONTAINERS+=("$container")
     sudo ip link add link "$CLIENT_HOST_PARENT" name "$macvlan" type macvlan mode bridge
     DHCP_CLIENT_HOST_LINKS+=("$macvlan")
+    if [[ -n "$preserved_mac" ]]; then
+        [[ "$preserved_mac" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]] \
+            || die "Saved DHCP client ${client} MAC is invalid"
+        sudo ip link set dev "$macvlan" address "$preserved_mac"
+    fi
     pid="$(docker inspect -f '{{.State.Pid}}' "$container")"
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "Could not read network namespace PID for $container"
     sudo ip link set dev "$macvlan" netns "$pid"
@@ -4204,6 +4552,9 @@ create_dhcp_client_container() {
     mac="$(docker exec "$container" cat /sys/class/net/eth0/address)"
     [[ "$mac" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]] \
         || die "Could not read the MAC address for DHCP client $client"
+    if [[ -n "$preserved_mac" && "${mac,,}" != "${preserved_mac,,}" ]]; then
+        die "Recreated DHCP client ${client} changed its preserved MAC address"
+    fi
     printf '%s\n' "$mac" >"$TEMP_DIR/client-${client}.mac"
     info "Prepared real DHCP client $client ($container, MAC $mac) on $CLIENT_HOST_PARENT."
 }
@@ -4221,6 +4572,7 @@ recreate_dhcp_client_container() {
     client_link "$client"
     container="$(client_container "$client")"
     macvlan="$(client_macvlan_name "$client")"
+    CLIENT_PRESERVED_MAC["$client"]="$(<"$TEMP_DIR/client-${client}.mac")"
     stop_dhcp_client "$client"
     docker rm -f "$container" >/dev/null \
         || die "Could not replace DHCP client container $container"
@@ -4421,8 +4773,7 @@ capture_failed_dhcp_client_state() {
             printf 'switch=%s trunk=%s\n' "$switch" "$trunk"
             switch_exec "$switch" bridge -j vlan show dev "$trunk" || true
             switch_exec "$switch" bridge fdb show dev "$trunk" || true
-            switch_exec "$switch" nv config show --output json \
-                | jq -c --arg port "$trunk" '.[0].set.interface[$port] // null' || true
+            nvue_interface_config "$switch" "$trunk" || true
         done < <(jq -r '.switches[] | .name as $name | .trunk_ports[] | [$name, .] | @tsv' \
             "$SWITCH_MANIFEST_FILE")
         netnode supervisorctl -c /etc/agentless-net/supervisord.conf status "$service_name" || true
@@ -4574,13 +4925,33 @@ detach_dhcp_client() {
     local client="$1" container
     container="$(client_container "$client")"
     stop_dhcp_client "$client"
-    docker exec "$container" ip address flush dev eth0
-    docker exec "$container" ip route flush dev eth0
-    restore_client_access_port "$client"
+    if docker inspect "$container" >/dev/null 2>&1; then
+        docker exec "$container" ip address flush dev eth0 || true
+        docker exec "$container" ip route flush dev eth0 || true
+    fi
+    offboard_client_from_subnet "$client" \
+        || die "Could not offboard DHCP client ${client} through osac-move-network-attachment"
 }
 
-cleanup_dhcp_clients_and_ports() {
-    local container link pid failed=false
+cleanup_dhcp_clients_and_attachments() {
+    local client container link pid failed=false
+    for client in a1 a2 b1; do
+        if [[ "${CLIENT_ATTACHMENT_PENDING[$client]:-false}" == true \
+            || "${CLIENT_ATTACHMENT_ACTIVE[$client]:-false}" == true ]]; then
+            stop_dhcp_client "$client"
+            container="$(client_container "$client")"
+            if docker inspect "$container" >/dev/null 2>&1; then
+                docker exec "$container" ip address flush dev eth0 >/dev/null 2>&1 || true
+                docker exec "$container" ip route flush dev eth0 >/dev/null 2>&1 || true
+            fi
+            if ! offboard_client_from_subnet "$client"; then
+                printf 'ERROR: could not offboard simulated BMI for client %s; retaining its client link and provider resources\n' \
+                    "$client" >&2
+                failed=true
+            fi
+        fi
+    done
+    [[ "$failed" == false ]] || return 1
     for container in "${DHCP_CLIENT_CONTAINERS[@]}"; do
         if pid="$(dhcp_client_pid "$container")"; then
             docker exec "$container" kill -TERM "$pid" >/dev/null 2>&1 || true
@@ -4592,7 +4963,6 @@ cleanup_dhcp_clients_and_ports() {
             sudo ip link delete dev "$link" || failed=true
         fi
     done
-    restore_client_access_ports || failed=true
     [[ "$failed" == false ]]
 }
 
@@ -4951,7 +5321,7 @@ assert_vlan_on_switches() {
 }
 
 snapshot_switch_vlan_state() {
-    local switch bridge_state reserved_state rows_file
+    local switch bridge_state reserved_state switchd_reserved_state rows_file
     rows_file="$TEMP_DIR/switch-vlan-snapshot.jsonl"
     SWITCH_VLAN_SNAPSHOT_FILE="$TEMP_DIR/switch-vlan-snapshot.json"
     : >"$rows_file"
@@ -4961,9 +5331,14 @@ snapshot_switch_vlan_state() {
             || die "Could not read VLAN state from Cumulus switch ${switch}"
         reserved_state="$(switch_exec "$switch" nv show system global reserved vlan --output json)" \
             || die "Could not read reserved VLAN ranges from Cumulus switch ${switch}"
+        switchd_reserved_state="$(switch_exec "$switch" awk \
+            '/^[[:space:]]*resv_vlan_range[[:space:]]*=/ { print }' \
+            /etc/cumulus/switchd.conf)" \
+            || die "Could not read switchd reserved VLAN range from Cumulus switch ${switch}"
         jq -nc --arg name "$switch" --arg bridge "$bridge_state" \
-            --arg reserved "$reserved_state" \
-            '{name:$name,bridge_vlan_output:$bridge,reserved_vlan_output:$reserved}' >>"$rows_file"
+            --arg reserved "$reserved_state" --arg switchd_reserved "$switchd_reserved_state" \
+            '{name:$name,bridge_vlan_output:$bridge,reserved_vlan_output:$reserved,switchd_reserved_vlan_output:$switchd_reserved}' \
+            >>"$rows_file"
     done < <(jq -r '.switches[].name' "$SWITCH_MANIFEST_FILE")
     jq -s . "$rows_file" >"$TEMP_DIR/switch-vlan-snapshot-input.json"
     OSAC_REPO_ROOT="$REPO_ROOT" python3 "$DHCP_CLIENT_HELPER" \
@@ -4971,7 +5346,7 @@ snapshot_switch_vlan_state() {
         --output "$SWITCH_VLAN_SNAPSHOT_FILE" \
         || die "Could not validate the baseline Cumulus VLAN snapshot"
     chmod 0600 "$SWITCH_VLAN_SNAPSHOT_FILE"
-    info "Captured existing VLAN memberships and NVUE reserved ranges from every configured switch."
+    info "Captured switch VLAN memberships and NVUE/switchd reserved ranges."
 }
 
 assert_new_vlans_avoid_baseline() {
@@ -5182,6 +5557,7 @@ create_external_ip_pool() {
     local list_error="${TEMP_DIR}/external-ip-pool-preflight.error.json"
     local existing_count
 
+    resolve_external_ip_pool_cidr
     jq -n --arg name "$EXTERNAL_IP_POOL_NAME" --arg cidr "$EXTERNAL_IP_POOL_CIDR" \
         '{object:{metadata:{name:$name,tenant:"shared"},spec:{cidrs:[$cidr],ipFamily:"IP_FAMILY_IPV4"}}}' \
         >"$request_file" || die "Could not write ExternalIPPool Create request"
@@ -5192,7 +5568,9 @@ create_external_ip_pool() {
         cat "$list_error" >&2
         die "Could not check whether the generated ExternalIPPool name is already in use"
     fi
-    existing_count="$(jq -er '.items | length' "$list_response")" \
+    list_json="$(external_ip_pool_list_items "$list_response")" \
+        || die "Private Fulfillment List returned an invalid ExternalIPPool response"
+    existing_count="$(jq -er 'length' <<<"$list_json")" \
         || die "Private Fulfillment List returned an invalid ExternalIPPool response"
     [[ "$existing_count" == 0 ]] \
         || die "Generated ExternalIPPool name ${EXTERNAL_IP_POOL_NAME} already exists"
@@ -5454,7 +5832,7 @@ FIRST_TRANSIT_CIDR="$(jq -r '.transit.cidr' <<<"$FIRST_ENTRY")"
 resolve_test_subnet_cidrs "$VIRTUAL_NETWORK_IPV4_CIDR" "$FIRST_TRANSIT_CIDR"
 printf 'test Subnet CIDRs: %s %s\n' "$SUBNET_ONE_IPV4_CIDR" "$SUBNET_TWO_IPV4_CIDR"
 snapshot_switch_vlan_state
-snapshot_client_access_ports
+assert_provider_key_survived "switch VLAN snapshot"
 
 SUBNET_ONE_OUTPUT="${TEMP_DIR}/create-subnet-one.out"
 SUBNET_TWO_OUTPUT="${TEMP_DIR}/create-subnet-two.out"
@@ -5503,12 +5881,15 @@ SECOND_SUBNET_VLAN_INTERFACE="$(jq -r '.vlan_interface' <<<"$SUBNET_TWO_ENTRY")"
 
 info "Attaching three real DHCP clients to the two sibling Subnets..."
 create_dhcp_client_containers
-configure_client_access_port a1 "$SUBNET_ONE_VLAN_ID"
-configure_client_access_port a2 "$SUBNET_ONE_VLAN_ID"
-configure_client_access_port b1 "$SUBNET_TWO_VLAN_ID"
+attach_client_to_subnet a1 "$SUBNET_ONE_FULFILLMENT_ID"
+attach_client_to_subnet a2 "$SUBNET_ONE_FULFILLMENT_ID"
+attach_client_to_subnet b1 "$SUBNET_TWO_FULFILLMENT_ID"
 start_dhcp_client a1
 start_dhcp_client a2
 start_dhcp_client b1
+discover_client_dhcp_lease a1
+discover_client_dhcp_lease a2
+discover_client_dhcp_lease b1
 write_client_lease_expectations \
     "a1=$SUBNET_ONE_ENTRY" "a2=$SUBNET_ONE_ENTRY" "b1=$SUBNET_TWO_ENTRY"
 assert_real_client_leases a1 a2 b1
@@ -5566,6 +5947,7 @@ SUBNET_ONE_ENTRY="$(get_subnet_state_entry "$SUBNET_ONE_K8S_UID")"
 [[ "$(jq -cS '.' <<<"$SUBNET_ONE_ENTRY")" == "$FIRST_SUBNET_ENTRY_BEFORE_RETRY" ]] \
     || die "Subnet retry did not preserve its UID-owned VLAN and DHCP state"
 for client in a1 a2 b1; do renew_dhcp_client "$client"; done
+for client in a1 a2 b1; do discover_client_dhcp_lease "$client"; done
 assert_real_client_leases a1 a2 b1
 assert_same_subnet_l2 a1 a2
 assert_client_gateway a1 "$SUBNET_ONE_ENTRY"
@@ -5616,8 +5998,9 @@ SUBNET_THREE_VLAN_INTERFACE="$(jq -r '.vlan_interface' <<<"$SUBNET_THREE_ENTRY")
     "$(jq -r '.dhcp_range_end' <<<"$SUBNET_THREE_ENTRY")" ]] \
     || die "The /30 Subnet does not provide exactly one DHCP address"
 assert_new_vlans_avoid_baseline "$SUBNET_ONE_VLAN_ID" "$SUBNET_THREE_VLAN_ID"
-configure_client_access_port b1 "$SUBNET_THREE_VLAN_ID"
+attach_client_to_subnet b1 "$SUBNET_THREE_FULFILLMENT_ID"
 start_dhcp_client b1
+discover_client_dhcp_lease b1
 write_client_lease_expectations "b1=$SUBNET_THREE_ENTRY"
 assert_real_client_leases b1
 [[ "$(jq -r '.address' "$TEMP_DIR/client-b1.lease.json")" == \
@@ -5658,6 +6041,8 @@ assert_baseline_state_unchanged
 run_full_suite() {
 info "Creating and verifying one shared IPv4 ExternalIPPool through Fulfillment..."
 create_external_ip_pool
+info "Running ExternalIP allocate, retry, release, and pool-capacity checks..."
+run_external_ip_lifecycle
 
 info "Submitting two overlapping VirtualNetwork requests concurrently through Fulfillment..."
 CREATE_ONE_OUTPUT="${TEMP_DIR}/create-one.out"
@@ -5685,6 +6070,7 @@ SECOND_FULFILLMENT_ID="$(cat "${CREATE_TWO_OUTPUT}.id")"
 
 wait_for_virtual_network_ready "$FIRST_FULFILLMENT_ID"
 wait_for_virtual_network_ready "$SECOND_FULFILLMENT_ID"
+assert_provider_key_survived "concurrent VirtualNetwork provisioning"
 FIRST_CR="$(virtual_network_cr_json "$FIRST_FULFILLMENT_ID")"
 SECOND_CR="$(virtual_network_cr_json "$SECOND_FULFILLMENT_ID")"
 FIRST_K8S_UID="$(jq -r '.metadata.uid' <<<"$FIRST_CR")"
@@ -5804,6 +6190,9 @@ run_external_ip_suite() {
     assert_baseline_state_unchanged
 }
 
+# Phase 5 starts only after provider access and one-time lab trunk setup pass.
+step "STEP 5 OF 5: Running the ${VLAN_E2E_SUITE} E2E suite"
+
 # Preserve the full pre-test JSON snapshot. Only the UIDs created by this run
 # are asserted or removed; any unrelated node state remains untouched.
 if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
@@ -5833,12 +6222,12 @@ HOST_IP_FORWARDING_AFTER="$(netnode sysctl -n net.ipv4.ip_forward)"
     || die "The AgentlessNet operations changed the test node's forwarding sysctl"
 
 if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
-    cleanup_dhcp_clients_and_ports \
-        || die "Could not remove run-owned DHCP client containers or restore access-port snapshots"
+    cleanup_dhcp_clients_and_attachments \
+        || die "Could not offboard simulated BMIs or remove run-owned DHCP client links"
 fi
 case "$VLAN_E2E_SUITE" in
     full)
-        info "Existing-lab AgentlessNet E2E passed: ExternalIPPool create/delete, overlapping VirtualNetworks, VN and Subnet retries, internal VLAN exclusion, real DHCP clients and leases, gateway and same-Subnet L2 traffic across leaves, DHCP service restart, /30 lease, peer-preserving lifecycle, and client/port cleanup."
+        info "Existing-lab AgentlessNet E2E passed: ExternalIPPool and ExternalIP allocation/retry/release, overlapping VirtualNetworks, VN and Subnet retries, internal VLAN exclusion, AAP BMI attachment and lease lookup for real DHCP clients, gateway and same-Subnet L2 traffic across leaves, DHCP service restart, /30 lease, peer-preserving lifecycle, and BMI offboarding."
         ;;
     virtual-network)
         info "VirtualNetwork-only E2E passed: one VN was created, verified, deleted, and cleaned up."
