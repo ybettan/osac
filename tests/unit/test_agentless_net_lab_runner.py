@@ -1068,9 +1068,11 @@ oc() {{
 python3() {{
     [[ "$1" == "$AAP_JOBS_HELPER" && "$2" == configure-k8s-credential ]]
     [[ "$AAP_API_TOKEN" == operator-api-token ]]
+    [[ " $* " == *"--job-template osac-move-network-attachment"* ]]
+    [[ " $* " == *"--job-template osac-query-dhcp-lease"* ]]
     [[ "$(<"$TEMP_DIR/aap-subnet-reader.token")" == service-account-token ]]
     [[ "$(<"$TEMP_DIR/aap-subnet-reader-ca.pem")" == test-ca ]]
-    printf '{{"template_id":12,"credential_id":55,"credential_type_id":44}}\\n'
+    printf '{{"template_ids":[12,13],"credential_id":55,"credential_type_id":44}}\\n'
 }}
 {helper}
 configure_aap_subnet_reader
@@ -1116,8 +1118,10 @@ oc() {{
 python3() {{
     [[ "$1" == "$AAP_JOBS_HELPER" && "$2" == cleanup-k8s-credential ]]
     [[ "$AAP_API_TOKEN" == operator-api-token ]]
+    [[ " $* " == *"--job-template osac-move-network-attachment"* ]]
+    [[ " $* " == *"--job-template osac-query-dhcp-lease"* ]]
     printf 'AAP credential removed\\n' >>"$EVENTS"
-    printf '{{"status":"removed"}}\\n'
+    printf '{{"template_ids":[12,13],"status":"removed"}}\\n'
 }}
 {helper}
 cleanup_aap_subnet_reader
@@ -1193,15 +1197,18 @@ on_exit
     assert failure_events.read_text().splitlines() == ["provider cleanup"]
 
 
-def test_provider_cleanup_keeps_aap_ca_until_subnet_credential_cleanup(tmp_path):
+def test_provider_cleanup_keeps_aap_ca_until_subnet_credential_cleanup(tmp_path: Path) -> None:
     helper = function_block("cleanup_created_virtual_networks", "export_dhcp_debug_artifacts")
-    ca_file = tmp_path / "aap-api-ca.pem"
+    temp_dir = tmp_path / "runner-temp"
+    temp_dir.mkdir()
+    ca_file = temp_dir / "aap-api-ca.pem"
     ca_file.write_text("test CA")
     script = f"""
 set -euo pipefail
 AAP_SUBNET_READER_SETUP_ATTEMPTED=true
 CLI_CA_FILE={shlex.quote(str(ca_file))}
-TEMP_DIR=
+AAP_API_CA_FILE={shlex.quote(str(ca_file))}
+TEMP_DIR={shlex.quote(str(temp_dir))}
 RUN_DIR_CREATED=false
 GENERATED_CLI_CONFIG=false
 GENERATED_CLI_BIN=false
@@ -1225,6 +1232,41 @@ info() {{ :; }}
 {helper}
 cleanup_created_virtual_networks 1
 [[ -f "$CLI_CA_FILE" ]]
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert temp_dir.is_dir()
+
+
+def test_repeated_dhcp_lease_queries_use_distinct_private_result_files(tmp_path: Path) -> None:
+    helper = function_block("discover_client_dhcp_lease", "offboard_client_from_subnet")
+    (tmp_path / "client-a1.mac").write_text("02:00:00:00:00:01\n")
+    (tmp_path / "client-a1.lease.json").write_text('{"address":"10.0.0.2"}\n')
+    capture = tmp_path / "result-paths.txt"
+    script = f"""
+set -euo pipefail
+TEMP_DIR={shlex.quote(str(tmp_path))}
+AAP_JOB_RESULT_SEQUENCE=0
+CAPTURE={shlex.quote(str(capture))}
+declare -A CLIENT_ATTACHMENT_SUBNET=([a1]=11234567-89ab-cdef-0123-456789abcdef)
+declare -A CLIENT_ATTACHMENT_ACTIVE=([a1]=true)
+write_client_bmi_extra_vars() {{ :; }}
+run_agentless_net_aap_job() {{
+    [[ "$1" == query-dhcp-lease ]]
+    printf '%s\\n' "$3" >>"$CAPTURE"
+    printf '%s\\n' '{{"artifacts":{{"leases":[{{"subnet_ref":"11234567-89ab-cdef-0123-456789abcdef","interface":"eth0","mac_address":"02:00:00:00:00:01","ip_address":"10.0.0.2"}}]}}}}' >"$3"
+}}
+info() {{ :; }}
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+{helper}
+discover_client_dhcp_lease a1
+discover_client_dhcp_lease a1
+[[ "$(wc -l <"$CAPTURE")" -eq 2 ]]
+result_one="$(sed -n '1p' "$CAPTURE")"
+result_two="$(sed -n '2p' "$CAPTURE")"
+[[ "$result_one" != "$result_two" ]]
+[[ -s "$result_one" && -s "$result_two" ]]
 """
     result = run_bash(tmp_path, script)
 
@@ -1283,6 +1325,7 @@ def test_client_attachment_is_idempotent_and_offboard_reuses_bmi_uid(tmp_path):
     script = f"""
 set -euo pipefail
 TEMP_DIR={shlex.quote(str(tmp_path))}
+AAP_JOB_RESULT_SEQUENCE=0
 OSAC_NAMESPACE=osac-e2e-ci
 OSAC_TENANT=osac-e2e-ci
 declare -A CLIENT_ATTACHMENT_ACTIVE=()
@@ -1296,6 +1339,7 @@ run_agentless_net_aap_job() {{
     [[ "$suffix" == move-network-attachment ]]
     JOB_CALLS=$((JOB_CALLS + 1))
     cp "$vars" "$TEMP_DIR/job-$JOB_CALLS.json"
+    printf '%s\\n' "$output" >>"$TEMP_DIR/result-paths.txt"
     printf '{{"job_id":%d,"status":"successful","artifacts":{{}}}}\\n' "$JOB_CALLS" >"$output"
 }}
 info() {{ :; }}
@@ -1309,6 +1353,10 @@ attach_client_to_subnet a1 11234567-89ab-cdef-0123-456789abcdef
 offboard_client_from_subnet a1
 [[ "$JOB_CALLS" == 2 && "${{CLIENT_ATTACHMENT_ACTIVE[a1]}}" == false ]]
 [[ -z "${{CLIENT_BMI_UID[a1]:-}}" && -z "${{CLIENT_ATTACHMENT_SUBNET[a1]:-}}" ]]
+attach_client_to_subnet a1 11234567-89ab-cdef-0123-456789abcdef
+[[ "$JOB_CALLS" == 3 && "${{CLIENT_ATTACHMENT_ACTIVE[a1]}}" == true ]]
+[[ "${{CLIENT_BMI_UID[a1]}}" != "$first_uid" ]]
+[[ "$(sort -u "$TEMP_DIR/result-paths.txt" | wc -l)" == 3 ]]
 jq -e --arg uid "$first_uid" '
   .osac_job_vars.resource.metadata.uid == $uid
   and .osac_job_vars.resource.metadata.deletionTimestamp != null
@@ -1536,3 +1584,171 @@ def test_full_suite_runs_external_ip_lifecycle_before_virtual_networks():
 
     assert suite.index("create_external_ip_pool") < suite.index("run_external_ip_lifecycle")
     assert suite.index("run_external_ip_lifecycle") < suite.index("create_virtual_network")
+
+
+def test_suite_flags_select_the_same_scope_for_run_and_cleanup(tmp_path):
+    start = SOURCE.index("SUITE_SELECTED=false")
+    end = SOURCE.index('\ncase "$VLAN_E2E_SUITE" in', start)
+    parser = SOURCE[start:end]
+
+    def parse(args):
+        quoted_args = " ".join(shlex.quote(arg) for arg in args)
+        script = (
+            "set -euo pipefail\n"
+            "VLAN_E2E_SUITE=full\n"
+            "CLEANUP_MODE=false\n"
+            "usage() { :; }\n"
+            "argument_error() { printf 'ERROR: %s\\n' \"$1\" >&2; exit 2; }\n"
+            f"set -- {quoted_args}\n"
+            f"{parser}\n"
+            "printf 'cleanup=%s suite=%s\\n' \"$CLEANUP_MODE\" \"$VLAN_E2E_SUITE\"\n"
+        )
+        return run_bash(tmp_path, script)
+
+    result = parse(["--subnet-dhcp"])
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "cleanup=false suite=subnet-dhcp"
+
+    result = parse(["--cleanup", "--subnet-dhcp"])
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "cleanup=true suite=subnet-dhcp"
+
+    result = parse(["--virtual-network"])
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "cleanup=false suite=virtual-network"
+
+    result = parse(["--cleanup", "--virtual-network"])
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "cleanup=true suite=virtual-network"
+
+    result = parse(["--external-ip"])
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "cleanup=false suite=external-ip"
+
+    result = parse(["--cleanup", "--external-ip"])
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "cleanup=true suite=external-ip"
+
+    result = parse(["--cleanup", "--suite", "external-ip-pool"])
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "cleanup=true suite=external-ip-pool"
+
+    result = parse(["--external-ip-pool"])
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "cleanup=false suite=external-ip-pool"
+
+    result = parse(["--cleanup", "--external-ip-pool"])
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "cleanup=true suite=external-ip-pool"
+
+    result = parse(["--subnet"])
+    assert result.returncode == 2
+    assert "unexpected argument: --subnet" in result.stderr
+
+
+def test_cleanup_name_filter_scopes_to_runner_prefix_and_explicit_network_name(tmp_path):
+    helper = function_block("cleanup_name_filter", "cleanup_array_json")
+    script = (
+        "set -euo pipefail\n"
+        f"{helper}\n"
+        "cleanup_name_filter agentless-smoke-vn- custom-vn\n"
+    )
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == (
+        '(this.metadata.name.startsWith("agentless-smoke-vn-") || '
+        'this.metadata.name.startsWith("custom-vn"))'
+    )
+
+
+def test_cleanup_subnet_parent_id_accepts_fulfillment_and_kubernetes_field_names(tmp_path):
+    helper = function_block("cleanup_subnet_parent_id", "cleanup_name_filter")
+    fixtures = (
+        {"spec": {"virtual_network": {"id": "fulfillment-vn"}}},
+        {"spec": {"virtualNetwork": "legacy-vn"}},
+    )
+    calls = "\n".join(
+        f"cleanup_subnet_parent_id {shlex.quote(json.dumps(fixture))}"
+        for fixture in fixtures
+    )
+    result = run_bash(tmp_path, f"set -euo pipefail\n{helper}\n{calls}\n")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["fulfillment-vn", "legacy-vn"]
+
+
+def test_cleanup_mode_is_standalone_and_skips_deployment_stages():
+    setup_start = SOURCE.index(
+        'if [[ "$CLEANUP_MODE" != true ]]; then\n# Step 1: deploy or reuse the SNO'
+    )
+    setup_end = SOURCE.index("\nfi\n\nnetnode() {", setup_start)
+    deployment_block = SOURCE[setup_start:setup_end]
+    cleanup_start = SOURCE.index(
+        "# Standalone cleanup uses the current deployment and fabric only."
+    )
+    cleanup_end = SOURCE.index('step "STEP 5 OF 5: Running', cleanup_start)
+    cleanup_block = SOURCE[cleanup_start:cleanup_end]
+
+    for marker in (
+        'step "STEP 1 OF 5:',
+        'step "STEP 2 OF 5:',
+        'step "STEP 3 OF 5:',
+        'step "STEP 4 OF 5:',
+    ):
+        assert marker in deployment_block
+    assert "prepare_suite_cleanup" in cleanup_block
+    assert cleanup_block.index("prepare_suite_cleanup") < cleanup_block.index("exit 0")
+    assert "containerlab deploy" not in cleanup_block
+    assert "configure_containerlab_fabric" not in cleanup_block
+    assert "helm get values osac" in cleanup_block
+    assert "configure_aap_execution_environment" not in cleanup_block
+    assert 'step "STEP 5 OF 5: Running' in SOURCE
+    assert 'IMAGE_SOURCE_COMMIT="$RUNTIME_SOURCE_COMMIT"' in SOURCE
+
+
+def test_cleanup_provider_verifier_resolves_dynamic_state_collections():
+    verifier = function_block(
+        "verify_suite_cleanup_provider_state", "cleanup_created_virtual_networks"
+    )
+
+    assert "baseline_uids=\"$(jq -r --arg collection \"$collection\"" in verifier
+    assert "if (.[$collection] | type) != \"array\" then error" in verifier
+    assert '".[$collection][].uid"' not in verifier
+
+
+def test_cleanup_supervisor_verifier_treats_no_such_process_as_absent(tmp_path):
+    helper = function_block(
+        "supervisor_service_status_is_absent", "verify_suite_cleanup_provider_state"
+    )
+    script = (
+        "set -euo pipefail\n"
+        f"{helper}\n"
+        "supervisor_service_status_is_absent agentless-dhcp-test "
+        '"agentless-dhcp-test: ERROR (no such process)"\n'
+        "if supervisor_service_status_is_absent agentless-dhcp-test "
+        '"agentless-dhcp-test: STOPPED"; then exit 1; fi\n'
+    )
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert "service_file=\"/etc/agentless-net/supervisor.d/${uid}.ini\"" in SOURCE
+
+
+def test_standalone_subnet_cleanup_offboards_saved_test_bmis_before_removing_clients():
+    helper = function_block("cleanup_interrupted_dhcp_clients", "prepare_suite_cleanup")
+    cleanup = function_block("prepare_suite_cleanup", "verify_suite_cleanup_provider_state")
+    on_exit_start = SOURCE.index("on_exit() {")
+    on_exit_end = SOURCE.index("\n}\ntrap on_exit EXIT", on_exit_start) + 2
+    on_exit = SOURCE[on_exit_start:on_exit_end]
+
+    assert helper.index("CLEANUP_CLIENTS_COMPLETE=false") < helper.index("offboard_client_from_subnet")
+    assert helper.index("offboard_client_from_subnet") < helper.index('docker rm -f "$container"')
+    assert "osac.openshift.io/owner-reference\"] == \"vlan-e2e-run\"" in helper
+    assert 'candidate_subnet" == "$subnet_ref"' in helper
+    assert 'switch_exec "$CLIENT_SWITCH" bridge -j vlan show dev "$CLIENT_SWITCH_PORT"' in helper
+    assert 'index("Egress Untagged") != null' in helper
+    assert cleanup.index("CLEANUP_DISCOVERY_COMPLETE=true") < cleanup.index(
+        "cleanup_interrupted_dhcp_clients"
+    )
+    assert '"${CLEANUP_CLIENTS_COMPLETE:-true}" != true' in on_exit

@@ -36,11 +36,7 @@ class Controller:
             raise AAPError("AAP CA bundle could not be loaded") from error
 
     def request(
-        self,
-        endpoint: str,
-        *,
-        body: dict[str, Any] | None = None,
-        method: str | None = None,
+        self, endpoint: str, *, body: dict[str, Any] | None = None, method: str | None = None
     ) -> dict[str, Any]:
         url = endpoint if endpoint.startswith("https://") else self.base + endpoint
         data = None if body is None else json.dumps(body).encode("utf-8")
@@ -85,13 +81,7 @@ K8S_CREDENTIAL_INPUTS: dict[str, Any] = {
     "fields": [
         {"id": "api_host", "label": "Kubernetes API host", "type": "string"},
         {"id": "api_token", "label": "Kubernetes API token", "type": "string", "secret": True},
-        {
-            "id": "ca_bundle",
-            "label": "Kubernetes API CA bundle",
-            "type": "string",
-            "secret": True,
-            "multiline": True,
-        },
+        {"id": "ca_bundle", "label": "Kubernetes API CA bundle", "type": "string", "secret": True, "multiline": True},
     ],
     "required": ["api_host", "api_token", "ca_bundle"],
 }
@@ -121,12 +111,22 @@ def configure_k8s_credential(args: argparse.Namespace) -> dict[str, Any]:
         raise AAPError("Kubernetes API host must use HTTPS")
 
     controller = Controller()
-    template_ref = controller.list_named("/job_templates/", args.job_template)
-    template_id = template_ref.get("id")
-    template = controller.request(f"/job_templates/{template_id}/")
-    organization_id = template.get("organization")
-    if not isinstance(template_id, int) or not isinstance(organization_id, int):
-        raise AAPError(f"AAP job template {args.job_template} has no organization")
+    template_ids: list[int] = []
+    organization_ids: set[int] = set()
+    for template_name in args.job_template:
+        template_ref = controller.list_named("/job_templates/", template_name)
+        template_id = template_ref.get("id")
+        if not isinstance(template_id, int):
+            raise AAPError(f"AAP job template {template_name} has no ID")
+        template = controller.request(f"/job_templates/{template_id}/")
+        organization_id = template.get("organization")
+        if not isinstance(organization_id, int):
+            raise AAPError(f"AAP job template {template_name} has no organization")
+        template_ids.append(template_id)
+        organization_ids.add(organization_id)
+    if len(organization_ids) != 1:
+        raise AAPError("AAP job templates do not share one organization")
+    organization_id = next(iter(organization_ids))
 
     credential_types = controller.list_named_items("/credential_types/", args.credential_type_name)
     if len(credential_types) > 1:
@@ -165,11 +165,7 @@ def configure_k8s_credential(args: argparse.Namespace) -> dict[str, Any]:
         "description": K8S_CREDENTIAL_DESCRIPTION,
         "credential_type": credential_type_id,
         "organization": organization_id,
-        "inputs": {
-            "api_host": args.api_host,
-            "api_token": api_token,
-            "ca_bundle": ca_bundle,
-        },
+        "inputs": {"api_host": args.api_host, "api_token": api_token, "ca_bundle": ca_bundle},
     }
     credential_created = not credential_matches
     if credential_created:
@@ -178,23 +174,21 @@ def configure_k8s_credential(args: argparse.Namespace) -> dict[str, Any]:
     else:
         credential_id = credential_matches[0].get("id")
         existing = controller.request(f"/credentials/{credential_id}/")
-        if (
-            existing.get("credential_type") != credential_type_id
-            or existing.get("organization") != organization_id
-        ):
+        if existing.get("credential_type") != credential_type_id or existing.get("organization") != organization_id:
             raise AAPError("Existing OSAC VLAN E2E credential has an unexpected owner or type")
         controller.request(f"/credentials/{credential_id}/", body=credential_body, method="PUT")
     if not isinstance(credential_id, int):
         raise AAPError("AAP did not return a Kubernetes credential ID")
 
-    relation = f"/job_templates/{template_id}/credentials/"
-    associated = controller.request(relation)
-    associated_ids = {item.get("id") for item in associated.get("results", []) if isinstance(item, dict)}
-    if credential_id not in associated_ids:
-        controller.request(relation, body={"id": credential_id})
+    for template_id in template_ids:
+        relation = f"/job_templates/{template_id}/credentials/"
+        associated = controller.request(relation)
+        associated_ids = {item.get("id") for item in associated.get("results", []) if isinstance(item, dict)}
+        if credential_id not in associated_ids:
+            controller.request(relation, body={"id": credential_id})
 
     return {
-        "template_id": template_id,
+        "template_ids": template_ids,
         "credential_id": credential_id,
         "credential_type_id": credential_type_id,
         "credential_created": credential_created,
@@ -204,24 +198,26 @@ def configure_k8s_credential(args: argparse.Namespace) -> dict[str, Any]:
 
 def cleanup_k8s_credential(args: argparse.Namespace) -> dict[str, Any]:
     controller = Controller()
-    template_ref = controller.list_named("/job_templates/", args.job_template)
-    template_id = template_ref.get("id")
-    if not isinstance(template_id, int):
-        raise AAPError(f"AAP job template {args.job_template} has no ID")
+    template_ids: list[int] = []
+    for template_name in args.job_template:
+        template_ref = controller.list_named("/job_templates/", template_name)
+        template_id = template_ref.get("id")
+        if not isinstance(template_id, int):
+            raise AAPError(f"AAP job template {template_name} has no ID")
+        template_ids.append(template_id)
     matches = controller.list_named_items("/credentials/", args.credential_name)
     if not matches:
-        return {"template_id": template_id, "status": "already-removed"}
+        return {"template_ids": template_ids, "status": "already-removed"}
     if len(matches) != 1:
         raise AAPError("AAP has duplicate OSAC VLAN E2E Kubernetes credentials")
     credential_id = matches[0].get("id")
     if not isinstance(credential_id, int):
         raise AAPError("AAP Kubernetes credential has no ID")
     credential = controller.request(f"/credentials/{credential_id}/")
-    if (
-        credential.get("name") != args.credential_name
-        or credential.get("description")
-        not in {K8S_CREDENTIAL_DESCRIPTION, K8S_CREDENTIAL_LEGACY_DESCRIPTION}
-    ):
+    if credential.get("name") != args.credential_name or credential.get("description") not in {
+        K8S_CREDENTIAL_DESCRIPTION,
+        K8S_CREDENTIAL_LEGACY_DESCRIPTION,
+    }:
         raise AAPError("Refusing to remove an unexpected AAP Kubernetes credential")
     credential_type_id = credential.get("credential_type")
     credential_type = controller.request(f"/credential_types/{credential_type_id}/")
@@ -231,13 +227,14 @@ def cleanup_k8s_credential(args: argparse.Namespace) -> dict[str, Any]:
     ):
         raise AAPError("Refusing to remove an unexpected AAP Kubernetes credential type")
 
-    relation = f"/job_templates/{template_id}/credentials/"
-    associated = controller.request(relation)
-    associated_ids = {item.get("id") for item in associated.get("results", []) if isinstance(item, dict)}
-    if credential_id in associated_ids:
-        controller.request(relation, body={"id": credential_id, "disassociate": True})
+    for template_id in template_ids:
+        relation = f"/job_templates/{template_id}/credentials/"
+        associated = controller.request(relation)
+        associated_ids = {item.get("id") for item in associated.get("results", []) if isinstance(item, dict)}
+        if credential_id in associated_ids:
+            controller.request(relation, body={"id": credential_id, "disassociate": True})
     controller.request(f"/credentials/{credential_id}/", method="DELETE")
-    return {"template_id": template_id, "credential_id": credential_id, "status": "removed"}
+    return {"template_ids": template_ids, "credential_id": credential_id, "status": "removed"}
 
 
 def launch(args: argparse.Namespace) -> dict[str, Any]:
@@ -332,14 +329,14 @@ def main() -> int:
     launch_parser.add_argument("--ee-image", required=True)
     launch_parser.add_argument("--timeout", type=int, default=1200)
     configure_parser = subparsers.add_parser("configure-k8s-credential")
-    configure_parser.add_argument("--job-template", required=True)
+    configure_parser.add_argument("--job-template", action="append", required=True)
     configure_parser.add_argument("--credential-name", required=True)
     configure_parser.add_argument("--credential-type-name", required=True)
     configure_parser.add_argument("--api-host", required=True)
     configure_parser.add_argument("--token-file", required=True)
     configure_parser.add_argument("--ca-file", required=True)
     cleanup_parser = subparsers.add_parser("cleanup-k8s-credential")
-    cleanup_parser.add_argument("--job-template", required=True)
+    cleanup_parser.add_argument("--job-template", action="append", required=True)
     cleanup_parser.add_argument("--credential-name", required=True)
     cleanup_parser.add_argument("--credential-type-name", required=True)
     args = parser.parse_args()
