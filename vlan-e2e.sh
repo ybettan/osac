@@ -11,10 +11,11 @@ set -euo pipefail
 umask 077
 
 VLAN_E2E_SUITE="full"
+CLEANUP_MODE=false
 
 usage() {
     cat <<'USAGE'
-Usage: bash ./vlan-e2e.sh [--suite SUITE]
+Usage: bash ./vlan-e2e.sh [--suite SUITE] [--cleanup]
 
 Suites:
   full              Run the complete ExternalIPPool/ExternalIP, VirtualNetwork, and Subnet/DHCP E2E (default).
@@ -28,16 +29,24 @@ fabric, initialize the declared trunks, and run the selected checks. Set
 CUMULUS_VERSION and CUMULUS_VX_IMAGE to the exact guest
 release and its Boxen image. CUMULUS_LAB_ADMIN_KEY defaults to the ignored
 local lab key path; VLAN_E2E_RUN_DIR optionally retains sanitized run evidence.
+Use --cleanup with --suite SUITE (or a suite shorthand) as a standalone command
+to remove only test-named resources for that suite through Fulfillment. It
+uses the existing lab and exits without deploying or initializing it.
 The runner requires a compatible AgentlessNet schema V1 database and preserves
 any incompatible existing state. Keep the AgentlessNet state schema at V1 until
 OSAC-5528 is complete.
 
 Examples:
   bash ./vlan-e2e.sh
-  bash ./vlan-e2e.sh --suite virtual-network
-  bash ./vlan-e2e.sh --suite subnet-dhcp
-  bash ./vlan-e2e.sh --suite external-ip-pool
-  bash ./vlan-e2e.sh --suite external-ip
+  bash ./vlan-e2e.sh --virtual-network
+  bash ./vlan-e2e.sh --subnet-dhcp
+  bash ./vlan-e2e.sh --external-ip-pool
+  bash ./vlan-e2e.sh --external-ip
+  bash ./vlan-e2e.sh --cleanup --suite full
+  bash ./vlan-e2e.sh --cleanup --subnet-dhcp
+  bash ./vlan-e2e.sh --cleanup --virtual-network
+  bash ./vlan-e2e.sh --cleanup --external-ip-pool
+  bash ./vlan-e2e.sh --cleanup --external-ip
 USAGE
 }
 
@@ -54,6 +63,11 @@ while (($# > 0)); do
             usage
             exit 0
             ;;
+        --cleanup)
+            [[ "$CLEANUP_MODE" == false ]] || argument_error "--cleanup may be specified only once"
+            CLEANUP_MODE=true
+            shift
+            ;;
         --suite)
             [[ "$SUITE_SELECTED" == false ]] || argument_error "--suite may be specified only once"
             (($# >= 2)) || argument_error "--suite requires a value"
@@ -65,6 +79,12 @@ while (($# > 0)); do
             esac
             SUITE_SELECTED=true
             shift 2
+            ;;
+        --full|--virtual-network|--subnet-dhcp|--external-ip-pool|--external-ip)
+            [[ "$SUITE_SELECTED" == false ]] || argument_error "a suite may be specified only once"
+            VLAN_E2E_SUITE="${1#--}"
+            SUITE_SELECTED=true
+            shift
             ;;
         *) argument_error "unexpected argument: $1" ;;
     esac
@@ -232,6 +252,7 @@ MGMT_DHCP_RANGES=""
 AAP_NETWORKING_SECRET="network-fulfillment-ig"
 AAP_EXECUTION_ENVIRONMENT_NAME="${AAP_EXECUTION_ENVIRONMENT_NAME:-osac-ee}"
 AAP_JOB_TIMEOUT="${AAP_JOB_TIMEOUT:-1800}"
+AAP_JOB_RESULT_SEQUENCE=0
 AAP_SSH_KEY_SECRET_KEY="AGENTLESS_NET_SSH_PRIVATE_KEY"
 AAP_SSH_KEY_SECRET_ANNOTATION="osac.openshift.io/agentless-vn-ssh"
 AAP_SUBNET_READER_NAME="vlan-e2e-subnet-reader"
@@ -239,6 +260,7 @@ AAP_SUBNET_LOCK_NAME="vlan-e2e-subnet-lock"
 AAP_SUBNET_READER_CREDENTIAL_TYPE="OSAC VLAN E2E Kubernetes API"
 AAP_SUBNET_READER_CREDENTIAL="vlan-e2e-subnet-reader"
 AAP_SUBNET_READER_SETUP_ATTEMPTED=false
+VIRTUAL_NETWORK_NAME_INPUT="${VIRTUAL_NETWORK_NAME:-}"
 VIRTUAL_NETWORK_NAME="${VIRTUAL_NETWORK_NAME:-agentless-smoke-vn-$(date -u +%Y%m%d%H%M%S)}"
 PEER_VIRTUAL_NETWORK_NAME="${PEER_VIRTUAL_NETWORK_NAME:-${VIRTUAL_NETWORK_NAME}-peer}"
 VIRTUAL_NETWORK_IPV4_CIDR="${VIRTUAL_NETWORK_IPV4_CIDR:-10.250.0.0/16}"
@@ -268,6 +290,20 @@ GENERATED_CLI_BIN=false
 GENERATED_CLI_CONFIG=false
 CREATED_IDS=()
 CREATED_SUBNET_IDS=()
+CREATED_EXTERNAL_IP_IDS=()
+CLEANUP_VN_UIDS=()
+CLEANUP_SUBNET_UIDS=()
+CLEANUP_POOL_UIDS=()
+CLEANUP_POOL_IDS=()
+CLEANUP_POOL_CIDRS=()
+CLEANUP_POOL_EIP_IDS_JSON=()
+CLEANUP_EIP_UIDS=()
+CLEANUP_EIP_IDS=()
+CLEANUP_PENDING_POOL_IDS=()
+CLEANUP_STATE_FILE=""
+CLEANUP_DISCOVERY_COMPLETE=false
+CLEANUP_CLIENTS_COMPLETE=true
+STALE_RECOVERY_DIRS=()
 EXTERNAL_IP_POOL_ID=""
 EXTERNAL_IP_POOL_K8S_UID=""
 EXTERNAL_IP_POOL_INITIAL_ENTRY=""
@@ -276,7 +312,6 @@ EXTERNAL_IP_POOL_DELETE_AAP_JOB_ID=""
 EXTERNAL_IP_POOL_PENDING_CLEANUP=false
 EXTERNAL_IP_POOL_INITIAL_ALLOCATED=0
 EXTERNAL_IP_POOL_INITIAL_AVAILABLE=0
-CREATED_EXTERNAL_IP_IDS=()
 BASELINE_STATE_FILE=""
 CURRENT_STATE_FILE=""
 SWITCH_MANIFEST_FILE=""
@@ -707,28 +742,35 @@ restore_netnode_download_network() {
 prepare_containerlab_net_node() {
     local public_key authorized_exists package_log bridge_status
     ensure_aap_ssh_key
-    info "Installing provider tools and key-only SSH access on the Containerlab network node..."
-    package_log="$TEMP_DIR/containerlab-package-install.log"
-    if ! docker exec "$CONTAINERLAB_NET_NODE" apk add --no-cache \
-        iptables iproute2 python3 openssh sudo conntrack-tools procps iputils dnsmasq supervisor >"$package_log" 2>&1; then
-        info "The isolated Containerlab network has no package-repository egress; retrying through the Docker bridge."
-        bridge_status="$(docker inspect -f '{{if index .NetworkSettings.Networks "bridge"}}true{{else}}false{{end}}' "$CONTAINERLAB_NET_NODE")" \
-            || die "Could not inspect the Containerlab node network attachments"
-        if [[ "$bridge_status" != true ]]; then
-            docker network connect \
-                --driver-opt=com.docker.network.endpoint.ifname=net-download \
-                bridge "$CONTAINERLAB_NET_NODE" >/dev/null \
-                || die "Could not temporarily connect the test network node to the Docker bridge"
-            NETNODE_DOCKER_BRIDGE_ATTACHED_BY_RUN=true
-        fi
+    if [[ "$CLEANUP_MODE" == true ]]; then
+        info "Checking existing provider tools and preparing temporary SSH access on the network node..."
+        docker exec "$CONTAINERLAB_NET_NODE" sh -c \
+            'for tool in iptables ip python3 sshd sudo conntrack dnsmasq supervisorctl; do command -v "$tool" >/dev/null || exit 1; done' \
+            || die "The existing Containerlab network node lacks provider cleanup tools; cleanup will not install packages"
+    else
+        info "Installing provider tools and key-only SSH access on the Containerlab network node..."
+        package_log="$TEMP_DIR/containerlab-package-install.log"
         if ! docker exec "$CONTAINERLAB_NET_NODE" apk add --no-cache \
             iptables iproute2 python3 openssh sudo conntrack-tools procps iputils dnsmasq supervisor >"$package_log" 2>&1; then
-            tail -n 20 "$package_log" >&2
-            restore_netnode_download_network || true
-            die "Could not install the AgentlessNet provider prerequisites on the Containerlab network node"
+            info "The isolated Containerlab network has no package-repository egress; retrying through the Docker bridge."
+            bridge_status="$(docker inspect -f '{{if index .NetworkSettings.Networks "bridge"}}true{{else}}false{{end}}' "$CONTAINERLAB_NET_NODE")" \
+                || die "Could not inspect the Containerlab node network attachments"
+            if [[ "$bridge_status" != true ]]; then
+                docker network connect \
+                    --driver-opt=com.docker.network.endpoint.ifname=net-download \
+                    bridge "$CONTAINERLAB_NET_NODE" >/dev/null \
+                    || die "Could not temporarily connect the test network node to the Docker bridge"
+                NETNODE_DOCKER_BRIDGE_ATTACHED_BY_RUN=true
+            fi
+            if ! docker exec "$CONTAINERLAB_NET_NODE" apk add --no-cache \
+                iptables iproute2 python3 openssh sudo conntrack-tools procps iputils dnsmasq supervisor >"$package_log" 2>&1; then
+                tail -n 20 "$package_log" >&2
+                restore_netnode_download_network || true
+                die "Could not install the AgentlessNet provider prerequisites on the Containerlab network node"
+            fi
+            restore_netnode_download_network \
+                || die "Could not disconnect the temporary Docker bridge from the Containerlab network node"
         fi
-        restore_netnode_download_network \
-            || die "Could not disconnect the temporary Docker bridge from the Containerlab network node"
     fi
     CONTAINERLAB_ACCESS_CONFIGURED=true
     if docker exec "$CONTAINERLAB_NET_NODE" test -f /etc/sudoers.d/osac-agentless-net; then
@@ -983,6 +1025,19 @@ ensure_containerlab_admin_nvue_key() {
         || die "The persistent administrator SSH key stopped working on ${switch} after NVUE apply"
 }
 
+assert_containerlab_admin_nvue_key() {
+    local switch="$1" key_type key_config
+    read -r key_type _ <"$CUMULUS_ADMIN_PUBLIC_KEY_FILE" \
+        || die "Could not parse the persistent Cumulus administrator public key"
+    key_config="$(switch_admin_user_exec "$switch" nv show system aaa user cumulus ssh authorized-key --output json)" \
+        || die "Could not inspect NVUE authorized keys on ${switch}"
+    jq -e --arg id "$CUMULUS_ADMIN_NVUE_KEY_ID" --arg type "$key_type" \
+        '.[$id].type == $type' <<<"$key_config" >/dev/null \
+        || die "The persistent administrator NVUE key is missing or different on ${switch}; cleanup will not modify it"
+    switch_admin_user_exec "$switch" true \
+        || die "The persistent administrator SSH key is not accepted on ${switch}"
+}
+
 install_containerlab_switch_provider_key() {
     local switch="$1" key_type="$2" key_data="$3" pending_diff key_config
     info "Installing per-run provider NVUE key on ${switch}."
@@ -1055,7 +1110,11 @@ prepare_containerlab_switches() {
         fi
         switch_admin_user_exec "$switch" id "$user" >/dev/null 2>&1 \
             || die "Cumulus switch $switch does not have its expected SSH user"
-        ensure_containerlab_admin_nvue_key "$switch"
+        if [[ "$CLEANUP_MODE" == true ]]; then
+            assert_containerlab_admin_nvue_key "$switch"
+        else
+            ensure_containerlab_admin_nvue_key "$switch"
+        fi
         install_containerlab_switch_provider_key "$switch" "$provider_key_type" "$provider_key_data"
     done < <(jq -r '.switches[].name' "$SWITCH_MANIFEST_FILE")
     while IFS= read -r switch; do
@@ -1650,6 +1709,7 @@ configure_aap_subnet_reader() {
         AAP_API_CA_FILE="$AAP_API_CA_FILE" \
         python3 "$AAP_JOBS_HELPER" configure-k8s-credential \
             --job-template "${AAP_PREFIX}-move-network-attachment" \
+            --job-template "${AAP_PREFIX}-query-dhcp-lease" \
             --credential-name "$AAP_SUBNET_READER_CREDENTIAL" \
             --credential-type-name "$AAP_SUBNET_READER_CREDENTIAL_TYPE" \
             --api-host https://kubernetes.default.svc \
@@ -1661,9 +1721,10 @@ configure_aap_subnet_reader() {
     fi
     unset token
     rm -f -- "$token_file" "$ca_file"
-    jq -e '.credential_id and .credential_type_id and .template_id' <<<"$result" >/dev/null \
+    jq -e '.credential_id and .credential_type_id and (.template_ids | length == 2)' \
+        <<<"$result" >/dev/null \
         || { printf 'ERROR: AAP did not confirm the Subnet credential association\n' >&2; return 1; }
-    info "Configured temporary Subnet and V-Net lock credentials for osac-move-network-attachment."
+    info "Configured temporary Subnet and V-Net lock credentials for the move and DHCP lease query jobs."
 }
 
 cleanup_aap_subnet_reader() {
@@ -1684,6 +1745,7 @@ cleanup_aap_subnet_reader() {
         AAP_API_CA_FILE="$AAP_API_CA_FILE" \
         python3 "$AAP_JOBS_HELPER" cleanup-k8s-credential \
             --job-template "${AAP_PREFIX}-move-network-attachment" \
+            --job-template "${AAP_PREFIX}-query-dhcp-lease" \
             --credential-name "$AAP_SUBNET_READER_CREDENTIAL" \
             --credential-type-name "$AAP_SUBNET_READER_CREDENTIAL_TYPE"; then
         unset token
@@ -2240,6 +2302,49 @@ external_ip_pool_list_items() {
         elif (.items | type) == "array" then .items
         else error("items is not an array")
         end' "$1"
+}
+
+cleanup_cli_list_json() {
+    local resource="$1" filter="$2" output
+    [[ -n "$CLI_BIN" && -x "$CLI_BIN" && -n "$CLI_CONFIG_DIR" && -d "$CLI_CONFIG_DIR" ]] \
+        || die "Fulfillment CLI is unavailable for suite cleanup"
+    output="$("$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" \
+        get "$resource" --filter "$filter" --output json)" \
+        || die "Could not list test-owned ${resource} resources for cleanup"
+    jq -ce '
+      if type == "array" then .
+      elif type == "object" and has("id") then [.]
+      else error("Fulfillment CLI returned an invalid cleanup list")
+      end' <<<"$output"
+}
+
+cleanup_subnet_parent_id() {
+    jq -er '(.spec.virtual_network // .spec.virtualNetwork) as $parent
+      | if ($parent | type) == "string" then $parent else $parent.id end' <<<"$1"
+}
+
+cleanup_name_filter() {
+    local default_prefix="$1" custom_prefix="$2"
+    python3 - "$default_prefix" "$custom_prefix" <<'PY'
+import json
+import sys
+
+prefixes = [sys.argv[1]]
+if sys.argv[2] and sys.argv[2] not in prefixes:
+    prefixes.append(sys.argv[2])
+print("(" + " || ".join(
+    "this.metadata.name.startsWith(" + json.dumps(prefix) + ")"
+    for prefix in prefixes
+) + ")")
+PY
+}
+
+cleanup_array_json() {
+    if (($# == 0)); then
+        printf '[]\n'
+    else
+        printf '%s\n' "$@" | jq -Rsc 'split("\n") | map(select(length > 0))'
+    fi
 }
 
 resolve_external_ip_pool_cidr() {
@@ -3306,6 +3411,665 @@ cleanup_created_external_ip_pool() {
         info "AAP ExternalIPPool delete job ID: ${EXTERNAL_IP_POOL_DELETE_AAP_JOB_ID}"
     fi
     EXTERNAL_IP_POOL_PENDING_CLEANUP=false
+    if [[ "${CLEANUP_MODE:-false}" == true ]]; then
+        local index
+        for index in "${!CLEANUP_PENDING_POOL_IDS[@]}"; do
+            if [[ "${CLEANUP_PENDING_POOL_IDS[$index]}" == "$EXTERNAL_IP_POOL_ID" ]]; then
+                unset 'CLEANUP_PENDING_POOL_IDS[index]'
+            fi
+        done
+    fi
+    return 0
+}
+
+cleanup_provisioning_vlan() {
+    "$AAP_DIR/.venv/bin/python" - "$TEMP_DIR/inventory.yml" <<'PY'
+import pathlib
+import sys
+import yaml
+
+inventory = yaml.safe_load(pathlib.Path(sys.argv[1]).read_text())
+value = inventory["all"]["vars"]["agentless_net_provisioning_network"]["vlan_id"]
+if not isinstance(value, int) or not 1 <= value <= 4094:
+    raise SystemExit("invalid AgentlessNet provisioning VLAN")
+print(value)
+PY
+}
+
+cleanup_interrupted_dhcp_clients() {
+    [[ "$SUITE_USES_SUBNET_DHCP" == true ]] || return 0
+
+    local all_names labeled_names container client prefix recovery_dir label_dir
+    local runner_label client_label prefix_label
+    local container_mac saved_mac attachment_file resource_json uid subnet_ref
+    local selected_subnet candidate_subnet link previous_prefix candidate
+    local switch_vlan_json provisioning_vlan
+    local duplicate
+    local -a containers=() matching_dirs=()
+    local -A selected_containers=()
+
+    CLEANUP_CLIENTS_COMPLETE=false
+    labeled_names="$(docker ps -a --filter label=io.osac.e2e.runner=vlan-e2e \
+        --format '{{.Names}}')" \
+        || die "Could not list Step 5 DHCP client containers"
+    all_names="$(docker ps -a --format '{{.Names}}')" \
+        || die "Could not inspect local containers for interrupted DHCP clients"
+    while IFS= read -r container; do
+        [[ -n "$container" ]] || continue
+        [[ -z "${selected_containers[$container]:-}" ]] || continue
+        if grep -Fxq -- "$container" <<<"$labeled_names"; then
+            selected_containers["$container"]=true
+            containers+=("$container")
+            continue
+        fi
+        if [[ "$container" =~ ^(osac5530-[0-9]{14})-(a1|a2|b1)$ ]]; then
+            selected_containers["$container"]=true
+            containers+=("$container")
+        fi
+    done <<<"$all_names"
+
+    if ((${#containers[@]} == 0)); then
+        CLEANUP_CLIENTS_COMPLETE=true
+        return 0
+    fi
+
+    info "Found ${#containers[@]} interrupted Step 5 DHCP client containers; offboarding them before Subnet cleanup..."
+    for container in "${containers[@]}"; do
+        if [[ "$container" =~ ^(.+)-(a1|a2|b1)$ ]]; then
+            prefix="${BASH_REMATCH[1]}"
+            client="${BASH_REMATCH[2]}"
+        else
+            die "Test DHCP client container ${container} has an invalid name"
+        fi
+
+        runner_label="$(docker inspect --format \
+            '{{index .Config.Labels "io.osac.e2e.runner"}}' "$container" 2>/dev/null || true)"
+        client_label="$(docker inspect --format \
+            '{{index .Config.Labels "io.osac.e2e.client"}}' "$container" 2>/dev/null || true)"
+        prefix_label="$(docker inspect --format \
+            '{{index .Config.Labels "io.osac.e2e.prefix"}}' "$container" 2>/dev/null || true)"
+        if [[ "$runner_label" == vlan-e2e ]]; then
+            [[ "$client_label" == "$client" && "$prefix_label" == "$prefix" ]] \
+                || die "Step 5 client ${container} has mismatched ownership labels"
+        else
+            [[ "$prefix" =~ ^osac5530-[0-9]{14}$ ]] \
+                || die "Refusing to clean unlabelled non-E2E client container ${container}"
+        fi
+
+        label_dir="$(docker inspect --format \
+            '{{index .Config.Labels "io.osac.e2e.run-dir"}}' "$container" 2>/dev/null || true)"
+        recovery_dir=""
+        if [[ -n "$label_dir" && "$label_dir" != '<no value>' ]]; then
+            [[ "$label_dir" == "${TMPDIR:-/tmp}"/osac-5530-vlan-e2e.* \
+                || "$label_dir" == /tmp/osac-5530-vlan-e2e.* ]] \
+                && [[ -d "$label_dir" && ! -L "$label_dir" ]] \
+                || die "Step 5 client ${container} has an invalid recovery directory label"
+            recovery_dir="$label_dir"
+        else
+            container_mac="$(docker exec "$container" cat /sys/class/net/eth0/address 2>/dev/null || true)"
+            container_mac="$(tr '[:upper:]' '[:lower:]' <<<"$container_mac" | tr -d '\r\n')"
+            matching_dirs=()
+            for candidate in "${TMPDIR:-/tmp}"/osac-5530-vlan-e2e.*; do
+                [[ -d "$candidate" && ! -L "$candidate" \
+                    && -f "$candidate/client-${client}.mac" ]] || continue
+                saved_mac="$(tr '[:upper:]' '[:lower:]' \
+                    <"$candidate/client-${client}.mac" | tr -d '\r\n')"
+                [[ -n "$container_mac" && "$saved_mac" == "$container_mac" ]] \
+                    && matching_dirs+=("$candidate")
+            done
+            if [[ "${#matching_dirs[@]}" == 1 ]]; then
+                recovery_dir="${matching_dirs[0]}"
+            elif [[ "${#matching_dirs[@]}" == 0 \
+                && "$prefix" =~ ^osac5530-[0-9]{14}$ ]]; then
+                recovery_dir=""
+            else
+                die "Could not identify unique recovery data for Step 5 client ${container}"
+            fi
+        fi
+        previous_prefix="$DHCP_CLIENT_PREFIX"
+        DHCP_CLIENT_PREFIX="$prefix"
+        stop_dhcp_client "$client"
+        docker exec "$container" ip address flush dev eth0 >/dev/null 2>&1 || true
+        docker exec "$container" ip route flush dev eth0 >/dev/null 2>&1 || true
+
+        if [[ -n "$recovery_dir" ]]; then
+            [[ "$recovery_dir" != "$TEMP_DIR" \
+                && -f "$recovery_dir/client-${client}.mac" ]] \
+                || die "Step 5 client ${container} has no saved MAC recovery data"
+            duplicate=false
+            for candidate in "${STALE_RECOVERY_DIRS[@]}"; do
+                [[ "$candidate" == "$recovery_dir" ]] && duplicate=true
+            done
+            [[ "$duplicate" == true ]] || STALE_RECOVERY_DIRS+=("$recovery_dir")
+            saved_mac="$(tr '[:upper:]' '[:lower:]' \
+                <"$recovery_dir/client-${client}.mac" | tr -d '\r\n')"
+            [[ "$saved_mac" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] \
+                || die "Saved MAC for Step 5 client ${container} is invalid"
+            attachment_file="$recovery_dir/${client}-move-network-attachment.json"
+            if [[ ! -f "$attachment_file" ]]; then
+                attachment_file="$recovery_dir/${client}-offboard-network-attachment.json"
+            fi
+        else
+            client_link "$client"
+            switch_vlan_json="$(switch_exec "$CLIENT_SWITCH" bridge -j vlan show dev "$CLIENT_SWITCH_PORT")" \
+                || die "Could not verify the legacy Step 5 client ${container} switch port"
+            provisioning_vlan="$(cleanup_provisioning_vlan)" \
+                || die "Could not read the declared AgentlessNet provisioning VLAN"
+            jq -e --arg port "$CLIENT_SWITCH_PORT" --argjson vlan "$provisioning_vlan" '
+              length == 1
+              and .[0].ifname == $port
+              and (.[0].vlans | length == 1)
+              and (.[0].vlans[0].vlan | tonumber) == $vlan
+              and (.[0].vlans[0].flags | index("PVID") != null)
+              and (.[0].vlans[0].flags | index("Egress Untagged") != null)
+            ' <<<"$switch_vlan_json" >/dev/null \
+                || die "Legacy Step 5 client ${container} is not on the provisioning access VLAN"
+            info "Legacy Step 5 client ${container} is on the provisioning VLAN; removing its stale container and link."
+            attachment_file=""
+        fi
+
+        if [[ -n "$attachment_file" && -f "$attachment_file" ]]; then
+            resource_json="$(jq -ce '.osac_job_vars.resource' "$attachment_file")" \
+                || die "Saved BMI attachment recovery data for ${container} is invalid"
+            jq -e --arg client "$client" --arg tenant "$OSAC_TENANT" '
+              .apiVersion == "osac.openshift.io/v1alpha1"
+              and .kind == "BareMetalInstance"
+              and .metadata.name == ("osac-e2e-" + $client)
+              and .spec.externalHostID == ("osac-e2e-" + $client)
+              and .metadata.annotations["osac.openshift.io/tenant"] == $tenant
+              and .metadata.annotations["osac.openshift.io/owner-reference"] == "vlan-e2e-run"
+              and .metadata.annotations["osac.openshift.io/implementation-strategy"] == "agentless_net"
+              and (.metadata.uid | type == "string" and test("^[0-9a-f-]{36}$"))
+              and (.spec.networkAttachments | type == "array" and length == 1)
+              and (.spec.networkAttachments[0].subnetRef | type == "string")
+              and (.spec.networkAttachments[0].interface == "eth0")
+            ' <<<"$resource_json" >/dev/null \
+                || die "Saved BMI identity for Step 5 client ${container} is outside the E2E scope"
+            uid="$(jq -er '.metadata.uid' <<<"$resource_json")"
+            subnet_ref="$(jq -er '.spec.networkAttachments[0].subnetRef' <<<"$resource_json")"
+            selected_subnet=false
+            for candidate_subnet in "${CREATED_SUBNET_IDS[@]}"; do
+                if [[ "$candidate_subnet" == "$subnet_ref" ]]; then
+                    selected_subnet=true
+                    break
+                fi
+            done
+            [[ "$selected_subnet" == true ]] \
+                || die "Step 5 client ${container} references a Subnet outside the selected cleanup scope"
+
+            if [[ "$AAP_SUBNET_READER_SETUP_ATTEMPTED" != true ]]; then
+                configure_aap_subnet_reader \
+                    || die "Could not configure AAP access to offboard Step 5 client ${container}"
+            fi
+            CLIENT_BMI_UID["$client"]="$uid"
+            CLIENT_ATTACHMENT_SUBNET["$client"]="$subnet_ref"
+            CLIENT_ATTACHMENT_ACTIVE["$client"]=true
+            CLIENT_ATTACHMENT_PENDING["$client"]=false
+            CLIENT_PRESERVED_MAC["$client"]="$saved_mac"
+            offboard_client_from_subnet "$client" "$subnet_ref" \
+                || die "Could not offboard Step 5 client ${container} through osac-move-network-attachment"
+        fi
+
+        docker rm -f "$container" >/dev/null \
+            || die "Could not remove Step 5 DHCP client container ${container}"
+        link="$(client_macvlan_name "$client")"
+        if sudo ip link show dev "$link" >/dev/null 2>&1; then
+            sudo ip link delete dev "$link" \
+                || die "Could not remove Step 5 DHCP client link ${link}"
+        fi
+        DHCP_CLIENT_PREFIX="$previous_prefix"
+    done
+
+    CLEANUP_CLIENTS_COMPLETE=true
+    info "Removed interrupted Step 5 DHCP client containers and links."
+}
+
+prepare_suite_cleanup() {
+    local vn_filter subnet_filter eip_filter vn_items subnet_items eip_items
+    local pool_request pool_response pool_error pool_items external_ips state_before=""
+    local pool_object pool_id pool_name pool_cidr pool_crs pool_count pool_cr pool_uid
+    local pool_state pool_status allocated available total active_count
+    local eip_object eip_id eip_name eip_cr eip_uid eip_pool id item
+    local pool_ip_crs pool_ip_count pool_eip_ids_json selected_parent parent_id_candidate
+    local provider_ip_rows provider_ip_count assigned_id
+    local vn_ids_json subnet_ids_json pool_uids_json pool_ids_json eip_uids_json eip_ids_json
+    local snapshot
+    local -a vn_ids=() vn_uids=() subnet_ids=() subnet_uids=()
+    local -a pool_ids=() pool_uids=() pool_cidrs=() pool_eip_ids_jsons=()
+    local -a pool_initial_allocated=() pool_initial_available=()
+    local -a eip_ids=() eip_uids=() assigned_eip_ids=()
+    local -a pool_eip_ids=() pool_eip_uids=()
+    local index
+
+    vn_filter="$(cleanup_name_filter 'agentless-smoke-vn-' "$VIRTUAL_NETWORK_NAME_INPUT")"
+    subnet_filter="$vn_filter"
+    if [[ "$SUITE_USES_VN" == true ]]; then
+        vn_items="$(cleanup_cli_list_json virtualnetwork "$vn_filter")" \
+            || die "Could not list test VirtualNetworks for cleanup"
+        jq -e --arg tenant "$OSAC_TENANT" --arg prefix 'agentless-smoke-vn-' \
+            --arg custom "$VIRTUAL_NETWORK_NAME_INPUT" '
+          all(.[]; .metadata.tenant == $tenant
+            and (.metadata.name | (startswith($prefix) or ($custom != "" and startswith($custom))))
+            and (.id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")))' \
+            <<<"$vn_items" >/dev/null \
+            || die "Fulfillment returned a VirtualNetwork outside the test tenant or name scope"
+        while IFS= read -r id; do
+            [[ -n "$id" ]] || continue
+            local cr uid
+            cr="$(virtual_network_cr_json "$id")"
+            jq -e '.metadata.annotations["osac.openshift.io/implementation-strategy"] == "agentless_net"' \
+                <<<"$cr" >/dev/null \
+                || die "Refusing to clean a test-named VirtualNetwork managed by another provider"
+            uid="$(jq -er '.metadata.uid' <<<"$cr")" \
+                || die "VirtualNetwork ${id} has no Kubernetes UID"
+            vn_ids+=("$id")
+            vn_uids+=("$uid")
+        done < <(jq -r '.[].id' <<<"$vn_items")
+    fi
+
+    if [[ "$SUITE_USES_SUBNET_DHCP" == true || "$SUITE_USES_VN" == true ]]; then
+        subnet_items="$(cleanup_cli_list_json subnet "$subnet_filter")" \
+            || die "Could not list test Subnets for cleanup"
+        jq -e --arg tenant "$OSAC_TENANT" --arg prefix 'agentless-smoke-vn-' \
+            --arg custom "$VIRTUAL_NETWORK_NAME_INPUT" '
+          all(.[]; .metadata.tenant == $tenant
+            and (.metadata.name | (startswith($prefix) or ($custom != "" and startswith($custom))))
+            and (.id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")))' \
+            <<<"$subnet_items" >/dev/null \
+            || die "Fulfillment returned a Subnet outside the test tenant or name scope"
+        if [[ "$SUITE_USES_SUBNET_DHCP" != true ]] \
+            && [[ "$(jq -er 'length' <<<"$subnet_items")" != 0 ]]; then
+            die "Test Subnets remain; use --cleanup --subnet-dhcp or --cleanup --full before deleting VirtualNetworks"
+        fi
+        if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
+            while IFS= read -r item; do
+                [[ -n "$item" ]] || continue
+                local parent_id cr uid
+                id="$(jq -er '.id' <<<"$item")"
+                parent_id="$(cleanup_subnet_parent_id "$item")" \
+                    || die "Test Subnet ${id} has no parent VirtualNetwork reference"
+                selected_parent=false
+                for parent_id_candidate in "${vn_ids[@]}"; do
+                    if [[ "$parent_id_candidate" == "$parent_id" ]]; then
+                        selected_parent=true
+                        break
+                    fi
+                done
+                [[ "$selected_parent" == true ]] \
+                    || die "Subnet ${id} is not attached to a selected E2E VirtualNetwork"
+                cr="$(subnet_cr_json "$id" "$parent_id")"
+                jq -e '.metadata.annotations["osac.openshift.io/implementation-strategy"] == "agentless_net"' \
+                    <<<"$cr" >/dev/null \
+                    || die "Refusing to clean a test-named Subnet managed by another provider"
+                uid="$(jq -er '.metadata.uid' <<<"$cr")" \
+                    || die "Subnet ${id} has no Kubernetes UID"
+                subnet_ids+=("$id")
+                subnet_uids+=("$uid")
+            done < <(jq -c '.[]' <<<"$subnet_items")
+        fi
+    fi
+
+    eip_items='[]'
+    if [[ "$SUITE_USES_EXTERNAL_IP" == true ]]; then
+        eip_filter='this.metadata.name.startsWith("agentless-eip-")'
+        eip_items="$(cleanup_cli_list_json externalip "$eip_filter")" \
+            || die "Could not list test ExternalIPs for cleanup"
+        jq -e --arg tenant "$OSAC_TENANT" '
+          all(.[]; .metadata.tenant == $tenant
+            and (.metadata.name | startswith("agentless-eip-"))
+            and (.id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")))' \
+            <<<"$eip_items" >/dev/null \
+            || die "Fulfillment returned an ExternalIP outside the test tenant or name scope"
+    fi
+
+    pool_items='[]'
+    external_ips='{"items":[]}'
+    if [[ "$SUITE_USES_POOL" == true ]]; then
+        pool_request="${TEMP_DIR}/cleanup-external-ip-pools.request.json"
+        pool_response="${TEMP_DIR}/cleanup-external-ip-pools.response.json"
+        pool_error="${TEMP_DIR}/cleanup-external-ip-pools.error.json"
+        jq -n '{filter:"this.metadata.tenant == \"shared\""}' >"$pool_request" \
+            || die "Could not write ExternalIPPool cleanup lookup request"
+        if ! external_ip_pool_rpc List "$pool_request" "$pool_response" "$pool_error"; then
+            cat "$pool_error" >&2
+            die "Could not list shared ExternalIPPools for cleanup"
+        fi
+        pool_items="$(external_ip_pool_list_items "$pool_response")" \
+            || die "Private Fulfillment List returned an invalid ExternalIPPool response"
+        pool_items="$(jq -ce '[.[] | select((.metadata.name // "") | startswith("agentless-e2e-pool-"))]' \
+            <<<"$pool_items")" \
+            || die "Could not select test ExternalIPPools for cleanup"
+        if [[ "$(jq -er 'length' <<<"$pool_items")" != 0 ]]; then
+            external_ips="$(oc get externalips -n "$NETWORKING_NAMESPACE" -o json)" \
+                || die "Could not list ExternalIP CRs before pool cleanup"
+            state_before="$(state_snapshot)" \
+                || die "Could not read AgentlessNet state before suite cleanup"
+        fi
+
+        while IFS= read -r pool_object; do
+            [[ -n "$pool_object" ]] || continue
+            pool_id="$(jq -er '.id' <<<"$pool_object")" \
+                || die "Test ExternalIPPool has no Fulfillment UUID"
+            pool_name="$(jq -er '.metadata.name' <<<"$pool_object")"
+            pool_cidr="$(jq -er '.spec.cidrs | select(type == "array" and length == 1) | .[0]' <<<"$pool_object")" \
+                || die "Test ExternalIPPool ${pool_name} has an invalid CIDR list"
+            jq -e --arg name "$pool_name" --arg id "$pool_id" '
+              .metadata.tenant == "shared"
+              and (.metadata.name | startswith("agentless-e2e-pool-"))
+              and .id == $id
+              and (.spec.ipFamily == "IP_FAMILY_IPV4" or .spec.ipFamily == "IPv4")' \
+                <<<"$pool_object" >/dev/null \
+                || die "Refusing to clean an ExternalIPPool outside the E2E name and tenant scope"
+
+            EXTERNAL_IP_POOL_ID="$pool_id"
+            EXTERNAL_IP_POOL_CIDR="$pool_cidr"
+            pool_crs="$(external_ip_pool_crs_json "$pool_id")" \
+                || die "Could not inspect test ExternalIPPool ${pool_id} in Kubernetes"
+            pool_count="$(jq -er '.items | length' <<<"$pool_crs")" \
+                || die "Could not count ExternalIPPool CRs for cleanup"
+            [[ "$pool_count" -le 1 ]] \
+                || die "Multiple Kubernetes ExternalIPPool CRs found for ${pool_id}"
+            if [[ "$pool_count" == 1 ]]; then
+                pool_cr="$(jq -c '.items[0]' <<<"$pool_crs")"
+                external_ip_pool_validate_cr_identity "$pool_cr" "$pool_id" \
+                    || die "ExternalIPPool ${pool_id} CR identity does not match its Fulfillment object"
+                pool_uid="$(jq -er '.metadata.uid' <<<"$pool_cr")"
+            else
+                pool_uid="$(jq -r --arg id "$pool_id" \
+                    '[.external_ip_pools[] | select(.fulfillment_id == $id) | .uid] | first // ""' \
+                    <<<"$state_before")"
+            fi
+
+            pool_eip_ids=()
+            pool_eip_uids=()
+            if [[ "$SUITE_USES_EXTERNAL_IP" == true ]]; then
+                while IFS= read -r eip_object; do
+                    [[ -n "$eip_object" ]] || continue
+                    eip_id="$(jq -er '.id' <<<"$eip_object")"
+                    eip_name="$(jq -er '.metadata.name' <<<"$eip_object")"
+                    eip_cr="$(jq -ce --arg id "$eip_id" \
+                        '[.items[] | select(.metadata.labels["osac.openshift.io/externalip-uuid"] == $id)]
+                         | if length == 1 then .[0] else error("expected one ExternalIP CR") end' \
+                        <<<"$external_ips")" \
+                        || die "ExternalIP ${eip_id} has no unique Kubernetes CR"
+                    eip_pool="$(jq -er '.spec.pool' <<<"$eip_cr")" \
+                        || die "ExternalIP ${eip_id} has no pool reference"
+                    if [[ "$eip_pool" == "$pool_id" ]]; then
+                        [[ "$(jq -r '.metadata.annotations["osac.openshift.io/tenant"] // ""' <<<"$eip_cr")" == "$OSAC_TENANT" ]] \
+                            || die "ExternalIP ${eip_id} belongs to a different tenant"
+                        [[ "$(jq -r '.metadata.annotations["osac.openshift.io/implementation-strategy"] // ""' <<<"$eip_cr")" == agentless_net ]] \
+                            || die "ExternalIP ${eip_id} is not managed by AgentlessNet"
+                        eip_uid="$(jq -er '.metadata.uid' <<<"$eip_cr")"
+                        pool_eip_ids+=("$eip_id")
+                        pool_eip_uids+=("$eip_uid")
+                    fi
+                done < <(jq -c '.[]' <<<"$eip_items")
+            fi
+
+            pool_ip_crs="$(jq -ce --arg id "$pool_id" \
+                '[.items[] | select(.spec.pool == $id)]' <<<"$external_ips")" \
+                || die "Could not select ExternalIP CRs for pool ${pool_id}"
+            pool_ip_count="$(jq -er 'length' <<<"$pool_ip_crs")"
+            if [[ "$SUITE_USES_EXTERNAL_IP" != true && "$pool_ip_count" != 0 ]]; then
+                die "ExternalIPPool ${pool_name} still has ExternalIPs; use --cleanup --external-ip or --cleanup --full"
+            fi
+            if [[ "$pool_ip_count" != "${#pool_eip_ids[@]}" ]]; then
+                die "ExternalIPPool ${pool_name} has ExternalIPs outside the selected E2E name scope"
+            fi
+            pool_eip_ids_json="$(cleanup_array_json "${pool_eip_ids[@]}")"
+            provider_ip_rows="$(jq -ce --arg uid "$pool_uid" \
+                '[.external_ips[] | select(.pool_uid == $uid)]' <<<"$state_before")" \
+                || die "Could not inspect provider ExternalIP state for pool ${pool_id}"
+            provider_ip_count="$(jq -er 'length' <<<"$provider_ip_rows")"
+            [[ "$provider_ip_count" == "${#pool_eip_ids[@]}" ]] \
+                || die "ExternalIPPool ${pool_name} has provider allocations outside the selected E2E resources"
+            if [[ "$provider_ip_count" -gt 0 ]]; then
+                jq -e --argjson ids "$pool_eip_ids_json" \
+                    'all(.[]; .fulfillment_id as $id | ($ids | index($id)) != null)' \
+                    <<<"$provider_ip_rows" >/dev/null \
+                    || die "ExternalIPPool ${pool_name} has a provider reservation outside the E2E name scope"
+            fi
+
+            EXTERNAL_IP_POOL_K8S_UID="$pool_uid"
+            pool_status="$(external_ip_pool_get_json)" \
+                || die "Could not read ExternalIPPool ${pool_id} counters before cleanup"
+            allocated="$(jq -er '(.object.status.allocated // 0) | tonumber' <<<"$pool_status")" \
+                || die "ExternalIPPool ${pool_id} has an invalid allocated counter"
+            available="$(jq -er '(.object.status.available // 0) | tonumber' <<<"$pool_status")" \
+                || die "ExternalIPPool ${pool_id} has an invalid available counter"
+            total="$(jq -er '.object.status.total | tonumber' <<<"$pool_status")" \
+                || die "ExternalIPPool ${pool_id} has an invalid total counter"
+            [[ "$allocated" == "$provider_ip_count" && "$available" -le "$total" ]] \
+                || die "ExternalIPPool ${pool_name} counters do not match its E2E provider allocations"
+            pool_ids+=("$pool_id")
+            pool_uids+=("$pool_uid")
+            pool_cidrs+=("$pool_cidr")
+            pool_eip_ids_jsons+=("$pool_eip_ids_json")
+            pool_initial_allocated+=("$((allocated - provider_ip_count))")
+            pool_initial_available+=("$((available + provider_ip_count))")
+            eip_ids+=("${pool_eip_ids[@]}")
+            eip_uids+=("${pool_eip_uids[@]}")
+            assigned_eip_ids+=("${pool_eip_ids[@]}")
+        done < <(jq -c '.[]' <<<"$pool_items")
+
+        if [[ "$SUITE_USES_EXTERNAL_IP" == true ]]; then
+            for eip_id in $(jq -r '.[].id' <<<"$eip_items"); do
+                local assigned=false
+                for assigned_id in "${assigned_eip_ids[@]}"; do
+                    [[ "$assigned_id" == "$eip_id" ]] && assigned=true
+                done
+                [[ "$assigned" == true ]] \
+                    || die "Test ExternalIP ${eip_id} does not belong to a selected E2E ExternalIPPool"
+            done
+        fi
+    fi
+
+    if [[ -z "$state_before" ]]; then
+        state_before="$(state_snapshot)" \
+            || die "Could not snapshot AgentlessNet state before suite cleanup"
+    fi
+    printf '%s\n' "$state_before" >"$CURRENT_STATE_FILE" \
+        || die "Could not save the cleanup baseline state"
+    CLEANUP_STATE_FILE="${TEMP_DIR}/cleanup-state.json"
+    cp -- "$CURRENT_STATE_FILE" "$CLEANUP_STATE_FILE" \
+        || die "Could not preserve the pre-cleanup provider snapshot"
+
+    CLEANUP_VN_UIDS=("${vn_uids[@]}")
+    CLEANUP_SUBNET_UIDS=("${subnet_uids[@]}")
+    CLEANUP_POOL_UIDS=("${pool_uids[@]}")
+    CLEANUP_POOL_IDS=("${pool_ids[@]}")
+    CLEANUP_POOL_CIDRS=("${pool_cidrs[@]}")
+    CLEANUP_POOL_EIP_IDS_JSON=("${pool_eip_ids_jsons[@]}")
+    CLEANUP_EIP_UIDS=("${eip_uids[@]}")
+    CLEANUP_EIP_IDS=("${eip_ids[@]}")
+    CLEANUP_PENDING_POOL_IDS=("${pool_ids[@]}")
+    CREATED_IDS=("${vn_ids[@]}")
+    CREATED_SUBNET_IDS=("${subnet_ids[@]}")
+
+    vn_ids_json="$(cleanup_array_json "${CLEANUP_VN_UIDS[@]}")"
+    subnet_ids_json="$(cleanup_array_json "${CLEANUP_SUBNET_UIDS[@]}")"
+    pool_uids_json="$(cleanup_array_json "${CLEANUP_POOL_UIDS[@]}")"
+    pool_ids_json="$(cleanup_array_json "${CLEANUP_POOL_IDS[@]}")"
+    eip_uids_json="$(cleanup_array_json "${CLEANUP_EIP_UIDS[@]}")"
+    eip_ids_json="$(cleanup_array_json "${CLEANUP_EIP_IDS[@]}")"
+    jq --argjson vns "$vn_ids_json" --argjson subnets "$subnet_ids_json" \
+        --argjson pools "$pool_uids_json" --argjson pool_ids "$pool_ids_json" \
+        --argjson ips "$eip_uids_json" --argjson ip_ids "$eip_ids_json" '
+      .virtual_networks |= map(select((.uid as $uid | ($vns | index($uid))) == null))
+      | .subnets |= map(select((.uid as $uid | ($subnets | index($uid))) == null))
+      | .external_ip_pools |= map(select(
+          (.uid as $uid | ($pools | index($uid))) == null
+          and (.fulfillment_id as $id | ($pool_ids | index($id))) == null))
+      | .external_ips |= map(select(
+          (.uid as $uid | ($ips | index($uid))) == null
+          and (.fulfillment_id as $id | ($ip_ids | index($id))) == null))' \
+        "$CURRENT_STATE_FILE" >"$BASELINE_STATE_FILE" \
+        || die "Could not compute the unrelated provider-state baseline for cleanup"
+    CLEANUP_DISCOVERY_COMPLETE=true
+    if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
+        CLEANUP_CLIENTS_COMPLETE=false
+    fi
+
+    info "Suite cleanup found ${#CLEANUP_EIP_IDS[@]} ExternalIPs, ${#CLEANUP_POOL_IDS[@]} test pools, ${#CREATED_SUBNET_IDS[@]} Subnets, and ${#CREATED_IDS[@]} VirtualNetworks."
+    for index in "${!CLEANUP_POOL_IDS[@]}"; do
+        EXTERNAL_IP_POOL_ID="${CLEANUP_POOL_IDS[$index]}"
+        EXTERNAL_IP_POOL_K8S_UID="${CLEANUP_POOL_UIDS[$index]}"
+        EXTERNAL_IP_POOL_CIDR="${CLEANUP_POOL_CIDRS[$index]}"
+        EXTERNAL_IP_POOL_INITIAL_ALLOCATED="${pool_initial_allocated[$index]}"
+        EXTERNAL_IP_POOL_INITIAL_AVAILABLE="${pool_initial_available[$index]}"
+        EXTERNAL_IP_POOL_PENDING_CLEANUP=true
+        mapfile -t CREATED_EXTERNAL_IP_IDS < <(jq -r '.[]' <<<"${CLEANUP_POOL_EIP_IDS_JSON[$index]}")
+        if [[ "${#CREATED_EXTERNAL_IP_IDS[@]}" -gt 0 ]] && ! cleanup_created_external_ips; then
+            die "Could not release all test ExternalIPs from pool ${EXTERNAL_IP_POOL_ID}"
+        fi
+        cleanup_created_external_ip_pool \
+            || die "Could not delete test ExternalIPPool ${EXTERNAL_IP_POOL_ID}"
+        CREATED_EXTERNAL_IP_IDS=()
+    done
+    [[ "${#CLEANUP_PENDING_POOL_IDS[@]}" == 0 ]] \
+        || die "Test ExternalIPPool cleanup is incomplete; preserving provider access"
+    EXTERNAL_IP_POOL_ID=""
+    EXTERNAL_IP_POOL_K8S_UID=""
+    EXTERNAL_IP_POOL_CIDR=""
+    EXTERNAL_IP_POOL_PENDING_CLEANUP=false
+    if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
+        cleanup_interrupted_dhcp_clients
+    fi
+    info "Suite cleanup resource discovery is complete; the exit handler will delete Subnets before VirtualNetworks and verify provider cleanup."
+}
+
+supervisor_service_status_is_absent() {
+    [[ "$2" == "$1: ERROR (no such process)" ]]
+}
+
+verify_suite_cleanup_provider_state() {
+    local current collection uid before after entry namespace host_interface baseline_uids
+    local parent_uid vlan_interface vlan_id config config_path service_status service_name service_file
+    if ! current="$(state_snapshot)"; then
+        printf 'Could not snapshot AgentlessNet state after suite cleanup\n' >&2
+        return 1
+    fi
+    printf '%s\n' "$current" >"$CURRENT_STATE_FILE" || return 1
+
+    for uid in "${CLEANUP_VN_UIDS[@]}"; do
+        if jq -e --arg uid "$uid" 'any(.virtual_networks[]; .uid == $uid)' \
+            <<<"$current" >/dev/null; then
+            printf 'Deleted test VirtualNetwork provider row remains for UID %s\n' "$uid" >&2
+            return 1
+        fi
+    done
+    for uid in "${CLEANUP_SUBNET_UIDS[@]}"; do
+        if jq -e --arg uid "$uid" 'any(.subnets[]; .uid == $uid)' \
+            <<<"$current" >/dev/null; then
+            printf 'Deleted test Subnet provider row remains for UID %s\n' "$uid" >&2
+            return 1
+        fi
+    done
+    for uid in "${CLEANUP_POOL_UIDS[@]}"; do
+        if jq -e --arg uid "$uid" 'any(.external_ip_pools[]; .uid == $uid)' \
+            <<<"$current" >/dev/null; then
+            printf 'Deleted test ExternalIPPool provider row remains for UID %s\n' "$uid" >&2
+            return 1
+        fi
+    done
+    for uid in "${CLEANUP_EIP_UIDS[@]}"; do
+        if jq -e --arg uid "$uid" 'any(.external_ips[]; .uid == $uid)' \
+            <<<"$current" >/dev/null; then
+            printf 'Deleted test ExternalIP provider row remains for UID %s\n' "$uid" >&2
+            return 1
+        fi
+    done
+
+    if [[ -s "$CLEANUP_STATE_FILE" ]]; then
+        while IFS= read -r entry; do
+            uid="$(jq -r '.uid' <<<"$entry")"
+            namespace="$(jq -r '.namespace_name' <<<"$entry")"
+            host_interface="$(jq -r '.host_interface' <<<"$entry")"
+            local namespaces
+            if ! namespaces="$(netnode ip netns list)"; then
+                printf 'Could not inspect namespaces after deleting VirtualNetwork UID %s\n' "$uid" >&2
+                return 1
+            fi
+            if awk -v name="$namespace" '$1 == name { found=1 } END { exit !found }' \
+                <<<"$namespaces"; then
+                printf 'Deleted VirtualNetwork namespace %s remains on the network node\n' "$namespace" >&2
+                return 1
+            fi
+            if netnode ip link show dev "$host_interface" >/dev/null 2>&1; then
+                printf 'Deleted VirtualNetwork interface %s remains on the network node\n' "$host_interface" >&2
+                return 1
+            fi
+            service_name="agentless-dhcp-${uid}"
+            if service_status="$(netnode supervisorctl -c /etc/agentless-net/supervisord.conf \
+                status "$service_name" 2>&1)"; then
+                printf 'Deleted VirtualNetwork DHCP service remains for UID %s\n' "$uid" >&2
+                return 1
+            fi
+            if ! supervisor_service_status_is_absent "$service_name" "$service_status"; then
+                printf 'Could not verify Supervisor state for deleted VirtualNetwork UID %s\n' "$uid" >&2
+                return 1
+            fi
+            if ! netnode test -d /etc/agentless-net/supervisor.d; then
+                printf 'Could not inspect Supervisor program files after deleting VirtualNetwork UID %s\n' "$uid" >&2
+                return 1
+            fi
+            service_file="/etc/agentless-net/supervisor.d/${uid}.ini"
+            if netnode test -f "$service_file"; then
+                printf 'Deleted VirtualNetwork Supervisor config %s remains on the network node\n' \
+                    "$service_file" >&2
+                return 1
+            fi
+        done < <(jq -c --argjson uids "$(cleanup_array_json "${CLEANUP_VN_UIDS[@]}")" \
+            '[.virtual_networks[] | select(.uid as $uid | ($uids | index($uid)) != null)][]' \
+            "$CLEANUP_STATE_FILE")
+
+        while IFS= read -r entry; do
+            uid="$(jq -r '.uid' <<<"$entry")"
+            parent_uid="$(jq -r '.virtual_network_uid' <<<"$entry")"
+            vlan_interface="$(jq -r '.vlan_interface' <<<"$entry")"
+            vlan_id="$(jq -r '.vlan_id' <<<"$entry")"
+            namespace="$(jq -r --arg uid "$parent_uid" \
+                '.virtual_networks[] | select(.uid == $uid) | .namespace_name' \
+                "$CLEANUP_STATE_FILE")"
+            if netnode ip netns exec "$namespace" ip link show dev "$vlan_interface" \
+                >/dev/null 2>&1; then
+                printf 'Deleted Subnet VLAN interface %s remains in namespace %s\n' \
+                    "$vlan_interface" "$namespace" >&2
+                return 1
+            fi
+            config_path="/etc/agentless-net/dhcp/${parent_uid}/dnsmasq.conf"
+            if config="$(netnode cat "$config_path" 2>/dev/null)" \
+                && grep -Fxq "interface=${vlan_interface}" <<<"$config"; then
+                printf 'Deleted Subnet VLAN interface %s remains in DHCP configuration\n' \
+                    "$vlan_interface" >&2
+                return 1
+            fi
+            if ! (assert_vlan_on_switches "$vlan_id" false) >/dev/null 2>&1; then
+                printf 'Deleted Subnet VLAN %s remains on a Cumulus switch\n' "$vlan_id" >&2
+                return 1
+            fi
+        done < <(jq -c --argjson uids "$(cleanup_array_json "${CLEANUP_SUBNET_UIDS[@]}")" \
+            '[.subnets[] | select(.uid as $uid | ($uids | index($uid)) != null)][]' \
+            "$CLEANUP_STATE_FILE")
+    fi
+
+    for collection in virtual_networks subnets external_ip_pools external_ips; do
+        baseline_uids="$(jq -r --arg collection "$collection" \
+            'if (.[$collection] | type) != "array" then error("invalid state collection") else .[$collection][].uid end' \
+            "$BASELINE_STATE_FILE")" || return 1
+        while IFS= read -r uid; do
+            [[ -n "$uid" ]] || continue
+            before="$(jq -cS --arg uid "$uid" --arg collection "$collection" \
+                '.[$collection][] | select(.uid == $uid)' "$BASELINE_STATE_FILE")"
+            after="$(jq -cS --arg uid "$uid" --arg collection "$collection" \
+                '.[$collection][] | select(.uid == $uid)' "$CURRENT_STATE_FILE")"
+            if [[ -z "$after" || "$before" != "$after" ]]; then
+                printf 'Unrelated AgentlessNet %s state for UID %s changed during cleanup\n' \
+                    "$collection" "$uid" >&2
+                return 1
+            fi
+        done <<<"$baseline_uids"
+    done
     return 0
 }
 
@@ -3321,6 +4085,13 @@ cleanup_created_virtual_networks() {
     if [[ "$test_external_ips_clean" == true ]] && ! cleanup_created_external_ip_pool; then
         test_external_ip_pool_clean=false
         printf 'ERROR: preserving the ExternalIPPool and provider access because pool cleanup is incomplete\n' >&2
+        cleanup_incomplete=true
+    fi
+    if [[ "${CLEANUP_MODE:-false}" == true ]] \
+        && declare -p CLEANUP_PENDING_POOL_IDS >/dev/null 2>&1 \
+        && ((${#CLEANUP_PENDING_POOL_IDS[@]} > 0)); then
+        test_external_ip_pool_clean=false
+        printf 'ERROR: preserving provider access; test ExternalIPPool cleanup is incomplete\n' >&2
         cleanup_incomplete=true
     fi
     if ! cleanup_created_subnets; then
@@ -3358,6 +4129,16 @@ cleanup_created_virtual_networks() {
             test_vns_clean=false
         fi
     done
+    if [[ "${CLEANUP_MODE:-false}" == true \
+        && "${CLEANUP_DISCOVERY_COMPLETE:-false}" == true \
+        && "$test_external_ips_clean" == true \
+        && "$test_external_ip_pool_clean" == true && "$test_subnets_clean" == true \
+        && "$test_vns_clean" == true ]]; then
+        if ! verify_suite_cleanup_provider_state; then
+            test_vns_clean=false
+            cleanup_incomplete=true
+        fi
+    fi
     if [[ "$test_external_ips_clean" == true && "$test_external_ip_pool_clean" == true \
         && "$test_subnets_clean" == true \
         && "$test_vns_clean" == true ]]; then
@@ -3409,18 +4190,6 @@ cleanup_created_virtual_networks() {
         PRESERVE_E2E_RECOVERY_ARTIFACTS=true
         printf 'Recovery artifacts and provider credentials are preserved in %s\n' "$TEMP_DIR" >&2
         return 1
-    fi
-    if [[ "$GENERATED_CLI_CONFIG" == true && -n "$CLI_CONFIG_DIR" ]]; then
-        rm -rf -- "$CLI_CONFIG_DIR"
-    fi
-    if [[ "$GENERATED_CLI_BIN" == true && -n "$CLI_BIN" ]]; then
-        rm -f -- "$CLI_BIN"
-    fi
-    if [[ -n "$CLI_CA_FILE" && "$AAP_SUBNET_READER_SETUP_ATTEMPTED" != true ]]; then
-        rm -f -- "$CLI_CA_FILE"
-    fi
-    if [[ -n "$TEMP_DIR" && "$RUN_DIR_CREATED" != true ]]; then
-        rm -rf -- "$TEMP_DIR"
     fi
     return 0
 }
@@ -3545,6 +4314,7 @@ on_exit() {
     local status=$?
     local cleanup_status=0
     local provider_cleanup_allowed=true
+    local stale_dir
     trap - EXIT
     set +e
     if [[ "$SUITE_USES_SUBNET_DHCP" == true && "$VLAN_E2E_DEBUG" == true ]] \
@@ -3552,7 +4322,7 @@ on_exit() {
         printf 'ERROR: could not preserve the requested DHCP debug artifacts\n' >&2
         cleanup_status=1
     fi
-    if [[ "$SUITE_USES_SUBNET_DHCP" == true ]] \
+    if [[ "${CLEANUP_MODE:-false}" != true && "$SUITE_USES_SUBNET_DHCP" == true ]] \
         && declare -F cleanup_dhcp_clients_and_attachments >/dev/null; then
         if ! cleanup_dhcp_clients_and_attachments; then
             printf 'ERROR: simulated BMI, DHCP client, or client-link cleanup is incomplete\n' >&2
@@ -3563,6 +4333,20 @@ on_exit() {
     fi
     if [[ "$PREEXISTING_PROVIDER_CLEANUP_PENDING" == true ]]; then
         printf 'ERROR: preserving AAP inventory and provider access while existing provider deletions remain pending\n' >&2
+        cleanup_status=1
+        provider_cleanup_allowed=false
+        PRESERVE_E2E_RECOVERY_ARTIFACTS=true
+    fi
+    if [[ "${CLEANUP_MODE:-false}" == true \
+        && "${CLEANUP_DISCOVERY_COMPLETE:-false}" != true ]]; then
+        printf 'ERROR: cleanup inventory was not completed; preserving lab resources and provider access\n' >&2
+        cleanup_status=1
+        provider_cleanup_allowed=false
+        PRESERVE_E2E_RECOVERY_ARTIFACTS=true
+    fi
+    if [[ "${CLEANUP_MODE:-false}" == true \
+        && "${CLEANUP_CLIENTS_COMPLETE:-true}" != true ]]; then
+        printf 'ERROR: preserving Step 5 network resources because client offboarding is incomplete\n' >&2
         cleanup_status=1
         provider_cleanup_allowed=false
         PRESERVE_E2E_RECOVERY_ARTIFACTS=true
@@ -3595,6 +4379,9 @@ on_exit() {
     if [[ "$PRESERVE_E2E_RECOVERY_ARTIFACTS" == true ]]; then
         printf 'Recovery artifacts and provider credentials are preserved in %s\n' "$TEMP_DIR" >&2
     else
+        for stale_dir in "${STALE_RECOVERY_DIRS[@]}"; do
+            [[ -z "$stale_dir" || "$stale_dir" == "$TEMP_DIR" ]] || rm -rf -- "$stale_dir"
+        done
         if [[ "$GENERATED_CLI_CONFIG" == true && -n "$CLI_CONFIG_DIR" ]]; then
             rm -rf -- "$CLI_CONFIG_DIR"
         fi
@@ -3613,11 +4400,17 @@ on_exit() {
 }
 trap on_exit EXIT
 
-for tool in cluster-tool virsh oc helm go jq python3 awk sed grep sort cut sleep make ssh-keygen base64 grpcurl docker sudo ssh uv stat tr; do
-    require_cmd "$tool"
-done
-require_cmd "$CONTAINER_TOOL"
-require_cmd "$CONTAINERLAB"
+if [[ "$CLEANUP_MODE" == true ]]; then
+    for tool in virsh oc helm go jq python3 awk sed grep sort cut sleep ssh-keygen base64 grpcurl docker sudo ssh stat tr; do
+        require_cmd "$tool"
+    done
+else
+    for tool in cluster-tool virsh oc helm go jq python3 awk sed grep sort cut sleep make ssh-keygen base64 grpcurl docker sudo ssh uv stat tr; do
+        require_cmd "$tool"
+    done
+    require_cmd "$CONTAINER_TOOL"
+    require_cmd "$CONTAINERLAB"
+fi
 [[ -f "$CONTAINERLAB_TOPOLOGY" ]] || die "Containerlab topology is missing: $CONTAINERLAB_TOPOLOGY"
 [[ -f "$CONTAINERLAB_INVENTORY" ]] || die "Containerlab inventory is missing: $CONTAINERLAB_INVENTORY"
 [[ -f "$CONTAINERLAB_CONFIGURE_PLAYBOOK" ]] || die "Containerlab trunk playbook is missing: $CONTAINERLAB_CONFIGURE_PLAYBOOK"
@@ -3631,45 +4424,51 @@ fi
     || die "OSAC_INSTALL_MODE must be auto, install, or upgrade"
 [[ "$VLAN_E2E_DEBUG" == true || "$VLAN_E2E_DEBUG" == false ]] \
     || die "VLAN_E2E_DEBUG must be true or false"
-[[ "$CUMULUS_VERSION" =~ ^5\.[0-9]+\.[0-9]+$ ]] \
-    || die "CUMULUS_VERSION must be an exact Cumulus release such as 5.16.5"
-[[ "$CUMULUS_VX_IMAGE" =~ ^[A-Za-z0-9._/-]+:[A-Za-z0-9._-]+$ ]] \
-    || die "CUMULUS_VX_IMAGE must be an explicit image reference with a version tag"
-[[ "${CUMULUS_VX_IMAGE##*:}" == "$CUMULUS_VERSION" ]] \
-    || die "CUMULUS_VX_IMAGE tag must match CUMULUS_VERSION"
+if [[ "$CLEANUP_MODE" != true ]]; then
+    [[ "$CUMULUS_VERSION" =~ ^5\.[0-9]+\.[0-9]+$ ]] \
+        || die "CUMULUS_VERSION must be an exact Cumulus release such as 5.16.5"
+    [[ "$CUMULUS_VX_IMAGE" =~ ^[A-Za-z0-9._/-]+:[A-Za-z0-9._-]+$ ]] \
+        || die "CUMULUS_VX_IMAGE must be an explicit image reference with a version tag"
+    [[ "${CUMULUS_VX_IMAGE##*:}" == "$CUMULUS_VERSION" ]] \
+        || die "CUMULUS_VX_IMAGE tag must match CUMULUS_VERSION"
+fi
 [[ "$CUMULUS_LAB_ADMIN_KEY" =~ ^/[A-Za-z0-9_./-]+$ ]] \
     || die "CUMULUS_LAB_ADMIN_KEY must be an absolute path with safe path characters"
-if [[ -n "$CUMULUS_IMAGE_PROVENANCE_FILE" ]]; then
+if [[ "$CLEANUP_MODE" != true && -n "$CUMULUS_IMAGE_PROVENANCE_FILE" ]]; then
     [[ "$CUMULUS_IMAGE_PROVENANCE_FILE" =~ ^/[A-Za-z0-9_./-]+$ && -f "$CUMULUS_IMAGE_PROVENANCE_FILE" ]] \
         || die "CUMULUS_IMAGE_PROVENANCE_FILE must name an existing file with a safe absolute path"
 fi
-if [[ -n "$VLAN_E2E_RUN_DIR" ]]; then
+if [[ "$CLEANUP_MODE" != true && -n "$VLAN_E2E_RUN_DIR" ]]; then
     [[ "$VLAN_E2E_RUN_DIR" =~ ^/[A-Za-z0-9_./-]+$ ]] \
         || die "VLAN_E2E_RUN_DIR must be an absolute path with safe path characters"
     [[ ! -e "$VLAN_E2E_RUN_DIR" && ! -L "$VLAN_E2E_RUN_DIR" ]] \
         || die "VLAN_E2E_RUN_DIR already exists; refusing to overwrite it"
 fi
-if ! CUMULUS_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$CUMULUS_VX_IMAGE")"; then
-    die "CUMULUS_VX_IMAGE is not available in the local Docker image store: $CUMULUS_VX_IMAGE"
+if [[ "$CLEANUP_MODE" != true ]]; then
+    if ! CUMULUS_IMAGE_ID="$(docker image inspect --format '{{.Id}}' "$CUMULUS_VX_IMAGE")"; then
+        die "CUMULUS_VX_IMAGE is not available in the local Docker image store: $CUMULUS_VX_IMAGE"
+    fi
+    CUMULUS_IMAGE_VENDOR="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.vendor"}}' "$CUMULUS_VX_IMAGE")" \
+        || die "Could not inspect the Boxen vendor label for CUMULUS_VX_IMAGE"
+    [[ "$CUMULUS_IMAGE_VENDOR" == Boxen ]] \
+        || die "CUMULUS_VX_IMAGE is not a Boxen-packaged image"
 fi
-CUMULUS_IMAGE_VENDOR="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.vendor"}}' "$CUMULUS_VX_IMAGE")" \
-    || die "Could not inspect the Boxen vendor label for CUMULUS_VX_IMAGE"
-[[ "$CUMULUS_IMAGE_VENDOR" == Boxen ]] \
-    || die "CUMULUS_VX_IMAGE is not a Boxen-packaged image"
-if [[ "$SUITE_USES_SUBNET_DHCP" == true \
+if [[ "$CLEANUP_MODE" != true && "$SUITE_USES_SUBNET_DHCP" == true \
     && "$VLAN_E2E_DEBUG" == true && -n "$VLAN_E2E_ARTIFACT_DIR" ]]; then
     [[ "$VLAN_E2E_ARTIFACT_DIR" =~ ^/[A-Za-z0-9_./-]+$ ]] \
         || die "VLAN_E2E_ARTIFACT_DIR must be an absolute path with safe path characters"
 fi
-[[ "$AAP_IMAGE" =~ ^quay\.io/[A-Za-z0-9._/-]+:[A-Za-z0-9._-]+$ ]] \
-    || die "AAP_IMAGE must be a quay.io image reference with a tag"
-[[ "$OPERATOR_IMAGE" =~ ^quay\.io/[A-Za-z0-9._/-]+:[A-Za-z0-9._-]+$ ]] \
-    || die "OPERATOR_IMAGE must be a quay.io image reference with a tag"
-[[ "$FULFILLMENT_IMAGE" =~ ^quay\.io/[A-Za-z0-9._/-]+:[A-Za-z0-9._-]+$ ]] \
-    || die "FULFILLMENT_IMAGE must be a quay.io image reference with a tag"
-[[ "$REUSE_PREBUILT_OSAC_IMAGES" == auto || "$REUSE_PREBUILT_OSAC_IMAGES" == true \
-    || "$REUSE_PREBUILT_OSAC_IMAGES" == false ]] \
-    || die "REUSE_PREBUILT_OSAC_IMAGES must be auto, true, or false"
+if [[ "$CLEANUP_MODE" != true ]]; then
+    [[ "$AAP_IMAGE" =~ ^quay\.io/[A-Za-z0-9._/-]+:[A-Za-z0-9._-]+$ ]] \
+        || die "AAP_IMAGE must be a quay.io image reference with a tag"
+    [[ "$OPERATOR_IMAGE" =~ ^quay\.io/[A-Za-z0-9._/-]+:[A-Za-z0-9._-]+$ ]] \
+        || die "OPERATOR_IMAGE must be a quay.io image reference with a tag"
+    [[ "$FULFILLMENT_IMAGE" =~ ^quay\.io/[A-Za-z0-9._/-]+:[A-Za-z0-9._-]+$ ]] \
+        || die "FULFILLMENT_IMAGE must be a quay.io image reference with a tag"
+    [[ "$REUSE_PREBUILT_OSAC_IMAGES" == auto || "$REUSE_PREBUILT_OSAC_IMAGES" == true \
+        || "$REUSE_PREBUILT_OSAC_IMAGES" == false ]] \
+        || die "REUSE_PREBUILT_OSAC_IMAGES must be auto, true, or false"
+fi
 [[ "$AAP_PROJECT_GIT_URI" =~ ^https://[A-Za-z0-9._/-]+$ ]] \
     || die "AAP_PROJECT_GIT_URI must be an HTTPS Git URL"
 [[ "$AAP_PROJECT_GIT_BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] \
@@ -3680,10 +4479,12 @@ fi
     || die "AAP_PROJECT_EXPECTED_REVISION must be a full lowercase Git commit SHA"
 [[ "$AAP_PROJECT_EXPECTED_REVISION" == "$RUNTIME_SOURCE_COMMIT" ]] \
     || die "AAP_PROJECT_EXPECTED_REVISION must match selected source commit ${RUNTIME_SOURCE_COMMIT}"
-for runtime_image in "$AAP_IMAGE" "$OPERATOR_IMAGE" "$FULFILLMENT_IMAGE"; do
-    [[ "${runtime_image##*:}" == *-"$IMAGE_SOURCE_SHORT" ]] \
-        || die "Runtime image tag must end in the selected source revision ${IMAGE_SOURCE_SHORT}: ${runtime_image}"
-done
+if [[ "$CLEANUP_MODE" != true ]]; then
+    for runtime_image in "$AAP_IMAGE" "$OPERATOR_IMAGE" "$FULFILLMENT_IMAGE"; do
+        [[ "${runtime_image##*:}" == *-"$IMAGE_SOURCE_SHORT" ]] \
+            || die "Runtime image tag must end in the selected source revision ${IMAGE_SOURCE_SHORT}: ${runtime_image}"
+    done
+fi
 [[ "$AAP_JOB_TIMEOUT" =~ ^[0-9]+$ ]] \
     && ((10#$AAP_JOB_TIMEOUT >= 60 && 10#$AAP_JOB_TIMEOUT <= 7200)) \
     || die "AAP_JOB_TIMEOUT must be between 60 and 7200 seconds"
@@ -3757,11 +4558,12 @@ TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/osac-5530-vlan-e2e.XXXXXX")"
 BASELINE_STATE_FILE="${TEMP_DIR}/baseline-state.json"
 CURRENT_STATE_FILE="${TEMP_DIR}/current-state.json"
 SWITCH_MANIFEST_FILE="${TEMP_DIR}/switches.json"
-if [[ -n "$VLAN_E2E_RUN_DIR" ]]; then
+if [[ -n "$VLAN_E2E_RUN_DIR" && "$CLEANUP_MODE" != true ]]; then
     mkdir -m 0700 -- "$VLAN_E2E_RUN_DIR"
     RUN_DIR_CREATED=true
 fi
-if [[ "$SUITE_USES_SUBNET_DHCP" == true && "$VLAN_E2E_DEBUG" == true ]]; then
+if [[ "$CLEANUP_MODE" != true && "$SUITE_USES_SUBNET_DHCP" == true \
+    && "$VLAN_E2E_DEBUG" == true ]]; then
     if [[ -z "$VLAN_E2E_ARTIFACT_DIR" ]]; then
         DEBUG_ARTIFACT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/osac-5530-dhcp-debug.XXXXXX")"
         DEBUG_ARTIFACT_DIR_GENERATED=true
@@ -3785,6 +4587,9 @@ if [[ "$SUITE_USES_CLI" == true ]]; then
     fi
 fi
 
+# Normal E2E runs are idempotent across these deployment stages. Cleanup is a
+# separate command that skips all deployment and fabric initialization work.
+if [[ "$CLEANUP_MODE" != true ]]; then
 # Step 1: deploy or reuse the SNO with cluster-tool.
 step "STEP 1 OF 5: Deploying or reusing the SNO cluster"
 if ! cluster-tool servers 2>/dev/null | awk 'NR > 2 && $1 == "local" { found = 1 } END { exit !found }'; then
@@ -4061,6 +4866,7 @@ if [[ "$SUITE_USES_CLI" == true ]]; then
     ensure_osac_tenant
     "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" tenant "$OSAC_TENANT"
 fi
+fi
 
 netnode() {
     docker exec "$CONTAINERLAB_NET_NODE" "$@"
@@ -4214,7 +5020,8 @@ attach_client_to_subnet() {
     CLIENT_ATTACHMENT_SUBNET["$client"]="$subnet_ref"
     CLIENT_ATTACHMENT_PENDING["$client"]=true
     extra_vars="$TEMP_DIR/${client}-move-network-attachment.json"
-    result_file="$TEMP_DIR/${client}-move-network-attachment-result.json"
+    AAP_JOB_RESULT_SEQUENCE=$((AAP_JOB_RESULT_SEQUENCE + 1))
+    result_file="$TEMP_DIR/${client}-move-network-attachment-result-${AAP_JOB_RESULT_SEQUENCE}.json"
     write_client_bmi_extra_vars "$client" "$subnet_ref" "$extra_vars" false
     run_agentless_net_aap_job move-network-attachment "$extra_vars" "$result_file" \
         || die "AAP could not attach DHCP client ${client} to Subnet ${subnet_ref}"
@@ -4233,7 +5040,8 @@ discover_client_dhcp_lease() {
     lease_ip="$(jq -er '.address' "$TEMP_DIR/client-${client}.lease.json")" \
         || die "DHCP client ${client} has no IPv4 lease to query"
     extra_vars="$TEMP_DIR/${client}-query-dhcp-lease.json"
-    result_file="$TEMP_DIR/${client}-query-dhcp-lease-result.json"
+    AAP_JOB_RESULT_SEQUENCE=$((AAP_JOB_RESULT_SEQUENCE + 1))
+    result_file="$TEMP_DIR/${client}-query-dhcp-lease-result-${AAP_JOB_RESULT_SEQUENCE}.json"
     write_client_bmi_extra_vars "$client" "$subnet_ref" "$extra_vars" query
     run_agentless_net_aap_job query-dhcp-lease "$extra_vars" "$result_file" \
         || die "AAP could not discover the DHCP lease for client ${client}"
@@ -4261,7 +5069,8 @@ offboard_client_from_subnet() {
         return 1
     }
     extra_vars="$TEMP_DIR/${client}-offboard-network-attachment.json"
-    result_file="$TEMP_DIR/${client}-offboard-network-attachment-result.json"
+    AAP_JOB_RESULT_SEQUENCE=$((AAP_JOB_RESULT_SEQUENCE + 1))
+    result_file="$TEMP_DIR/${client}-offboard-network-attachment-result-${AAP_JOB_RESULT_SEQUENCE}.json"
     write_client_bmi_extra_vars "$client" "$subnet_ref" "$extra_vars" true \
         || return 1
     run_agentless_net_aap_job move-network-attachment "$extra_vars" "$result_file" \
@@ -4529,7 +5338,12 @@ create_dhcp_client_container() {
     client_link "$client"
     container="$(client_container "$client")"
     macvlan="$(client_macvlan_name "$client")"
-    docker run -d --name "$container" --network none \
+    docker run -d --name "$container" \
+        --label io.osac.e2e.runner=vlan-e2e \
+        --label "io.osac.e2e.client=${client}" \
+        --label "io.osac.e2e.prefix=${DHCP_CLIENT_PREFIX}" \
+        --label "io.osac.e2e.run-dir=${TEMP_DIR}" \
+        --network none \
         --cap-add NET_ADMIN --cap-add NET_RAW "$CLIENT_IMAGE" sleep 3600 >/dev/null
     DHCP_CLIENT_CONTAINERS+=("$container")
     sudo ip link add link "$CLIENT_HOST_PARENT" name "$macvlan" type macvlan mode bridge
@@ -6190,7 +7004,73 @@ run_external_ip_suite() {
     assert_baseline_state_unchanged
 }
 
-# Phase 5 starts only after provider access and one-time lab trunk setup pass.
+# Standalone cleanup uses the current deployment and fabric only. It deliberately
+# skips Steps 1-4 so cleanup never boots, deploys, upgrades, or initializes them.
+if [[ "$CLEANUP_MODE" == true ]]; then
+    step "Standalone cleanup: removing ${VLAN_E2E_SUITE} E2E resources"
+    oc get nodes >/dev/null \
+        || die "The existing OpenShift cluster is unavailable; cleanup will not deploy it"
+    oc wait deployment/fulfillment-grpc-server -n "$OSAC_NAMESPACE" \
+        --for=condition=Available --timeout=300s >/dev/null \
+        || die "The existing Fulfillment API is not available for cleanup"
+    oc wait deployment/osac-operator -n "$OSAC_NAMESPACE" \
+        --for=condition=Available --timeout=300s >/dev/null \
+        || die "The existing OSAC operator is not available for cleanup"
+    oc wait deployment/osac-aap-controller-task -n "$OSAC_NAMESPACE" \
+        --for=condition=Available --timeout=300s >/dev/null \
+        || die "The existing AAP controller is not available for cleanup"
+
+    CLUSTER_DOMAIN="$(oc get ingresses.config/cluster -o jsonpath='{.spec.domain}')"
+    [[ -n "$CLUSTER_DOMAIN" ]] || die "Could not read the existing cluster domain"
+    AAP_IMAGE="$(helm get values osac -n "$OSAC_NAMESPACE" --all -o json \
+        | jq -er '.aap.configAsCode.eeImage')" \
+        || die "Could not read the currently deployed AAP execution environment image"
+    [[ "$AAP_IMAGE" =~ ^quay\.io/[A-Za-z0-9._/-]+:[A-Za-z0-9._-]+$ ]] \
+        || die "The deployed AAP execution environment image reference is invalid"
+    AAP_API_CA_FILE="$TEMP_DIR/aap-api-ca.pem"
+    prepare_aap_ca_bundle
+    sync_aap_project_revision
+
+    resolve_mgmt_network
+    if ! docker inspect "$CONTAINERLAB_NET_NODE" >/dev/null 2>&1 \
+        || [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINERLAB_NET_NODE")" != true ]]; then
+        die "The existing Containerlab network node is unavailable; cleanup will not deploy the fabric"
+    fi
+    write_provider_inventory
+    ensure_containerlab_switches
+    ensure_cumulus_admin_identity
+    write_cumulus_ssh_config
+    prepare_containerlab_net_node
+    prepare_containerlab_switches
+    if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
+        prepare_containerlab_dhcp_supervisor
+        configure_aap_subnet_reader \
+            || die "Could not configure AAP Kubernetes authentication for cleanup of BMaaS attachments"
+    fi
+    prepare_aap_networking_instance_group
+
+    if [[ "$SUITE_USES_CLI" == true ]]; then
+        info "Building a temporary local Fulfillment CLI for cleanup..."
+        CLI_CA_FILE="$AAP_API_CA_FILE"
+        (
+            cd "${REPO_ROOT}/fulfillment-service"
+            go build -o "$CLI_BIN" ./cmd/osac
+        )
+        OSAC_API="https://fulfillment-api-${OSAC_NAMESPACE}.${CLUSTER_DOMAIN}"
+        OSAC_TOKEN_SCRIPT="oc create token -n ${OSAC_NAMESPACE} ${OSAC_SERVICE_ACCOUNT} --duration=1h"
+        "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" login \
+            --ca-file "$CLI_CA_FILE" \
+            --token-script "$OSAC_TOKEN_SCRIPT" \
+            "$OSAC_API"
+        "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" \
+            tenant "$OSAC_TENANT" >/dev/null \
+            || die "The existing E2E tenant is unavailable; cleanup will not create it"
+    fi
+
+    prepare_suite_cleanup
+    info "Cleanup is prepared; the exit handler will delete selected resources in dependency order."
+    exit 0
+fi
 step "STEP 5 OF 5: Running the ${VLAN_E2E_SUITE} E2E suite"
 
 # Preserve the full pre-test JSON snapshot. Only the UIDs created by this run
