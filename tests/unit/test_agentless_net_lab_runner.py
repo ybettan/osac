@@ -2,12 +2,12 @@ import base64
 import json
 import os
 import shlex
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
 import yaml
-
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNNER = REPO_ROOT / "vlan-e2e.sh"
@@ -1217,8 +1217,13 @@ CLI_BIN=
 CREATED_IDS=()
 CREATED_SUBNET_IDS=()
 CREATED_EXTERNAL_IP_IDS=()
+CREATED_EXTERNAL_IP_ATTACHMENT_IDS=()
+CREATED_BARE_METAL_INSTANCE_IDS=()
+cleanup_created_external_ip_attachments() {{ return 0; }}
+remove_external_ip_client_routes() {{ return 0; }}
 cleanup_created_external_ips() {{ return 0; }}
 cleanup_created_external_ip_pool() {{ return 0; }}
+cleanup_created_bare_metal_instances() {{ return 0; }}
 cleanup_created_subnets() {{ return 0; }}
 restore_dhcp_supervisor() {{ return 0; }}
 remove_netnode_public_key() {{ return 0; }}
@@ -1452,7 +1457,7 @@ create_dhcp_client_container b1
     assert set_mac < move_netns
 
 
-def test_runtime_source_falls_back_to_main_after_fixes_branch_is_deleted(tmp_path: Path) -> None:
+def test_runtime_source_pins_the_implementation_commit_and_requires_it_as_ancestor(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     repository.mkdir()
 
@@ -1473,22 +1478,14 @@ def test_runtime_source_falls_back_to_main_after_fixes_branch_is_deleted(tmp_pat
     production_file.write_text("fix source\n")
     git("add", "osac-aap/source.py")
     git("commit", "-m", "base")
-    git("checkout", "-b", "fixes/osac-6307-cumulus-5.16")
-    production_file.write_text("fixed source\n")
-    git("commit", "-am", "fix")
-    fixes_commit = git("rev-parse", "HEAD")
+    git("checkout", "-b", "osac-6308-external-ip-attachment")
+    production_file.write_text("implementation source\n")
+    git("commit", "-am", "implementation")
+    implementation_commit = git("rev-parse", "HEAD")
     git("checkout", "-b", "e2e")
     (repository / "vlan-e2e.sh").write_text("runner update\n")
     git("add", "vlan-e2e.sh")
     git("commit", "-m", "runner")
-    git("checkout", "main")
-    git("merge", "--ff-only", "fixes/osac-6307-cumulus-5.16")
-    (repository / "docs.md").write_text("main documentation update\n")
-    git("add", "docs.md")
-    git("commit", "-m", "docs")
-    main_commit = git("rev-parse", "HEAD")
-    git("branch", "-D", "fixes/osac-6307-cumulus-5.16")
-    git("checkout", "e2e")
 
     helper_start = SOURCE.index("resolve_runtime_source() {")
     helper_end = SOURCE.index("\n}\n", helper_start) + 3
@@ -1496,70 +1493,49 @@ def test_runtime_source_falls_back_to_main_after_fixes_branch_is_deleted(tmp_pat
     script = f"""
 set -euo pipefail
 {helper}
-resolve_runtime_source {shlex.quote(str(repository))} fixes/osac-6307-cumulus-5.16
+resolve_runtime_source {shlex.quote(str(repository))} osac-6308-external-ip-attachment
 """
     result = run_bash(tmp_path, script)
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["main", main_commit]
-    assert git("merge-base", "main", "HEAD") == fixes_commit
+    assert result.stdout.splitlines() == ["osac-6308-external-ip-attachment", implementation_commit]
+    assert git("merge-base", "osac-6308-external-ip-attachment", "HEAD") == implementation_commit
     assert subprocess.run(
-        ["git", "-C", str(repository), "diff", "--quiet", "main", "HEAD", "--", "osac-aap"]
+        ["git", "-C", str(repository), "diff", "--quiet", "osac-6308-external-ip-attachment", "HEAD", "--", "osac-aap"]
     ).returncode == 0
 
-    git("checkout", "main")
-    production_file.write_text("main changed production source\n")
-    git("commit", "-am", "main production update")
+    git("checkout", "osac-6308-external-ip-attachment")
+    production_file.write_text("implementation advanced\n")
+    git("commit", "-am", "advance implementation")
     git("checkout", "e2e")
     assert subprocess.run(
-        ["git", "-C", str(repository), "diff", "--quiet", "main", "HEAD", "--", "osac-aap"]
+        ["git", "-C", str(repository), "diff", "--quiet", "osac-6308-external-ip-attachment", "HEAD", "--", "osac-aap"]
     ).returncode == 1
-    assert fixes_commit != main_commit
+    advanced = run_bash(tmp_path, script)
+    assert advanced.returncode != 0
 
 
-def test_runtime_source_rejects_fixes_branch_advanced_past_e2e_base(tmp_path: Path) -> None:
+def test_runtime_source_rejects_a_missing_implementation_branch(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     repository.mkdir()
-
-    def git(*arguments: str) -> str:
-        result = subprocess.run(
-            ["git", "-C", str(repository), *arguments],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        return result.stdout.strip()
-
-    git("init", "--initial-branch=main")
-    git("config", "user.name", "E2E Test")
-    git("config", "user.email", "e2e@example.invalid")
-    production_file = repository / "osac-aap" / "source.py"
-    production_file.parent.mkdir()
-    production_file.write_text("base source\n")
-    git("add", "osac-aap/source.py")
-    git("commit", "-m", "base")
-    git("checkout", "-b", "fixes/osac-6307-cumulus-5.16")
-    production_file.write_text("fix source\n")
-    git("commit", "-am", "fix")
-    git("checkout", "-b", "e2e")
-    (repository / "vlan-e2e.sh").write_text("runner update\n")
-    git("add", "vlan-e2e.sh")
-    git("commit", "-m", "runner")
-    git("checkout", "fixes/osac-6307-cumulus-5.16")
-    production_file.write_text("advanced fix source\n")
-    git("commit", "-am", "advance fixes base")
-    git("checkout", "e2e")
+    subprocess.run(["git", "-C", str(repository), "init", "--initial-branch=main"], check=True)
+    subprocess.run(["git", "-C", str(repository), "config", "user.name", "E2E Test"], check=True)
+    subprocess.run(["git", "-C", str(repository), "config", "user.email", "e2e@example.invalid"], check=True)
+    source = repository / "osac-aap" / "source.py"
+    source.parent.mkdir()
+    source.write_text("base\n")
+    subprocess.run(["git", "-C", str(repository), "add", "osac-aap/source.py"], check=True)
+    subprocess.run(["git", "-C", str(repository), "commit", "-m", "base"], check=True)
 
     helper_start = SOURCE.index("resolve_runtime_source() {")
     helper_end = SOURCE.index("\n}\n", helper_start) + 3
     helper = SOURCE[helper_start:helper_end]
-    script = f"""
-set -euo pipefail
-{helper}
-resolve_runtime_source {shlex.quote(str(repository))} fixes/osac-6307-cumulus-5.16
-"""
-    result = run_bash(tmp_path, script)
-
+    result = run_bash(
+        tmp_path,
+        f"set -euo pipefail\n{helper}\n"
+        f"resolve_runtime_source {shlex.quote(str(repository))} "
+        "osac-6308-external-ip-attachment\n",
+    )
     assert result.returncode != 0
 
 
@@ -1579,11 +1555,276 @@ def test_runner_stages_are_ordered_and_source_revision_is_pinned():
     assert 'IMAGE_SOURCE_COMMIT="$RUNTIME_SOURCE_COMMIT"' in SOURCE
 
 
-def test_full_suite_runs_external_ip_lifecycle_before_virtual_networks():
+def test_full_suite_runs_attachment_lifecycle_after_creating_its_network_and_bmi():
     suite = function_block("run_full_suite", "run_virtual_network_suite")
 
     assert suite.index("create_external_ip_pool") < suite.index("run_external_ip_lifecycle")
-    assert suite.index("run_external_ip_lifecycle") < suite.index("create_virtual_network")
+    assert suite.index("run_subnet_dhcp_checks") < suite.index("create_external_ip_attachment_test_network_and_bmi")
+    assert suite.index("create_external_ip_attachment_test_network_and_bmi") < suite.index("run_external_ip_lifecycle")
+    assert suite.index("run_external_ip_lifecycle") < suite.index("cleanup_created_bare_metal_instances")
+    assert suite.index("cleanup_created_bare_metal_instances") < suite.index("delete_subnet_by_id")
+
+
+def test_external_ip_suite_selects_attachment_dependencies_but_pool_suite_stays_scoped(tmp_path: Path) -> None:
+    start = SOURCE.index('case "$VLAN_E2E_SUITE" in')
+    end = SOURCE.index("\nREPO_ROOT=", start)
+    suite_flags = SOURCE[start:end]
+
+    def resolve(suite: str) -> subprocess.CompletedProcess[str]:
+        return run_bash(
+            tmp_path,
+            "set -euo pipefail\n"
+            f'VLAN_E2E_SUITE="{suite}"\n'
+            f"{suite_flags}\n"
+            "printf '%s\\n' \"$SUITE_USES_VN $SUITE_USES_SUBNET $SUITE_USES_SUBNET_DHCP "
+            "$SUITE_USES_POOL $SUITE_USES_CLI $SUITE_USES_EXTERNAL_IP "
+            '$SUITE_USES_EXTERNAL_IP_ATTACHMENT"\n',
+        )
+
+    result = resolve("external-ip")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "true true false true true true true"
+
+    result = resolve("external-ip-pool")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "false false false true false false false"
+
+
+def test_external_ip_probe_uses_upstream_route_and_allocated_external_ip(tmp_path: Path) -> None:
+    route = function_block("add_external_ip_client_route", "remove_external_ip_client_route")
+    probe = function_block("probe_external_ip_response", "assert_external_ip_attachment_provider_absent")
+    events = tmp_path / "external-ip-probe.log"
+    script = f"""
+set -euo pipefail
+CONTAINERLAB_UPSTREAM_ROUTER=upstream-router
+MGMT_PREFIX=192.0.2
+EXTERNAL_IP_CLIENT_ROUTE_INTERFACE=eth0
+EXTERNAL_IP_CLIENT_ROUTE_GATEWAY=
+EXTERNAL_IP_CLIENT_ROUTE_ADDRESSES=()
+EXTERNAL_IP_RESPONSE_PORT=18080
+EVENTS={shlex.quote(str(events))}
+docker() {{
+    printf '%s\\n' "$*" >>"$EVENTS"
+    if [[ "$*" == *"wget "* ]]; then printf 'response-token\\n'; fi
+}}
+{route}
+{probe}
+add_external_ip_client_route 198.51.100.21
+[[ "$(probe_external_ip_response 198.51.100.21)" == response-token ]]
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    operations = events.read_text().splitlines()
+    assert any("ip route add 198.51.100.21/32 via 192.0.2.30 dev eth0" in line for line in operations)
+    assert any("http://198.51.100.21:18080/osac-eia-response" in line for line in operations)
+    assert all("10.250." not in line for line in operations)
+
+
+def test_external_ip_cleanup_orders_detach_before_dependent_resources() -> None:
+    cleanup = function_block("cleanup_created_virtual_networks", "on_exit")
+
+    positions = [
+        cleanup.index("cleanup_created_external_ip_attachments"),
+        cleanup.index("remove_external_ip_client_routes"),
+        cleanup.index("cleanup_created_external_ips"),
+        cleanup.index("cleanup_created_external_ip_pool"),
+        cleanup.index("cleanup_created_bare_metal_instances"),
+        cleanup.index("cleanup_created_subnets"),
+        cleanup.index('delete virtualnetwork "$id"'),
+    ]
+    assert positions == sorted(positions)
+
+
+def test_failed_attachment_detach_preserves_all_dependent_resources(tmp_path: Path) -> None:
+    cleanup = function_block("cleanup_created_virtual_networks", "on_exit")
+    events = tmp_path / "failed-attachment-cleanup.log"
+    script = f"""
+set -euo pipefail
+CLEANUP_MODE=false
+CLEANUP_DISCOVERY_COMPLETE=false
+CLEANUP_PENDING_POOL_IDS=()
+CREATED_EXTERNAL_IP_ATTACHMENT_IDS=(attachment-id)
+CREATED_EXTERNAL_IP_IDS=(external-ip-id)
+CREATED_BARE_METAL_INSTANCE_IDS=(bmi-id)
+CREATED_SUBNET_IDS=(subnet-id)
+CREATED_IDS=(vn-id)
+TEMP_DIR=/tmp
+CLI_BIN=
+CLI_CONFIG_DIR=
+EXTERNAL_IP_POOL_PENDING_CLEANUP=true
+PRESERVE_E2E_RECOVERY_ARTIFACTS=false
+EVENTS={shlex.quote(str(events))}
+cleanup_created_external_ip_attachments() {{ printf 'detach\\n' >>"$EVENTS"; return 1; }}
+remove_external_ip_client_routes() {{ printf 'route\\n' >>"$EVENTS"; return 0; }}
+cleanup_created_external_ips() {{ printf 'external-ip\\n' >>"$EVENTS"; return 0; }}
+cleanup_created_external_ip_pool() {{ printf 'pool\\n' >>"$EVENTS"; return 0; }}
+cleanup_created_bare_metal_instances() {{ printf 'bmi\\n' >>"$EVENTS"; return 0; }}
+cleanup_created_subnets() {{ printf 'subnet\\n' >>"$EVENTS"; return 0; }}
+info() {{ :; }}
+{cleanup}
+if cleanup_created_virtual_networks 0; then exit 1; fi
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert events.read_text().splitlines() == ["detach"]
+
+
+def test_standalone_external_ip_cleanup_is_idempotent_for_absent_attachment(tmp_path: Path) -> None:
+    remove_id = function_block("external_ip_attachment_remove_created_id", "create_external_ip_attachment")
+    cleanup = function_block("cleanup_created_external_ip_attachments", "remove_external_ip_client_routes")
+    script = f"""
+set -euo pipefail
+CLI_BIN=/bin/true
+CLI_CONFIG_DIR=/tmp
+CREATED_EXTERNAL_IP_ATTACHMENT_IDS=(already-removed)
+state_snapshot() {{ printf '{{"external_ip_attachments":[]}}\\n'; }}
+external_ip_attachment_crs_json() {{ printf '{{"items":[]}}\\n'; }}
+{remove_id}
+{cleanup}
+cleanup_created_external_ip_attachments
+[[ "${{#CREATED_EXTERNAL_IP_ATTACHMENT_IDS[@]}}" == 0 ]]
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_external_ip_state_snapshot_and_peer_checks_include_attachments() -> None:
+    assert '"external_ip_attachments": attachment_entries' in SOURCE
+    assert "external_ip_attachments external_ip_attachments" not in SOURCE
+    assert "for collection in virtual_networks subnets external_ip_pools external_ips external_ip_attachments" in SOURCE
+    assert 'peer_state="$(external_ip_attachment_state_entry' in SOURCE
+    assert "changed its peer attachment state" in SOURCE
+
+
+def test_external_ip_attachment_target_is_created_through_fulfillment() -> None:
+    setup = function_block(
+        "create_external_ip_attachment_test_network_and_bmi", "delete_primary_virtual_network_for_suite"
+    )
+    wait = function_block("wait_for_external_ip_bmi_ready", "external_ip_attachment_assert_result")
+
+    assert 'create baremetalinstance --name "$EXTERNAL_IP_BMI_NAME"' in setup
+    assert '--catalog-item "$OSAC_BMI_CATALOG_ITEM"' in setup
+    assert 'wait_for_external_ip_bmi_ready "$EXTERNAL_IP_BMI_ID"' in setup
+    assert "select(.primary == true)" in wait
+    assert '"$subnet_ref" == "$EXTERNAL_IP_ATTACHMENT_SUBNET_ID"' in wait
+    assert ".status.phase" in wait and "== Ready" in wait
+    assert '"kind": "BareMetalInstance"' not in setup
+    assert "ip -4 -o addr show dev {interface}" in setup
+    assert '--bind "$address"' in setup
+
+
+def test_external_ip_bmi_user_data_binds_response_service_to_primary_interface(tmp_path: Path) -> None:
+    setup = function_block("create_external_ip_attachment_test_network_and_bmi", "cleanup_created_bare_metal_instances")
+    body_start = setup.index("<<'PY'\n") + len("<<'PY'\n")
+    body_end = setup.index("\nPY\n", body_start)
+    generator = setup[body_start:body_end]
+    output = tmp_path / "bmi-user-data.yaml"
+    result = subprocess.run(
+        [sys.executable, "-", "osac-eia-test-token", "18080", "eth9", str(output)],
+        input=generator,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    user_data = yaml.safe_load(output.read_text())
+    files = {entry["path"]: entry for entry in user_data["write_files"]}
+    response_service = files["/usr/local/sbin/osac-eia-response.sh"]["content"]
+    assert "ip -4 -o addr show dev eth9" in response_service
+    assert '--bind "$address"' in response_service
+    service_unit = files["/etc/systemd/system/osac-eia-response.service"]["content"]
+    assert "ExecStart=/usr/local/sbin/osac-eia-response.sh" in service_unit
+    assert "/osac-eia-response" not in response_service
+    assert files["/var/tmp/osac-eia-response"]["content"] == "osac-eia-test-token"
+
+
+def test_attachment_cleanup_discovery_checks_prefix_tenant_and_parent_scope() -> None:
+    cleanup = function_block("prepare_suite_cleanup", "supervisor_service_status_is_absent")
+
+    assert "bmi_filter='this.metadata.name.startsWith(\"agentless-eip-bmi-\")'" in cleanup
+    assert "attachment_filter='this.metadata.name.startsWith(\"agentless-eip-attach-\")'" in cleanup
+    assert "all(.[]; .metadata.tenant == $tenant" in cleanup
+    assert "references an ExternalIP outside the test name scope" in cleanup
+    assert "references a BMI outside the test name scope" in cleanup
+
+
+def test_state_snapshot_includes_attachment_rows_and_accepts_existing_schema_v1(tmp_path: Path) -> None:
+    helper = function_block("state_snapshot", "save_current_state")
+    body_start = helper.index("<<'PY'\n") + len("<<'PY'\n")
+    body_end = helper.index("\nPY\n", body_start)
+    snapshot_code = helper[body_start:body_end]
+
+    def create_state(path: Path, *, attachments: bool) -> None:
+        connection = sqlite3.connect(path)
+        connection.executescript(
+            """
+            CREATE TABLE virtual_networks (uid TEXT, tenant_id TEXT, virtual_network_cidr TEXT,
+              namespace_name TEXT, namespace_interface TEXT, host_interface TEXT,
+              transit_cidr TEXT, transit_start TEXT, payload TEXT);
+            CREATE TABLE subnets (uid TEXT, virtual_network_uid TEXT, tenant_id TEXT, vlan_id INTEGER,
+              vlan_interface TEXT, ipv4_cidr TEXT, phase TEXT, payload TEXT);
+            CREATE TABLE external_ip_pools (uid TEXT, fulfillment_id TEXT, tenant_id TEXT,
+              ip_family TEXT, ipv4_cidr TEXT);
+            CREATE TABLE external_ips (uid TEXT, fulfillment_id TEXT, tenant_id TEXT,
+              pool_uid TEXT, address TEXT);
+            """
+        )
+        if attachments:
+            connection.executescript(
+                """
+                CREATE TABLE attachments (uid TEXT, fulfillment_id TEXT, tenant_id TEXT,
+                  external_ip_uid TEXT, virtual_network_uid TEXT, subnet_uid TEXT,
+                  external_address TEXT, phase TEXT, payload TEXT);
+                """
+            )
+            connection.execute(
+                "INSERT INTO attachments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "attachment-uid",
+                    "attachment-id",
+                    "test-tenant",
+                    "eip-uid",
+                    "vn-uid",
+                    "subnet-uid",
+                    "198.51.100.21",
+                    "ready",
+                    json.dumps({"context": {"target": {"ip_address": "10.250.1.5"}}}),
+                ),
+            )
+        connection.execute("PRAGMA user_version=1")
+        connection.commit()
+        connection.close()
+
+    def read_state(path: Path) -> dict[str, object]:
+        result = subprocess.run(
+            [sys.executable, "-", str(path)], input=snapshot_code, capture_output=True, text=True, check=True
+        )
+        return json.loads(result.stdout)
+
+    current_schema = tmp_path / "current.sqlite3"
+    create_state(current_schema, attachments=True)
+    snapshot = read_state(current_schema)
+    assert snapshot["external_ip_attachments"] == [
+        {
+            "uid": "attachment-uid",
+            "fulfillment_id": "attachment-id",
+            "tenant_id": "test-tenant",
+            "external_ip_uid": "eip-uid",
+            "virtual_network_uid": "vn-uid",
+            "subnet_uid": "subnet-uid",
+            "external_address": "198.51.100.21",
+            "phase": "ready",
+            "payload": {"context": {"target": {"ip_address": "10.250.1.5"}}},
+        }
+    ]
+
+    previous_schema = tmp_path / "previous.sqlite3"
+    create_state(previous_schema, attachments=False)
+    assert read_state(previous_schema)["external_ip_attachments"] == []
 
 
 def test_suite_flags_select_the_same_scope_for_run_and_cleanup(tmp_path):
