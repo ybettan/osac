@@ -22,7 +22,7 @@ Suites:
   virtual-network   Create, verify, and delete one VirtualNetwork.
   subnet-dhcp       Create a parent VirtualNetwork and run the Subnet/DHCP E2E.
   external-ip-pool  Create, verify, and delete one ExternalIPPool.
-  external-ip       Allocate, retry, and release ExternalIPs through Fulfillment.
+  external-ip       Verify ExternalIP allocation and a BMaaS ExternalIPAttachment.
 
 All suites boot or reuse the SNO, deploy or reuse OSAC and the Containerlab
 fabric, initialize the declared trunks, and run the selected checks. Set
@@ -35,6 +35,13 @@ uses the existing lab and exits without deploying or initializing it.
 The runner requires a compatible AgentlessNet schema V1 database and preserves
 any incompatible existing state. Keep the AgentlessNet state schema at V1 until
 OSAC-5528 is complete.
+The --external-ip and --full suites also require BMaaS to be enabled, an
+available BMaaS host, and a suitable CatalogItem. OSAC_BMI_CATALOG_ITEM
+defaults to ci-bm-default; OSAC_BMI_NETWORK_INTERFACE defaults to eth9.
+OSAC_BMI_INSTANCE_TYPE and OSAC_BMI_DISK_IMAGE may select explicit defaults
+when the CatalogItem does not provide them. The ingress probe uses a test-only
+static route from upstream-router to the network node; it does not test BGP
+advertisement.
 
 Examples:
   bash ./vlan-e2e.sh
@@ -93,38 +100,48 @@ done
 case "$VLAN_E2E_SUITE" in
     full)
         SUITE_USES_VN=true
+        SUITE_USES_SUBNET=true
         SUITE_USES_SUBNET_DHCP=true
         SUITE_USES_POOL=true
         SUITE_USES_CLI=true
         SUITE_USES_EXTERNAL_IP=true
+        SUITE_USES_EXTERNAL_IP_ATTACHMENT=true
         ;;
     virtual-network)
         SUITE_USES_VN=true
+        SUITE_USES_SUBNET=false
         SUITE_USES_SUBNET_DHCP=false
         SUITE_USES_POOL=false
         SUITE_USES_CLI=true
         SUITE_USES_EXTERNAL_IP=false
+        SUITE_USES_EXTERNAL_IP_ATTACHMENT=false
         ;;
     subnet-dhcp)
         SUITE_USES_VN=true
+        SUITE_USES_SUBNET=true
         SUITE_USES_SUBNET_DHCP=true
         SUITE_USES_POOL=false
         SUITE_USES_CLI=true
         SUITE_USES_EXTERNAL_IP=false
+        SUITE_USES_EXTERNAL_IP_ATTACHMENT=false
         ;;
     external-ip-pool)
         SUITE_USES_VN=false
+        SUITE_USES_SUBNET=false
         SUITE_USES_SUBNET_DHCP=false
         SUITE_USES_POOL=true
         SUITE_USES_CLI=false
         SUITE_USES_EXTERNAL_IP=false
+        SUITE_USES_EXTERNAL_IP_ATTACHMENT=false
         ;;
     external-ip)
-        SUITE_USES_VN=false
+        SUITE_USES_VN=true
+        SUITE_USES_SUBNET=true
         SUITE_USES_SUBNET_DHCP=false
         SUITE_USES_POOL=true
         SUITE_USES_CLI=true
         SUITE_USES_EXTERNAL_IP=true
+        SUITE_USES_EXTERNAL_IP_ATTACHMENT=true
         ;;
 esac
 
@@ -139,6 +156,7 @@ CONTAINERLAB_CONFIGURE_PLAYBOOK="${FABRIC_DIR}/configure_network.yml"
 CONTAINERLAB_NAME="agentless-net-lab"
 CONTAINERLAB_PREFIX="clab-${CONTAINERLAB_NAME}"
 CONTAINERLAB_NET_NODE="${CONTAINERLAB_PREFIX}-net-node"
+CONTAINERLAB_UPSTREAM_ROUTER="${CONTAINERLAB_PREFIX}-upstream-router"
 CONTAINERLAB="${CONTAINERLAB:-containerlab}"
 MGMT_CLONE_NAME="${MGMT_CLONE_NAME:-agentless-lab-mgmt}"
 MGMT_VM_NAME="test-infra-cluster-${MGMT_CLONE_NAME}-master-0"
@@ -169,7 +187,7 @@ CLIENT_IMAGE="${CLIENT_IMAGE:-busybox:1.36.1}"
 VLAN_E2E_DEBUG="${VLAN_E2E_DEBUG:-false}"
 VLAN_E2E_ARTIFACT_DIR="${VLAN_E2E_ARTIFACT_DIR:-}"
 DHCP_CLIENT_PREFIX="${DHCP_CLIENT_PREFIX:-osac5530-$(date -u +%Y%m%d%H%M%S)}"
-FIXES_BRANCH_NAME="fixes/osac-6307-cumulus-5.16"
+IMPLEMENTATION_BRANCH_NAME="osac-6308-external-ip-attachment"
 CURRENT_BRANCH="$(git -C "$REPO_ROOT" branch --show-current)"
 if [[ "$CURRENT_BRANCH" != e2e ]]; then
     printf 'ERROR: run vlan-e2e.sh from the e2e branch; current branch is %s\n' "$CURRENT_BRANCH" >&2
@@ -177,25 +195,17 @@ if [[ "$CURRENT_BRANCH" != e2e ]]; then
 fi
 
 resolve_runtime_source() {
-    local repo="$1" fixes_branch="$2" source_branch source_commit
-    if source_commit="$(git -C "$repo" rev-parse --verify \
-        "refs/heads/${fixes_branch}^{commit}" 2>/dev/null)"; then
-        source_branch="$fixes_branch"
-        git -C "$repo" merge-base --is-ancestor "$source_commit" HEAD || return 1
-    else
-        source_branch=main
-        if ! source_commit="$(git -C "$repo" rev-parse --verify \
-            'refs/heads/main^{commit}' 2>/dev/null)"; then
-            return 1
-        fi
-        git -C "$repo" merge-base main HEAD >/dev/null || return 1
-    fi
+    local repo="$1" implementation_branch="$2" source_commit
+    source_commit="$(git -C "$repo" rev-parse --verify \
+        "refs/heads/${implementation_branch}^{commit}" 2>/dev/null)" || return 1
+    git -C "$repo" merge-base --is-ancestor "$source_commit" HEAD || return 1
+    local source_branch="$implementation_branch"
     printf '%s\n%s\n' "$source_branch" "$source_commit"
 }
 
-if ! RUNTIME_SOURCE_INFO="$(resolve_runtime_source "$REPO_ROOT" "$FIXES_BRANCH_NAME")"; then
-    printf 'ERROR: e2e must be based on local %s, or on main after that branch is merged\n' \
-        "$FIXES_BRANCH_NAME" >&2
+if ! RUNTIME_SOURCE_INFO="$(resolve_runtime_source "$REPO_ROOT" "$IMPLEMENTATION_BRANCH_NAME")"; then
+    printf 'ERROR: e2e must include local implementation branch %s\n' \
+        "$IMPLEMENTATION_BRANCH_NAME" >&2
     exit 1
 fi
 mapfile -t RUNTIME_SOURCE_FIELDS <<<"$RUNTIME_SOURCE_INFO"
@@ -232,14 +242,17 @@ AAP_PROJECT_GIT_URI="${AAP_PROJECT_GIT_URI:-https://github.com/ybettan/osac}"
 AAP_PROJECT_GIT_BRANCH="${AAP_PROJECT_GIT_BRANCH:-${RUNTIME_SOURCE_BRANCH}}"
 AAP_PREFIX="${AAP_PREFIX:-${AAP_ORGANIZATION_NAME:-osac}}"
 AAP_PROJECT_NAME="${AAP_PROJECT_NAME:-${AAP_PREFIX}}"
-# AAP executes production project code from fixes during development, then
-# main after that branch is merged and removed. Runner-only commits never change
-# the runtime project revision or image tags.
+# AAP executes the exact OSAC-6308 implementation commit. Runner-only commits
+# never change the runtime project revision or image tags.
 AAP_PROJECT_EXPECTED_REVISION="${AAP_PROJECT_EXPECTED_REVISION:-${RUNTIME_SOURCE_COMMIT}}"
 
 OSAC_NAMESPACE="${OSAC_NAMESPACE:-osac-e2e-ci}"
 OSAC_TENANT="${OSAC_TENANT:-osac-e2e-ci}"
 OSAC_SERVICE_ACCOUNT="${OSAC_SERVICE_ACCOUNT:-osac-operator}"
+OSAC_BMAAS_NAMESPACE="${OSAC_BMAAS_NAMESPACE:-osac-baremetalinstance}"
+OSAC_BMI_CATALOG_ITEM="${OSAC_BMI_CATALOG_ITEM:-ci-bm-default}"
+OSAC_BMI_INSTANCE_TYPE="${OSAC_BMI_INSTANCE_TYPE:-${OSAC_BM_HOST_TYPE:-}}"
+OSAC_BMI_NETWORK_INTERFACE="${OSAC_BMI_NETWORK_INTERFACE:-eth9}"
 NETWORKING_NAMESPACE="${OSAC_NETWORKING_NAMESPACE:-${OSAC_NAMESPACE}}"
 AGENTLESS_NET_STATE_FILE="${AGENTLESS_NET_STATE_FILE:-/etc/osac/agentless_network_state.sqlite3}"
 AGENTLESS_NET_HOST=""
@@ -267,6 +280,8 @@ VIRTUAL_NETWORK_IPV4_CIDR="${VIRTUAL_NETWORK_IPV4_CIDR:-10.250.0.0/16}"
 SUBNET_ONE_NAME="${SUBNET_ONE_NAME:-${VIRTUAL_NETWORK_NAME}-subnet-a}"
 SUBNET_TWO_NAME="${SUBNET_TWO_NAME:-${VIRTUAL_NETWORK_NAME}-subnet-b}"
 SUBNET_THREE_NAME="${SUBNET_THREE_NAME:-${VIRTUAL_NETWORK_NAME}-subnet-30}"
+EXTERNAL_IP_ATTACHMENT_SUBNET_NAME="${VIRTUAL_NETWORK_NAME}-eip-subnet"
+EXTERNAL_IP_ATTACHMENT_SUBNET_CIDR="${OSAC_EIA_SUBNET_IPV4_CIDR:-}"
 SUBNET_ONE_IPV4_CIDR="${SUBNET_ONE_IPV4_CIDR:-}"
 SUBNET_TWO_IPV4_CIDR="${SUBNET_TWO_IPV4_CIDR:-}"
 SUBNET_THREE_IPV4_CIDR="${SUBNET_THREE_IPV4_CIDR:-}"
@@ -280,6 +295,16 @@ EXTERNAL_IP_POOL_CIDR_RESOLVED=false
 EXTERNAL_IP_PREFIX="agentless-eip-$(date -u +%Y%m%d%H%M%S)-$$"
 EXTERNAL_IP_ONE_NAME="${EXTERNAL_IP_PREFIX}-a"
 EXTERNAL_IP_TWO_NAME="${EXTERNAL_IP_PREFIX}-b"
+EXTERNAL_IP_ATTACHMENT_PREFIX="agentless-eip-attach-$(date -u +%Y%m%d%H%M%S)-$$"
+EXTERNAL_IP_ATTACHMENT_ONE_NAME="${EXTERNAL_IP_ATTACHMENT_PREFIX}-a"
+EXTERNAL_IP_ATTACHMENT_TWO_NAME="${EXTERNAL_IP_ATTACHMENT_PREFIX}-b"
+EXTERNAL_IP_BMI_NAME="agentless-eip-bmi-$(date -u +%Y%m%d%H%M%S)-$$"
+EXTERNAL_IP_RESPONSE_PORT="${OSAC_EIA_RESPONSE_PORT:-18080}"
+EXTERNAL_IP_RESPONSE_TOKEN=""
+EXTERNAL_IP_CLIENT_ROUTE_GATEWAY=""
+EXTERNAL_IP_CLIENT_ROUTE_INTERFACE="eth0"
+EXTERNAL_IP_CLIENT_ROUTE_ADDRESSES=()
+CLEANUP_EIP_ADDRESSES=()
 
 CLI_BIN="${OSAC_CLI_BIN:-}"
 CLI_CONFIG_DIR="${OSAC_CLI_CONFIG_DIR:-}"
@@ -291,8 +316,14 @@ GENERATED_CLI_CONFIG=false
 CREATED_IDS=()
 CREATED_SUBNET_IDS=()
 CREATED_EXTERNAL_IP_IDS=()
+CREATED_EXTERNAL_IP_ATTACHMENT_IDS=()
+CREATED_BARE_METAL_INSTANCE_IDS=()
 CLEANUP_VN_UIDS=()
 CLEANUP_SUBNET_UIDS=()
+CLEANUP_ATTACHMENT_UIDS=()
+CLEANUP_ATTACHMENT_IDS=()
+CLEANUP_BMI_IDS=()
+CLEANUP_BMI_UIDS=()
 CLEANUP_POOL_UIDS=()
 CLEANUP_POOL_IDS=()
 CLEANUP_POOL_CIDRS=()
@@ -371,6 +402,8 @@ label_selector() { printf 'osac.openshift.io/virtualnetwork-uuid=%s' "$1"; }
 subnet_label_selector() { printf 'osac.openshift.io/subnet-uuid=%s' "$1"; }
 external_ip_pool_label_selector() { printf 'osac.openshift.io/externalippool-uuid=%s' "$1"; }
 external_ip_label_selector() { printf 'osac.openshift.io/externalip-uuid=%s' "$1"; }
+external_ip_attachment_label_selector() { printf 'osac.openshift.io/externalipattachment-uuid=%s' "$1"; }
+baremetal_instance_label_selector() { printf 'osac.openshift.io/baremetalinstance-uuid=%s' "$1"; }
 
 assert_provider_schema_v1() {
     python3 - "$AAP_DIR/collections/ansible_collections/osac/templates/plugins/module_utils/agentless_net_state.py" <<'PY'
@@ -2837,6 +2870,417 @@ external_ip_cr_json() {
       end' <<<"$json"
 }
 
+external_ip_attachment_crs_json() {
+    local selector
+    selector="$(external_ip_attachment_label_selector "$1")"
+    oc get externalipattachments -n "$NETWORKING_NAMESPACE" -l "$selector" \
+        -o json --request-timeout=20s
+}
+
+external_ip_attachment_cr_json() {
+    local id="$1" json
+    json="$(external_ip_attachment_crs_json "$id")" \
+        || die "Kubernetes API failed while looking up ExternalIPAttachment UUID ${id}"
+    jq -ce --arg id "$id" --arg tenant "$OSAC_TENANT" \
+        --arg namespace "$NETWORKING_NAMESPACE" '
+      if (.items | length) != 1 then
+        error("expected one ExternalIPAttachment CR for Fulfillment UUID " + $id)
+      else
+        .items[0] as $attachment
+        | if $attachment.metadata.labels["osac.openshift.io/externalipattachment-uuid"] != $id then
+            error("ExternalIPAttachment UUID label does not match the requested resource")
+          elif $attachment.metadata.annotations["osac.openshift.io/tenant"] != $tenant then
+            error("ExternalIPAttachment tenant annotation does not match the test tenant")
+          elif $attachment.metadata.annotations["osac.openshift.io/implementation-strategy"] != "agentless_net" then
+            error("ExternalIPAttachment did not resolve to AgentlessNet")
+          elif $attachment.metadata.annotations["osac.openshift.io/externalipattachment-contract-version"] != "v1" then
+            error("ExternalIPAttachment is not using the v1 contract")
+          elif $attachment.metadata.namespace != $namespace then
+            error("ExternalIPAttachment is in an unexpected namespace")
+          elif ($attachment.metadata.name | startswith("agentless-eip-attach-") | not) then
+            error("ExternalIPAttachment is outside the test name scope")
+          else $attachment end
+      end' <<<"$json"
+}
+
+baremetal_instance_crs_json() {
+    local selector
+    selector="$(baremetal_instance_label_selector "$1")"
+    oc get baremetalinstances -A -l "$selector" -o json --request-timeout=20s
+}
+
+baremetal_instance_cr_json() {
+    local id="$1" json
+    json="$(baremetal_instance_crs_json "$id")" \
+        || die "Kubernetes API failed while looking up BareMetalInstance UUID ${id}"
+    jq -ce --arg id "$id" --arg tenant "$OSAC_TENANT" '
+      if (.items | length) != 1 then
+        error("expected one BareMetalInstance CR for Fulfillment UUID " + $id)
+      else
+        .items[0] as $instance
+        | if $instance.metadata.labels["osac.openshift.io/baremetalinstance-uuid"] != $id then
+            error("BareMetalInstance UUID label does not match the requested resource")
+          elif $instance.metadata.annotations["osac.openshift.io/tenant"] != $tenant then
+            error("BareMetalInstance tenant annotation does not match the test tenant")
+          elif ($instance.metadata.name | startswith("agentless-eip-bmi-") | not) then
+            error("BareMetalInstance is outside the test name scope")
+          else $instance end
+      end' <<<"$json"
+}
+
+wait_for_external_ip_bmi_ready() {
+    local id="$1" deadline=$((SECONDS + 3600)) crs count cr phase primary_status
+    local subnet_ref ip_address
+    info "Waiting for Fulfillment-backed BareMetalInstance ${id} to be Ready with its primary Subnet address..."
+    while ((SECONDS < deadline)); do
+        if ! crs="$(baremetal_instance_crs_json "$id")"; then
+            die "Kubernetes API failed while looking up BareMetalInstance UUID ${id}"
+        fi
+        count="$(jq -er '.items | length' <<<"$crs")" \
+            || die "Could not count BareMetalInstance CRs for UUID ${id}"
+        if [[ "$count" == 0 ]]; then
+            sleep 5
+            continue
+        fi
+        [[ "$count" == 1 ]] || die "Expected one BareMetalInstance CR for UUID ${id}; found ${count}"
+        cr="$(baremetal_instance_cr_json "$id")"
+        phase="$(jq -r '.status.phase // ""' <<<"$cr")"
+        [[ "$phase" != Failed ]] || { printf '%s\n' "$cr" >&2; die "BareMetalInstance ${id} failed provisioning"; }
+        primary_status="$(jq -c '[.status.networkAttachmentStatuses[]? | select(.primary == true)]' <<<"$cr")"
+        if [[ "$phase" == Ready && "$(jq -r 'length' <<<"$primary_status")" == 1 ]]; then
+            subnet_ref="$(jq -r '.[0].subnetRef // ""' <<<"$primary_status")"
+            ip_address="$(jq -r '.[0].ipAddress // ""' <<<"$primary_status")"
+            if [[ "$subnet_ref" == "$EXTERNAL_IP_ATTACHMENT_SUBNET_ID" && -n "$ip_address" ]]; then
+                python3 - "$ip_address" "$EXTERNAL_IP_ATTACHMENT_SUBNET_CIDR" <<'PY' \
+                    || die "BareMetalInstance ${id} primary address is not IPv4 within the test Subnet"
+import ipaddress
+import sys
+
+address = ipaddress.ip_address(sys.argv[1])
+subnet = ipaddress.ip_network(sys.argv[2], strict=True)
+if not isinstance(address, ipaddress.IPv4Address) or address not in subnet:
+    raise SystemExit(1)
+PY
+                EXTERNAL_IP_BMI_K8S_UID="$(jq -er '.metadata.uid' <<<"$cr")"
+                EXTERNAL_IP_BMI_NAMESPACE="$(jq -er '.metadata.namespace' <<<"$cr")"
+                EXTERNAL_IP_BMI_PRIMARY_IP="$ip_address"
+                info "BareMetalInstance ${id} is Ready at ${ip_address} on Subnet ${subnet_ref}"
+                return 0
+            fi
+        fi
+        sleep 5
+    done
+    die "Timed out waiting for BareMetalInstance ${id} to report a Ready primary Subnet address"
+}
+
+external_ip_attachment_assert_result() {
+    local artifacts="$1" operation="$2" uid="$3" generation="$4"
+    jq -e --arg operation "$operation" --arg uid "$uid" \
+        --argjson generation "$generation" '
+      .osac_result as $result
+      | $result.schemaVersion == "v1"
+        and $result.operation == $operation
+        and $result.resourceUID == $uid
+        and $result.observedGeneration == $generation
+        and $result.data == {}' <<<"$artifacts" >/dev/null
+}
+
+external_ip_attachment_state_entry() {
+    local uid="$1" fulfillment_id="$2"
+    save_current_state
+    jq -ceS --arg uid "$uid" --arg id "$fulfillment_id" '
+      [.external_ip_attachments[] | select(.uid == $uid and .fulfillment_id == $id)]
+      | if length == 1 then .[0] else error("expected one saved ExternalIPAttachment") end' \
+        "$CURRENT_STATE_FILE"
+}
+
+external_ip_attachment_remove_created_id() {
+    local id="$1" index
+    for index in "${!CREATED_EXTERNAL_IP_ATTACHMENT_IDS[@]}"; do
+        if [[ "${CREATED_EXTERNAL_IP_ATTACHMENT_IDS[$index]}" == "$id" ]]; then
+            unset 'CREATED_EXTERNAL_IP_ATTACHMENT_IDS[index]'
+        fi
+    done
+}
+
+create_external_ip_attachment() {
+    local eip_id="$1" name="$2" output_file="$3" output id create_status=0
+    if "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" \
+        create externalipattachment --name "$name" --externalip "$eip_id" \
+        --baremetal-instance "$EXTERNAL_IP_BMI_ID" >"$output_file" 2>&1; then
+        create_status=0
+    else
+        create_status=$?
+    fi
+    cat "$output_file" >&2 || return 1
+    output="$(cat "$output_file")" || return 1
+    id="$(grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
+        <<<"$output" | tail -n 1)"
+    if [[ "$id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        CREATED_EXTERNAL_IP_ATTACHMENT_IDS+=("$id")
+        printf '%s\n' "$id" >"${output_file}.id" || return 1
+    fi
+    [[ "$id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+        || { printf 'Could not parse ExternalIPAttachment UUID from CLI output for %s\n' "$name" >&2; return 1; }
+    return "$create_status"
+}
+
+wait_for_external_ip_attachment_ready() {
+    local id="$1" eip_id="$2" eip_uid="$3" eip_address="$4"
+    local deadline=$((SECONDS + 1800)) crs count cr phase job job_id job_state uid generation artifacts entry
+    info "Waiting for ExternalIPAttachment ${id} to become Ready..."
+    while ((SECONDS < deadline)); do
+        if ! crs="$(external_ip_attachment_crs_json "$id")"; then
+            die "Kubernetes API failed while looking up ExternalIPAttachment UUID ${id}"
+        fi
+        count="$(jq -er '.items | length' <<<"$crs")" \
+            || die "Could not count ExternalIPAttachment CRs for UUID ${id}"
+        if [[ "$count" == 0 ]]; then
+            sleep 2
+            continue
+        fi
+        [[ "$count" == 1 ]] \
+            || die "Expected one ExternalIPAttachment CR for UUID ${id}; found ${count}"
+        cr="$(external_ip_attachment_cr_json "$id")"
+        phase="$(jq -r '.status.phase // ""' <<<"$cr")"
+        job="$(jq -c '[.status.provisioningJobs[]? | select(.type == "provision")] | last // {}' <<<"$cr")"
+        job_id="$(jq -r '.jobID // ""' <<<"$job")"
+        job_state="$(jq -r '.state // ""' <<<"$job")"
+        if [[ "$phase" == Failed || "$job_state" == Failed || "$job_state" == Canceled ]]; then
+            printf '%s\n' "$cr" >&2
+            die "ExternalIPAttachment ${id} failed; AAP job ${job_id:-unknown}, phase ${phase:-unknown}"
+        fi
+        if [[ "$phase" == Ready && "$job_state" == Succeeded && -n "$job_id" ]]; then
+            uid="$(jq -er '.metadata.uid' <<<"$cr")"
+            generation="$(jq -er '.metadata.generation' <<<"$cr")"
+            jq -e --arg eip "$eip_id" --arg bmi "$EXTERNAL_IP_BMI_ID" '
+              .spec.externalIP == $eip and .spec.baremetalInstance == $bmi' <<<"$cr" >/dev/null \
+                || die "ExternalIPAttachment ${id} does not reference the selected ExternalIP and BMI"
+            artifacts="$(external_ip_aap_job_artifacts "$job_id")" \
+                || die "Could not retrieve attach artifacts for AAP job ${job_id}"
+            external_ip_attachment_assert_result "$artifacts" \
+                external_ip_attachment.attach "$uid" "$generation" \
+                || die "AAP attach artifact does not match ExternalIPAttachment ${id}"
+            entry="$(external_ip_attachment_state_entry "$uid" "$id")"
+            jq -e --arg uid "$uid" --arg id "$id" --arg tenant "$OSAC_TENANT" \
+                --arg eip_uid "$eip_uid" --arg address "$eip_address" \
+                --arg vn_uid "$FIRST_K8S_UID" --arg subnet_uid "$EXTERNAL_IP_ATTACHMENT_SUBNET_UID" \
+                --arg target_uid "$EXTERNAL_IP_BMI_K8S_UID" --arg target_id "$EXTERNAL_IP_BMI_ID" \
+                --arg target_name "$EXTERNAL_IP_BMI_NAME" --arg target_ip "$EXTERNAL_IP_BMI_PRIMARY_IP" \
+                --arg subnet_cidr "$EXTERNAL_IP_ATTACHMENT_SUBNET_CIDR" '
+              .uid == $uid and .fulfillment_id == $id and .tenant_id == $tenant
+              and .external_ip_uid == $eip_uid and .virtual_network_uid == $vn_uid
+              and .subnet_uid == $subnet_uid and .external_address == $address
+              and .phase == "ready"
+              and .payload.context.external_ip.address == $address
+              and .payload.context.external_ip.kubernetes_uid == $eip_uid
+              and .payload.context.target.kind == "BareMetalInstance"
+              and .payload.context.target.fulfillment_id == $target_id
+              and .payload.context.target.kubernetes_uid == $target_uid
+              and .payload.context.target.name == $target_name
+              and .payload.context.target.ip_address == $target_ip
+              and .payload.context.subnet.kubernetes_uid == $subnet_uid
+              and .payload.context.subnet.ipv4_cidr == $subnet_cidr
+              and .payload.context.virtual_network.kubernetes_uid == $vn_uid' <<<"$entry" >/dev/null \
+                || die "AgentlessNet attachment state does not match the Ready CR and target"
+            LAST_EXTERNAL_IP_ATTACHMENT_UID="$uid"
+            LAST_EXTERNAL_IP_ATTACHMENT_GENERATION="$generation"
+            LAST_EXTERNAL_IP_ATTACHMENT_PROVISION_JOB_ID="$job_id"
+            LAST_EXTERNAL_IP_ATTACHMENT_STATE="$entry"
+            info "ExternalIPAttachment ${id} is Ready; AAP job ${job_id}; provider state is saved"
+            return 0
+        fi
+        sleep 2
+    done
+    cr="$(external_ip_attachment_cr_json "$id")"
+    job_id="$(jq -r '[.status.provisioningJobs[]? | select(.type == "provision")] | last | .jobID // "unknown"' <<<"$cr")"
+    phase="$(jq -r '.status.phase // "unknown"' <<<"$cr")"
+    die "Timed out waiting for ExternalIPAttachment ${id}; AAP job ${job_id}, phase ${phase}"
+}
+
+delete_external_ip_attachment_and_verify() {
+    local id="$1" uid="$2" address="$3" namespace="$4"
+    local output_file="${TEMP_DIR}/delete-external-ip-attachment-${id}.out"
+    local hold_finalizer="osac.openshift.io/e2e-hold-external-ip-attachment"
+    local operator_finalizer="osac.openshift.io/externalipattachment-finalizer"
+    local cr crs count deadline=$((SECONDS + 1800)) job job_id="" job_state generation artifacts validated=false
+    cr="$(external_ip_attachment_cr_json "$id")"
+    generation="$(jq -er '.metadata.generation' <<<"$cr")" \
+        || die "ExternalIPAttachment ${id} has no generation"
+    if [[ -z "$(jq -r '.metadata.deletionTimestamp // ""' <<<"$cr")" ]]; then
+        if ! jq -e --arg finalizer "$hold_finalizer" \
+            '(.metadata.finalizers // []) | index($finalizer) != null' <<<"$cr" >/dev/null; then
+            oc patch externalipattachment "$(jq -r '.metadata.name' <<<"$cr")" \
+                -n "$NETWORKING_NAMESPACE" --type=json \
+                -p="[{\"op\":\"add\",\"path\":\"/metadata/finalizers/-\",\"value\":\"${hold_finalizer}\"}]" >/dev/null
+        fi
+        cr="$(external_ip_attachment_cr_json "$id")"
+        info "Deleting ExternalIPAttachment ${id} through Fulfillment..."
+        if ! "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" \
+            delete externalipattachment "$id" >"$output_file" 2>&1; then
+            cat "$output_file" >&2
+            die "Fulfillment could not delete ExternalIPAttachment ${id}"
+        fi
+    fi
+
+    while ((SECONDS < deadline)); do
+        crs="$(external_ip_attachment_crs_json "$id")" \
+            || die "Kubernetes API failed while waiting for ExternalIPAttachment ${id} deletion"
+        count="$(jq -er '.items | length' <<<"$crs")" \
+            || die "Could not count ExternalIPAttachment CRs for UUID ${id} during deletion"
+        [[ "$count" == 1 ]] || {
+            printf 'Expected the held ExternalIPAttachment %s to remain until detach validation; found %s CRs\n' \
+                "$id" "$count" >&2
+            return 1
+        }
+        cr="$(jq -c '.items[0]' <<<"$crs")"
+        job="$(jq -c '[.status.provisioningJobs[]? | select(.type == "deprovision")] | last // {}' <<<"$cr")"
+        job_id="$(jq -r '.jobID // ""' <<<"$job")"
+        job_state="$(jq -r '.state // ""' <<<"$job")"
+        if [[ -n "$job_id" && ( "$job_state" == Failed || "$job_state" == Canceled ) ]]; then
+            printf 'AAP detach job %s ended in %s for ExternalIPAttachment %s; retaining ExternalIP, BMI, Subnet, and route\n' \
+                "$job_id" "$job_state" "$id" >&2
+            return 1
+        fi
+        if [[ -n "$job_id" ]] \
+            && jq -e --arg hold "$hold_finalizer" --arg operator "$operator_finalizer" '
+                (.metadata.finalizers // []) as $values
+                | ($values | index($hold) != null)
+                  and ($values | index($operator) == null)' <<<"$cr" >/dev/null; then
+            artifacts="$(external_ip_aap_job_artifacts "$job_id" 2>/dev/null || true)"
+            if [[ -n "$artifacts" ]] \
+                && external_ip_attachment_assert_result "$artifacts" \
+                    external_ip_attachment.detach "$uid" "$generation"; then
+                validated=true
+                break
+            fi
+        fi
+        sleep 2
+    done
+    [[ "$validated" == true ]] || {
+        printf 'Timed out validating detach for ExternalIPAttachment %s; AAP job %s; next: bash ./vlan-e2e.sh --cleanup --external-ip\n' \
+            "$id" "${job_id:-unknown}" >&2
+        return 1
+    }
+    cr="$(external_ip_attachment_cr_json "$id")"
+    oc patch externalipattachment "$(jq -r '.metadata.name' <<<"$cr")" \
+        -n "$NETWORKING_NAMESPACE" --type=merge \
+        -p="$(jq -c --arg hold "$hold_finalizer" \
+            '{metadata:{finalizers:((.metadata.finalizers // []) | map(select(. != $hold)))}}' <<<"$cr")" \
+        >/dev/null || return 1
+
+    deadline=$((SECONDS + 600))
+    while ((SECONDS < deadline)); do
+        crs="$(external_ip_attachment_crs_json "$id")" \
+            || { printf 'Could not verify ExternalIPAttachment %s disappearance\n' "$id" >&2; return 1; }
+        count="$(jq -er '.items | length' <<<"$crs")" || return 1
+        [[ "$count" == 0 ]] && break
+        [[ "$count" == 1 ]] || return 1
+        sleep 2
+    done
+    [[ "$count" == 0 ]] || {
+        printf 'Timed out waiting for detached ExternalIPAttachment %s to disappear\n' "$id" >&2
+        return 1
+    }
+    assert_external_ip_attachment_provider_absent "$uid" "$address" "$namespace" || return 1
+    external_ip_attachment_remove_created_id "$id"
+    info "ExternalIPAttachment ${id} is detached; AAP job ${job_id}; provider route, rules, conntrack, and state are absent"
+}
+
+add_external_ip_client_route() {
+    local address="$1" current gateway
+    gateway="${MGMT_PREFIX}.30"
+    current="$(docker exec "$CONTAINERLAB_UPSTREAM_ROUTER" ip route show | \
+        awk -v destination="$address" '$1 == destination || $1 == destination "/32"')" \
+        || return 1
+    if [[ -n "$current" ]]; then
+        [[ "$(wc -l <<<"$current")" == 1 && "$current" == *" via ${gateway} "* \
+            && "$current" == *" dev ${EXTERNAL_IP_CLIENT_ROUTE_INTERFACE}"* ]] \
+            || { printf 'Refusing to replace unexpected upstream route for ExternalIP %s: %s\n' "$address" "$current" >&2; return 1; }
+    else
+        docker exec "$CONTAINERLAB_UPSTREAM_ROUTER" ip route add "${address}/32" \
+            via "$gateway" dev "$EXTERNAL_IP_CLIENT_ROUTE_INTERFACE" || return 1
+    fi
+    EXTERNAL_IP_CLIENT_ROUTE_GATEWAY="$gateway"
+    EXTERNAL_IP_CLIENT_ROUTE_ADDRESSES+=("$address")
+}
+
+remove_external_ip_client_route() {
+    local address="$1" current gateway="${MGMT_PREFIX}.30" index
+    current="$(docker exec "$CONTAINERLAB_UPSTREAM_ROUTER" ip route show | \
+        awk -v destination="$address" '$1 == destination || $1 == destination "/32"')" \
+        || return 1
+    if [[ -n "$current" ]]; then
+        [[ "$(wc -l <<<"$current")" == 1 && "$current" == *" via ${gateway} "* \
+            && "$current" == *" dev ${EXTERNAL_IP_CLIENT_ROUTE_INTERFACE}"* ]] \
+            || { printf 'Refusing to remove unexpected upstream route for ExternalIP %s: %s\n' "$address" "$current" >&2; return 1; }
+        docker exec "$CONTAINERLAB_UPSTREAM_ROUTER" ip route del "${address}/32" \
+            via "$gateway" dev "$EXTERNAL_IP_CLIENT_ROUTE_INTERFACE" || return 1
+        current="$(docker exec "$CONTAINERLAB_UPSTREAM_ROUTER" ip route show | \
+            awk -v destination="$address" '$1 == destination || $1 == destination "/32"')" \
+            || return 1
+        [[ -z "$current" ]] || {
+            printf 'Upstream route for ExternalIP %s remains after cleanup\n' "$address" >&2
+            return 1
+        }
+    fi
+    for index in "${!EXTERNAL_IP_CLIENT_ROUTE_ADDRESSES[@]}"; do
+        if [[ "${EXTERNAL_IP_CLIENT_ROUTE_ADDRESSES[$index]}" == "$address" ]]; then
+            unset 'EXTERNAL_IP_CLIENT_ROUTE_ADDRESSES[index]'
+        fi
+    done
+}
+
+probe_external_ip_response() {
+    local address="$1"
+    docker exec "$CONTAINERLAB_UPSTREAM_ROUTER" wget -q -T 5 -O - \
+        "http://${address}:${EXTERNAL_IP_RESPONSE_PORT}/osac-eia-response"
+}
+
+wait_for_external_ip_response() {
+    local address="$1" deadline=$((SECONDS + 300)) response
+    while ((SECONDS < deadline)); do
+        if response="$(probe_external_ip_response "$address" 2>/dev/null)" \
+            && [[ "$response" == "$EXTERNAL_IP_RESPONSE_TOKEN" ]]; then
+            info "External client received the BMI response through ExternalIP ${address}."
+            return 0
+        fi
+        sleep 2
+    done
+    die "ExternalIP ${address} did not return the expected BMI response from the upstream-router"
+}
+
+assert_external_ip_attachment_provider_absent() {
+    local uid="$1" address="$2" namespace="$3" state routes nat forwarding conntrack
+    state="$(state_snapshot)" || return 1
+    if jq -e --arg uid "$uid" 'any(.external_ip_attachments[]; .uid == $uid)' <<<"$state" >/dev/null; then
+        printf 'ExternalIPAttachment provider row remains for UID %s\n' "$uid" >&2
+        return 1
+    fi
+    routes="$(netnode vtysh -c "show ip route ${address}/32" 2>&1 || true)"
+    if grep -Fq "${address}/32" <<<"$routes"; then
+        printf 'ExternalIP route %s remains on the network node after detach\n' "$address" >&2
+        return 1
+    fi
+    forwarding="$(netnode iptables -w -t filter -S OSAC-EXTERNAL 2>&1 || true)"
+    nat=""
+    conntrack=""
+    if [[ -n "$namespace" ]]; then
+        nat="$(netnode ip netns exec "$namespace" iptables -w -t nat -S PREROUTING 2>&1)" \
+            || return 1
+        conntrack="$(netnode ip netns exec "$namespace" conntrack -L -f ipv4 2>&1)" \
+            || return 1
+    fi
+    if grep -Fq "osac-eia:${uid}:" <<<"$nat$forwarding"; then
+        printf 'ExternalIPAttachment %s still owns a forwarding or DNAT rule\n' "$uid" >&2
+        return 1
+    fi
+    if [[ -n "$namespace" ]] && grep -E "(^| )(src|dst)=${address}([[:space:]]|$)" <<<"$conntrack"; then
+        printf 'ExternalIP %s conntrack entries remain after detach\n' "$address" >&2
+        return 1
+    fi
+}
+
 external_ip_pool_get_json() {
     local request_file="${TEMP_DIR}/external-ip-pool-status.request.json"
     local response_file="${TEMP_DIR}/external-ip-pool-status.response.json"
@@ -3188,6 +3632,10 @@ run_external_ip_lifecycle() {
         || die "ExternalIP retry changed its UID-owned provider reservation"
     external_ip_pool_wait_for_delta 2
 
+    if [[ "${SUITE_USES_EXTERNAL_IP_ATTACHMENT:-false}" == true ]]; then
+        run_external_ip_attachment_lifecycle
+    fi
+
     delete_external_ip_and_verify "$EXTERNAL_IP_ONE_ID" "$EXTERNAL_IP_ONE_UID" 1
     cr="$(external_ip_cr_json "$EXTERNAL_IP_TWO_ID")"
     [[ "$(jq -r '.status.address' <<<"$cr")" == "$EXTERNAL_IP_TWO_ADDRESS" ]] \
@@ -3200,6 +3648,91 @@ run_external_ip_lifecycle() {
     external_ip_pool_wait_for_delta 0
     save_current_state
     assert_baseline_state_unchanged
+}
+
+run_external_ip_attachment_lifecycle() {
+    local output_file first_cr original_job state_after_retry peer_state peer_eip_state
+    local first_namespace
+    [[ -n "$EXTERNAL_IP_BMI_ID" && -n "$EXTERNAL_IP_BMI_PRIMARY_IP" \
+        && -n "$EXTERNAL_IP_ATTACHMENT_SUBNET_UID" ]] \
+        || die "ExternalIPAttachment lifecycle requires a Ready Fulfillment-backed BMI and Subnet"
+    first_namespace="$(jq -er '.namespace_name' <<<"$(get_state_entry "$FIRST_K8S_UID")")" \
+        || die "Could not find the test VirtualNetwork namespace"
+
+    output_file="${TEMP_DIR}/create-external-ip-attachment-one.out"
+    create_external_ip_attachment "$EXTERNAL_IP_ONE_ID" "$EXTERNAL_IP_ATTACHMENT_ONE_NAME" \
+        "$output_file" || die "Could not create the first ExternalIPAttachment"
+    EXTERNAL_IP_ATTACHMENT_ONE_ID="$(<"${output_file}.id")"
+    wait_for_external_ip_attachment_ready "$EXTERNAL_IP_ATTACHMENT_ONE_ID" \
+        "$EXTERNAL_IP_ONE_ID" "$EXTERNAL_IP_ONE_UID" "$EXTERNAL_IP_ONE_ADDRESS"
+    EXTERNAL_IP_ATTACHMENT_ONE_UID="$LAST_EXTERNAL_IP_ATTACHMENT_UID"
+    EXTERNAL_IP_ATTACHMENT_ONE_JOB_ID="$LAST_EXTERNAL_IP_ATTACHMENT_PROVISION_JOB_ID"
+    EXTERNAL_IP_ATTACHMENT_ONE_STATE="$LAST_EXTERNAL_IP_ATTACHMENT_STATE"
+
+    output_file="${TEMP_DIR}/create-external-ip-attachment-two.out"
+    create_external_ip_attachment "$EXTERNAL_IP_TWO_ID" "$EXTERNAL_IP_ATTACHMENT_TWO_NAME" \
+        "$output_file" || die "Could not create the peer ExternalIPAttachment"
+    EXTERNAL_IP_ATTACHMENT_TWO_ID="$(<"${output_file}.id")"
+    wait_for_external_ip_attachment_ready "$EXTERNAL_IP_ATTACHMENT_TWO_ID" \
+        "$EXTERNAL_IP_TWO_ID" "$EXTERNAL_IP_TWO_UID" "$EXTERNAL_IP_TWO_ADDRESS"
+    EXTERNAL_IP_ATTACHMENT_TWO_UID="$LAST_EXTERNAL_IP_ATTACHMENT_UID"
+    EXTERNAL_IP_ATTACHMENT_TWO_JOB_ID="$LAST_EXTERNAL_IP_ATTACHMENT_PROVISION_JOB_ID"
+    EXTERNAL_IP_ATTACHMENT_TWO_STATE="$LAST_EXTERNAL_IP_ATTACHMENT_STATE"
+
+    add_external_ip_client_route "$EXTERNAL_IP_ONE_ADDRESS" \
+        || die "Could not add the test-only upstream route for ExternalIP ${EXTERNAL_IP_ONE_ADDRESS}"
+    add_external_ip_client_route "$EXTERNAL_IP_TWO_ADDRESS" \
+        || die "Could not add the test-only upstream route for peer ExternalIP ${EXTERNAL_IP_TWO_ADDRESS}"
+    wait_for_external_ip_response "$EXTERNAL_IP_ONE_ADDRESS"
+    wait_for_external_ip_response "$EXTERNAL_IP_TWO_ADDRESS"
+
+    info "Retrying ExternalIPAttachment ${EXTERNAL_IP_ATTACHMENT_ONE_ID} with the same Kubernetes UID..."
+    original_job="$EXTERNAL_IP_ATTACHMENT_ONE_JOB_ID"
+    first_cr="$(external_ip_attachment_cr_json "$EXTERNAL_IP_ATTACHMENT_ONE_ID")"
+    oc patch externalipattachment "$(jq -r '.metadata.name' <<<"$first_cr")" \
+        -n "$NETWORKING_NAMESPACE" --subresource=status --type=merge \
+        -p '{"status":{"phase":"Progressing","conditions":[],"provisioningJobs":[]}}' >/dev/null
+    wait_for_external_ip_attachment_ready "$EXTERNAL_IP_ATTACHMENT_ONE_ID" \
+        "$EXTERNAL_IP_ONE_ID" "$EXTERNAL_IP_ONE_UID" "$EXTERNAL_IP_ONE_ADDRESS"
+    [[ "$LAST_EXTERNAL_IP_ATTACHMENT_PROVISION_JOB_ID" != "$original_job" ]] \
+        || die "ExternalIPAttachment retry did not create a new AAP job"
+    [[ "$LAST_EXTERNAL_IP_ATTACHMENT_UID" == "$EXTERNAL_IP_ATTACHMENT_ONE_UID" ]] \
+        || die "ExternalIPAttachment retry changed its Kubernetes UID"
+    state_after_retry="$LAST_EXTERNAL_IP_ATTACHMENT_STATE"
+    [[ "$state_after_retry" == "$EXTERNAL_IP_ATTACHMENT_ONE_STATE" ]] \
+        || die "ExternalIPAttachment retry changed its UID-owned provider state"
+    wait_for_external_ip_response "$EXTERNAL_IP_ONE_ADDRESS"
+
+    peer_state="$(external_ip_attachment_state_entry \
+        "$EXTERNAL_IP_ATTACHMENT_TWO_UID" "$EXTERNAL_IP_ATTACHMENT_TWO_ID")"
+    peer_eip_state="$(external_ip_state_entry "$EXTERNAL_IP_TWO_UID" "$EXTERNAL_IP_TWO_ID")"
+    delete_external_ip_attachment_and_verify "$EXTERNAL_IP_ATTACHMENT_ONE_ID" \
+        "$EXTERNAL_IP_ATTACHMENT_ONE_UID" "$EXTERNAL_IP_ONE_ADDRESS" "$first_namespace" \
+        || die "Detach failed for ExternalIPAttachment ${EXTERNAL_IP_ATTACHMENT_ONE_ID}; retaining EIPs, BMI, Subnet, and VirtualNetwork"
+    first_cr="$(external_ip_cr_json "$EXTERNAL_IP_ONE_ID")"
+    [[ "$(jq -r '.status.state' <<<"$first_cr")" == Allocated ]] \
+        || die "ExternalIP ${EXTERNAL_IP_ONE_ID} was released before its attachment cleanup completed"
+    if probe_external_ip_response "$EXTERNAL_IP_ONE_ADDRESS" >/dev/null 2>&1; then
+        die "Detached ExternalIP ${EXTERNAL_IP_ONE_ADDRESS} still reaches the BMI"
+    fi
+    [[ "$(external_ip_attachment_state_entry \
+        "$EXTERNAL_IP_ATTACHMENT_TWO_UID" "$EXTERNAL_IP_ATTACHMENT_TWO_ID")" == "$peer_state" ]] \
+        || die "Detaching ExternalIP ${EXTERNAL_IP_ONE_ADDRESS} changed its peer attachment state"
+    [[ "$(external_ip_state_entry "$EXTERNAL_IP_TWO_UID" "$EXTERNAL_IP_TWO_ID")" == "$peer_eip_state" ]] \
+        || die "Detaching ExternalIP ${EXTERNAL_IP_ONE_ADDRESS} changed its peer ExternalIP state"
+    wait_for_external_ip_response "$EXTERNAL_IP_TWO_ADDRESS"
+
+    delete_external_ip_attachment_and_verify "$EXTERNAL_IP_ATTACHMENT_TWO_ID" \
+        "$EXTERNAL_IP_ATTACHMENT_TWO_UID" "$EXTERNAL_IP_TWO_ADDRESS" "$first_namespace" \
+        || die "Detach failed for peer ExternalIPAttachment ${EXTERNAL_IP_ATTACHMENT_TWO_ID}; preserving dependent resources"
+    if probe_external_ip_response "$EXTERNAL_IP_TWO_ADDRESS" >/dev/null 2>&1; then
+        die "Detached peer ExternalIP ${EXTERNAL_IP_TWO_ADDRESS} still reaches the BMI"
+    fi
+    remove_external_ip_client_route "$EXTERNAL_IP_ONE_ADDRESS" \
+        || die "Could not remove the test route for ExternalIP ${EXTERNAL_IP_ONE_ADDRESS}"
+    remove_external_ip_client_route "$EXTERNAL_IP_TWO_ADDRESS" \
+        || die "Could not remove the test route for ExternalIP ${EXTERNAL_IP_TWO_ADDRESS}"
+    info "ExternalIPAttachment ingress, retry, peer preservation, and detach checks passed."
 }
 
 cleanup_created_external_ips() {
@@ -3298,6 +3831,122 @@ cleanup_created_external_ips() {
             printf 'Fulfillment capacity did not return to the expected count after ExternalIP %s cleanup\n' "$id" >&2
             return 1
         }
+    done
+    return 0
+}
+
+cleanup_created_external_ip_attachments() {
+    [[ "${#CREATED_EXTERNAL_IP_ATTACHMENT_IDS[@]}" -gt 0 ]] || return 0
+    [[ -n "$CLI_BIN" && -x "$CLI_BIN" && -n "$CLI_CONFIG_DIR" && -d "$CLI_CONFIG_DIR" ]] \
+        || return 1
+    local id crs count cr uid name eip_id bmi_id eip_crs eip_cr eip_count address
+    local state state_rows state_count entry namespace target_selected selected_bmi_id
+    for id in "${CREATED_EXTERNAL_IP_ATTACHMENT_IDS[@]}"; do
+        crs="$(external_ip_attachment_crs_json "$id")" || return 1
+        count="$(jq -er '.items | length' <<<"$crs")" || return 1
+        state="$(state_snapshot)" || return 1
+        state_rows="$(jq -ce --arg id "$id" \
+            '[.external_ip_attachments[] | select(.fulfillment_id == $id)]' <<<"$state")" || return 1
+        state_count="$(jq -er 'length' <<<"$state_rows")" || return 1
+        if [[ "$count" == 0 ]]; then
+            [[ "$state_count" == 0 ]] || {
+                printf 'ExternalIPAttachment CR %s is absent while provider state remains; preserving all dependent resources\n' "$id" >&2
+                return 1
+            }
+            external_ip_attachment_remove_created_id "$id"
+            continue
+        fi
+        [[ "$count" == 1 ]] || {
+            printf 'Multiple ExternalIPAttachment CRs exist for test UUID %s\n' "$id" >&2
+            return 1
+        }
+        cr="$(external_ip_attachment_cr_json "$id")" || return 1
+        uid="$(jq -er '.metadata.uid' <<<"$cr")" || return 1
+        name="$(jq -er '.metadata.name' <<<"$cr")" || return 1
+        eip_id="$(jq -er '.spec.externalIP' <<<"$cr")" || return 1
+        bmi_id="$(jq -er '.spec.baremetalInstance' <<<"$cr")" || return 1
+        [[ "${CREATED_EXTERNAL_IP_IDS[*]} " == *"${eip_id} "* ]] || {
+            printf 'ExternalIPAttachment %s references ExternalIP %s outside this cleanup scope\n' "$id" "$eip_id" >&2
+            return 1
+        }
+        eip_crs="$(external_ip_crs_json "$eip_id")" || return 1
+        eip_count="$(jq -er '.items | length' <<<"$eip_crs")" || return 1
+        [[ "$eip_count" == 1 ]] || {
+            printf 'ExternalIPAttachment %s does not have exactly one ExternalIP CR for %s\n' "$id" "$eip_id" >&2
+            return 1
+        }
+        eip_cr="$(jq -c '.items[0]' <<<"$eip_crs")"
+        jq -e --arg id "$eip_id" --arg tenant "$OSAC_TENANT" '
+          .metadata.labels["osac.openshift.io/externalip-uuid"] == $id
+          and .metadata.annotations["osac.openshift.io/tenant"] == $tenant
+          and .metadata.annotations["osac.openshift.io/implementation-strategy"] == "agentless_net"
+          and .status.state == "Allocated"' <<<"$eip_cr" >/dev/null || {
+            printf 'ExternalIPAttachment %s refers to an unallocated or out-of-scope ExternalIP %s\n' "$id" "$eip_id" >&2
+            return 1
+        }
+        address="$(jq -er '.status.address' <<<"$eip_cr")" || return 1
+        if [[ "$state_count" == 1 ]]; then
+            entry="$(jq -c '.[0]' <<<"$state_rows")"
+            [[ "$(jq -r '.uid' <<<"$entry")" == "$uid" ]] || {
+                printf 'ExternalIPAttachment %s provider UID does not match its Kubernetes UID\n' "$id" >&2
+                return 1
+            }
+            jq -e --arg id "$bmi_id" --arg tenant "$OSAC_TENANT" '
+              .payload.context.target.kind == "BareMetalInstance"
+              and .payload.context.target.fulfillment_id == $id
+              and .payload.context.target.tenant_id == $tenant
+              and (.payload.context.target.name | startswith("agentless-eip-bmi-"))' \
+                <<<"$entry" >/dev/null || {
+                printf 'ExternalIPAttachment %s saved target context is outside the selected BMI scope\n' "$id" >&2
+                return 1
+            }
+            namespace="$(jq -er '.payload.provider.namespace_name' <<<"$entry")" || return 1
+        else
+            target_selected=false
+            for selected_bmi_id in "${CREATED_BARE_METAL_INSTANCE_IDS[@]}"; do
+                [[ "$selected_bmi_id" == "$bmi_id" ]] && target_selected=true
+            done
+            [[ "$target_selected" == true ]] || {
+                printf 'ExternalIPAttachment %s references BMI %s outside the Fulfillment cleanup scope and has no saved provider identity\n' "$id" "$bmi_id" >&2
+                return 1
+            }
+            namespace=""
+        fi
+        info "Cleaning ExternalIPAttachment ${id} (${name}) before its ExternalIP or BMI..."
+        delete_external_ip_attachment_and_verify "$id" "$uid" "$address" "$namespace" || return 1
+    done
+    return 0
+}
+
+remove_external_ip_client_routes() {
+    local id crs count address state index
+    local -a addresses=("${EXTERNAL_IP_CLIENT_ROUTE_ADDRESSES[@]}" "${CLEANUP_EIP_ADDRESSES[@]}")
+    if ((${#addresses[@]} == 0 && ${#CREATED_EXTERNAL_IP_IDS[@]} == 0 && ${#CLEANUP_EIP_IDS[@]} == 0)); then
+        return 0
+    fi
+    for id in "${CREATED_EXTERNAL_IP_IDS[@]}"; do
+        crs="$(external_ip_crs_json "$id" 2>/dev/null || true)"
+        [[ -n "$crs" ]] || crs='{"items":[]}'
+        count="$(jq -r '.items | length' <<<"$crs" 2>/dev/null || printf '0')"
+        if [[ "$count" == 1 ]]; then
+            address="$(jq -r '.items[0].status.address // ""' <<<"$crs")"
+            [[ -z "$address" ]] || addresses+=("$address")
+        fi
+    done
+    state="$(state_snapshot)" || return 1
+    for id in "${CLEANUP_EIP_IDS[@]}"; do
+        address="$(jq -r --arg id "$id" \
+            '[.external_ips[] | select(.fulfillment_id == $id) | .address] | first // ""' <<<"$state")"
+        [[ -z "$address" ]] || addresses+=("$address")
+    done
+    for address in "${addresses[@]}"; do
+        [[ -n "$address" ]] || continue
+        remove_external_ip_client_route "$address" || return 1
+        for index in "${!EXTERNAL_IP_CLIENT_ROUTE_ADDRESSES[@]}"; do
+            if [[ "${EXTERNAL_IP_CLIENT_ROUTE_ADDRESSES[$index]}" == "$address" ]]; then
+                unset 'EXTERNAL_IP_CLIENT_ROUTE_ADDRESSES[index]'
+            fi
+        done
     done
     return 0
 }
@@ -3626,18 +4275,20 @@ cleanup_interrupted_dhcp_clients() {
 
 prepare_suite_cleanup() {
     local vn_filter subnet_filter eip_filter vn_items subnet_items eip_items
+    local bmi_filter bmi_items attachment_filter attachment_items attachment_object attachment_id attachment_cr attachment_uid
     local pool_request pool_response pool_error pool_items external_ips state_before=""
     local pool_object pool_id pool_name pool_cidr pool_crs pool_count pool_cr pool_uid
     local pool_state pool_status allocated available total active_count
-    local eip_object eip_id eip_name eip_cr eip_uid eip_pool id item
+    local eip_object eip_id eip_name eip_cr eip_uid eip_pool eip_address id item attachment_eip_id attachment_bmi_id
     local pool_ip_crs pool_ip_count pool_eip_ids_json selected_parent parent_id_candidate
     local provider_ip_rows provider_ip_count assigned_id
-    local vn_ids_json subnet_ids_json pool_uids_json pool_ids_json eip_uids_json eip_ids_json
+    local vn_ids_json subnet_ids_json pool_uids_json pool_ids_json eip_uids_json eip_ids_json attachment_uids_json attachment_ids_json
     local snapshot
     local -a vn_ids=() vn_uids=() subnet_ids=() subnet_uids=()
     local -a pool_ids=() pool_uids=() pool_cidrs=() pool_eip_ids_jsons=()
     local -a pool_initial_allocated=() pool_initial_available=()
     local -a eip_ids=() eip_uids=() assigned_eip_ids=()
+    local -a bmi_ids=() bmi_uids=() attachment_ids=() attachment_uids=()
     local -a pool_eip_ids=() pool_eip_uids=()
     local index
 
@@ -3667,7 +4318,7 @@ prepare_suite_cleanup() {
         done < <(jq -r '.[].id' <<<"$vn_items")
     fi
 
-    if [[ "$SUITE_USES_SUBNET_DHCP" == true || "$SUITE_USES_VN" == true ]]; then
+    if [[ "$SUITE_USES_SUBNET" == true || "$SUITE_USES_VN" == true ]]; then
         subnet_items="$(cleanup_cli_list_json subnet "$subnet_filter")" \
             || die "Could not list test Subnets for cleanup"
         jq -e --arg tenant "$OSAC_TENANT" --arg prefix 'agentless-smoke-vn-' \
@@ -3677,11 +4328,11 @@ prepare_suite_cleanup() {
             and (.id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")))' \
             <<<"$subnet_items" >/dev/null \
             || die "Fulfillment returned a Subnet outside the test tenant or name scope"
-        if [[ "$SUITE_USES_SUBNET_DHCP" != true ]] \
+        if [[ "$SUITE_USES_SUBNET" != true ]] \
             && [[ "$(jq -er 'length' <<<"$subnet_items")" != 0 ]]; then
             die "Test Subnets remain; use --cleanup --subnet-dhcp or --cleanup --full before deleting VirtualNetworks"
         fi
-        if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
+        if [[ "$SUITE_USES_SUBNET" == true ]]; then
             while IFS= read -r item; do
                 [[ -n "$item" ]] || continue
                 local parent_id cr uid
@@ -3720,6 +4371,64 @@ prepare_suite_cleanup() {
             and (.id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")))' \
             <<<"$eip_items" >/dev/null \
             || die "Fulfillment returned an ExternalIP outside the test tenant or name scope"
+    fi
+
+    bmi_items='[]'
+    attachment_items='[]'
+    if [[ "$SUITE_USES_EXTERNAL_IP_ATTACHMENT" == true ]]; then
+        bmi_filter='this.metadata.name.startsWith("agentless-eip-bmi-")'
+        bmi_items="$(cleanup_cli_list_json baremetalinstance "$bmi_filter")" \
+            || die "Could not list test BareMetalInstances for attachment cleanup"
+        jq -e --arg tenant "$OSAC_TENANT" '
+          all(.[]; .metadata.tenant == $tenant
+            and (.metadata.name | startswith("agentless-eip-bmi-"))
+            and (.id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")))' \
+            <<<"$bmi_items" >/dev/null \
+            || die "Fulfillment returned a BareMetalInstance outside the E2E tenant or name scope"
+        while IFS= read -r id; do
+            [[ -n "$id" ]] || continue
+            local bmi_cr bmi_uid
+            bmi_cr="$(baremetal_instance_cr_json "$id")" \
+                || die "Test BareMetalInstance ${id} has no unique Kubernetes CR"
+            bmi_uid="$(jq -er '.metadata.uid' <<<"$bmi_cr")" \
+                || die "Test BareMetalInstance ${id} has no Kubernetes UID"
+            bmi_ids+=("$id")
+            bmi_uids+=("$bmi_uid")
+        done < <(jq -r '.[].id' <<<"$bmi_items")
+
+        attachment_filter='this.metadata.name.startsWith("agentless-eip-attach-")'
+        attachment_items="$(cleanup_cli_list_json externalipattachment "$attachment_filter")" \
+            || die "Could not list test ExternalIPAttachments for cleanup"
+        jq -e --arg tenant "$OSAC_TENANT" '
+          all(.[]; .metadata.tenant == $tenant
+            and (.metadata.name | startswith("agentless-eip-attach-"))
+            and (.id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")))' \
+            <<<"$attachment_items" >/dev/null \
+            || die "Fulfillment returned an ExternalIPAttachment outside the E2E tenant or name scope"
+        while IFS= read -r attachment_id; do
+            [[ -n "$attachment_id" ]] || continue
+            attachment_cr="$(external_ip_attachment_cr_json "$attachment_id")" \
+                || die "Test ExternalIPAttachment ${attachment_id} has no unique Kubernetes CR"
+            attachment_uid="$(jq -er '.metadata.uid' <<<"$attachment_cr")" \
+                || die "Test ExternalIPAttachment ${attachment_id} has no Kubernetes UID"
+            attachment_eip_id="$(jq -er '.spec.externalIP' <<<"$attachment_cr")" \
+                || die "Test ExternalIPAttachment ${attachment_id} has no ExternalIP reference"
+            attachment_bmi_id="$(jq -er '.spec.baremetalInstance' <<<"$attachment_cr")" \
+                || die "Test ExternalIPAttachment ${attachment_id} has no BMI reference"
+            local selected_eip=false
+            while IFS= read -r eip_id; do
+                if [[ "$eip_id" == "$attachment_eip_id" ]]; then
+                    selected_eip=true
+                    break
+                fi
+            done < <(jq -r '.[].id' <<<"$eip_items")
+            [[ "$selected_eip" == true ]] \
+                || die "ExternalIPAttachment ${attachment_id} references an ExternalIP outside the test name scope"
+            [[ " ${bmi_ids[*]} " == *" ${attachment_bmi_id} "* ]] \
+                || die "ExternalIPAttachment ${attachment_id} references a BMI outside the test name scope"
+            attachment_ids+=("$attachment_id")
+            attachment_uids+=("$attachment_uid")
+        done < <(jq -r '.[].id' <<<"$attachment_items")
     fi
 
     pool_items='[]'
@@ -3800,8 +4509,12 @@ prepare_suite_cleanup() {
                         [[ "$(jq -r '.metadata.annotations["osac.openshift.io/implementation-strategy"] // ""' <<<"$eip_cr")" == agentless_net ]] \
                             || die "ExternalIP ${eip_id} is not managed by AgentlessNet"
                         eip_uid="$(jq -er '.metadata.uid' <<<"$eip_cr")"
+                        eip_address="$(jq -r '.status.address // ""' <<<"$eip_cr")"
+                        [[ -n "$eip_address" ]] \
+                            || die "ExternalIP ${eip_id} has no address for route cleanup"
                         pool_eip_ids+=("$eip_id")
                         pool_eip_uids+=("$eip_uid")
+                        CLEANUP_EIP_ADDRESSES+=("$eip_address")
                     fi
                 done < <(jq -c '.[]' <<<"$eip_items")
             fi
@@ -3882,9 +4595,16 @@ prepare_suite_cleanup() {
     CLEANUP_POOL_EIP_IDS_JSON=("${pool_eip_ids_jsons[@]}")
     CLEANUP_EIP_UIDS=("${eip_uids[@]}")
     CLEANUP_EIP_IDS=("${eip_ids[@]}")
+    CLEANUP_ATTACHMENT_UIDS=("${attachment_uids[@]}")
+    CLEANUP_ATTACHMENT_IDS=("${attachment_ids[@]}")
+    CLEANUP_BMI_IDS=("${bmi_ids[@]}")
+    CLEANUP_BMI_UIDS=("${bmi_uids[@]}")
     CLEANUP_PENDING_POOL_IDS=("${pool_ids[@]}")
     CREATED_IDS=("${vn_ids[@]}")
     CREATED_SUBNET_IDS=("${subnet_ids[@]}")
+    CREATED_EXTERNAL_IP_IDS=("${eip_ids[@]}")
+    CREATED_EXTERNAL_IP_ATTACHMENT_IDS=("${attachment_ids[@]}")
+    CREATED_BARE_METAL_INSTANCE_IDS=("${bmi_ids[@]}")
 
     vn_ids_json="$(cleanup_array_json "${CLEANUP_VN_UIDS[@]}")"
     subnet_ids_json="$(cleanup_array_json "${CLEANUP_SUBNET_UIDS[@]}")"
@@ -3892,9 +4612,12 @@ prepare_suite_cleanup() {
     pool_ids_json="$(cleanup_array_json "${CLEANUP_POOL_IDS[@]}")"
     eip_uids_json="$(cleanup_array_json "${CLEANUP_EIP_UIDS[@]}")"
     eip_ids_json="$(cleanup_array_json "${CLEANUP_EIP_IDS[@]}")"
+    attachment_uids_json="$(cleanup_array_json "${CLEANUP_ATTACHMENT_UIDS[@]}")"
+    attachment_ids_json="$(cleanup_array_json "${CLEANUP_ATTACHMENT_IDS[@]}")"
     jq --argjson vns "$vn_ids_json" --argjson subnets "$subnet_ids_json" \
         --argjson pools "$pool_uids_json" --argjson pool_ids "$pool_ids_json" \
-        --argjson ips "$eip_uids_json" --argjson ip_ids "$eip_ids_json" '
+        --argjson ips "$eip_uids_json" --argjson ip_ids "$eip_ids_json" \
+        --argjson attachments "$attachment_uids_json" --argjson attachment_ids "$attachment_ids_json" '
       .virtual_networks |= map(select((.uid as $uid | ($vns | index($uid))) == null))
       | .subnets |= map(select((.uid as $uid | ($subnets | index($uid))) == null))
       | .external_ip_pools |= map(select(
@@ -3902,7 +4625,10 @@ prepare_suite_cleanup() {
           and (.fulfillment_id as $id | ($pool_ids | index($id))) == null))
       | .external_ips |= map(select(
           (.uid as $uid | ($ips | index($uid))) == null
-          and (.fulfillment_id as $id | ($ip_ids | index($id))) == null))' \
+          and (.fulfillment_id as $id | ($ip_ids | index($id))) == null))
+      | .external_ip_attachments |= map(select(
+          (.uid as $uid | ($attachments | index($uid))) == null
+          and (.fulfillment_id as $id | ($attachment_ids | index($id))) == null))' \
         "$CURRENT_STATE_FILE" >"$BASELINE_STATE_FILE" \
         || die "Could not compute the unrelated provider-state baseline for cleanup"
     CLEANUP_DISCOVERY_COMPLETE=true
@@ -3910,7 +4636,13 @@ prepare_suite_cleanup() {
         CLEANUP_CLIENTS_COMPLETE=false
     fi
 
-    info "Suite cleanup found ${#CLEANUP_EIP_IDS[@]} ExternalIPs, ${#CLEANUP_POOL_IDS[@]} test pools, ${#CREATED_SUBNET_IDS[@]} Subnets, and ${#CREATED_IDS[@]} VirtualNetworks."
+    info "Suite cleanup found ${#CLEANUP_ATTACHMENT_IDS[@]} ExternalIPAttachments, ${#CLEANUP_EIP_IDS[@]} ExternalIPs, ${#CLEANUP_BMI_IDS[@]} BMaaS instances, ${#CLEANUP_POOL_IDS[@]} test pools, ${#CREATED_SUBNET_IDS[@]} Subnets, and ${#CREATED_IDS[@]} VirtualNetworks."
+    if [[ "${#CREATED_EXTERNAL_IP_ATTACHMENT_IDS[@]}" -gt 0 ]]; then
+        cleanup_created_external_ip_attachments \
+            || die "Could not detach all test ExternalIPAttachments; preserving ExternalIPs, BMIs, Subnets, and VirtualNetworks"
+    fi
+    remove_external_ip_client_routes \
+        || die "Could not remove test-only upstream routes; preserving ExternalIPs and network resources"
     for index in "${!CLEANUP_POOL_IDS[@]}"; do
         EXTERNAL_IP_POOL_ID="${CLEANUP_POOL_IDS[$index]}"
         EXTERNAL_IP_POOL_K8S_UID="${CLEANUP_POOL_UIDS[$index]}"
@@ -3932,6 +4664,10 @@ prepare_suite_cleanup() {
     EXTERNAL_IP_POOL_K8S_UID=""
     EXTERNAL_IP_POOL_CIDR=""
     EXTERNAL_IP_POOL_PENDING_CLEANUP=false
+    if [[ "${#CREATED_BARE_METAL_INSTANCE_IDS[@]}" -gt 0 ]]; then
+        cleanup_created_bare_metal_instances \
+            || die "Could not offboard test BMaaS instances; preserving their Subnets and VirtualNetworks"
+    fi
     if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
         cleanup_interrupted_dhcp_clients
     fi
@@ -3976,6 +4712,13 @@ verify_suite_cleanup_provider_state() {
         if jq -e --arg uid "$uid" 'any(.external_ips[]; .uid == $uid)' \
             <<<"$current" >/dev/null; then
             printf 'Deleted test ExternalIP provider row remains for UID %s\n' "$uid" >&2
+            return 1
+        fi
+    done
+    for uid in "${CLEANUP_ATTACHMENT_UIDS[@]}"; do
+        if jq -e --arg uid "$uid" 'any(.external_ip_attachments[]; .uid == $uid)' \
+            <<<"$current" >/dev/null; then
+            printf 'Deleted test ExternalIPAttachment provider row remains for UID %s\n' "$uid" >&2
             return 1
         fi
     done
@@ -4053,7 +4796,7 @@ verify_suite_cleanup_provider_state() {
             "$CLEANUP_STATE_FILE")
     fi
 
-    for collection in virtual_networks subnets external_ip_pools external_ips; do
+    for collection in virtual_networks subnets external_ip_pools external_ips external_ip_attachments; do
         baseline_uids="$(jq -r --arg collection "$collection" \
             'if (.[$collection] | type) != "array" then error("invalid state collection") else .[$collection][].uid end' \
             "$BASELINE_STATE_FILE")" || return 1
@@ -4076,16 +4819,32 @@ verify_suite_cleanup_provider_state() {
 cleanup_created_virtual_networks() {
     local cleanup_incomplete=false
     local test_vns_clean=true test_subnets_clean=true test_external_ips_clean=true test_external_ip_pool_clean=true
+    local test_external_ip_attachments_clean=true test_baremetal_instances_clean=true routes_clean=true
     local id selector current
-    if ! cleanup_created_external_ips; then
+    if ! cleanup_created_external_ip_attachments; then
+        test_external_ip_attachments_clean=false
+        printf 'ERROR: preserving test ExternalIPs, BMI, Subnet, VirtualNetwork, route, and provider state because detach cleanup is incomplete\n' >&2
+        cleanup_incomplete=true
+    fi
+    if [[ "$test_external_ip_attachments_clean" == true ]] && ! remove_external_ip_client_routes; then
+        routes_clean=false
+        printf 'ERROR: preserving test ExternalIPs and network resources because upstream route cleanup is incomplete\n' >&2
+        cleanup_incomplete=true
+    fi
+    if [[ "$test_external_ip_attachments_clean" == true && "$routes_clean" == true ]] \
+        && ! cleanup_created_external_ips; then
         test_external_ips_clean=false
         printf 'ERROR: preserving test ExternalIPs and provider state because cleanup is incomplete\n' >&2
         cleanup_incomplete=true
     fi
-    if [[ "$test_external_ips_clean" == true ]] && ! cleanup_created_external_ip_pool; then
+    if [[ "$test_external_ip_attachments_clean" == true && "$routes_clean" == true \
+        && "$test_external_ips_clean" == true ]] && ! cleanup_created_external_ip_pool; then
         test_external_ip_pool_clean=false
         printf 'ERROR: preserving the ExternalIPPool and provider access because pool cleanup is incomplete\n' >&2
         cleanup_incomplete=true
+    elif [[ "$test_external_ip_attachments_clean" != true || "$routes_clean" != true \
+        || "$test_external_ips_clean" != true ]]; then
+        test_external_ip_pool_clean=false
     fi
     if [[ "${CLEANUP_MODE:-false}" == true ]] \
         && declare -p CLEANUP_PENDING_POOL_IDS >/dev/null 2>&1 \
@@ -4094,10 +4853,23 @@ cleanup_created_virtual_networks() {
         printf 'ERROR: preserving provider access; test ExternalIPPool cleanup is incomplete\n' >&2
         cleanup_incomplete=true
     fi
-    if ! cleanup_created_subnets; then
+    if [[ "$test_external_ips_clean" == true && "$test_external_ip_pool_clean" == true \
+        && "$test_external_ip_attachments_clean" == true && "$routes_clean" == true ]] \
+        && ! cleanup_created_bare_metal_instances; then
+        test_baremetal_instances_clean=false
+        printf 'ERROR: preserving BMI Subnet and VirtualNetwork because BMaaS cleanup is incomplete\n' >&2
+        cleanup_incomplete=true
+    fi
+    if [[ "$test_external_ip_attachments_clean" == true && "$routes_clean" == true \
+        && "$test_external_ips_clean" == true && "$test_external_ip_pool_clean" == true \
+        && "$test_baremetal_instances_clean" == true ]] && ! cleanup_created_subnets; then
         test_subnets_clean=false
         printf 'ERROR: test-owned Subnet cleanup is incomplete; preserving its provider and DHCP state for recovery\n' >&2
         cleanup_incomplete=true
+    elif [[ "$test_external_ip_attachments_clean" != true || "$routes_clean" != true \
+        || "$test_external_ips_clean" != true || "$test_external_ip_pool_clean" != true \
+        || "$test_baremetal_instances_clean" != true ]]; then
+        test_subnets_clean=false
     fi
     if [[ "$test_subnets_clean" == true && -n "$CLI_BIN" && -x "$CLI_BIN" \
         && -n "$CLI_CONFIG_DIR" && -d "$CLI_CONFIG_DIR" ]]; then
@@ -4131,15 +4903,19 @@ cleanup_created_virtual_networks() {
     done
     if [[ "${CLEANUP_MODE:-false}" == true \
         && "${CLEANUP_DISCOVERY_COMPLETE:-false}" == true \
+        && "$test_external_ip_attachments_clean" == true && "$routes_clean" == true \
         && "$test_external_ips_clean" == true \
-        && "$test_external_ip_pool_clean" == true && "$test_subnets_clean" == true \
+        && "$test_external_ip_pool_clean" == true && "$test_baremetal_instances_clean" == true \
+        && "$test_subnets_clean" == true \
         && "$test_vns_clean" == true ]]; then
         if ! verify_suite_cleanup_provider_state; then
             test_vns_clean=false
             cleanup_incomplete=true
         fi
     fi
-    if [[ "$test_external_ips_clean" == true && "$test_external_ip_pool_clean" == true \
+    if [[ "$test_external_ip_attachments_clean" == true && "$routes_clean" == true \
+        && "$test_external_ips_clean" == true && "$test_external_ip_pool_clean" == true \
+        && "$test_baremetal_instances_clean" == true \
         && "$test_subnets_clean" == true \
         && "$test_vns_clean" == true ]]; then
         if ! restore_dhcp_supervisor; then
@@ -4177,8 +4953,14 @@ cleanup_created_virtual_networks() {
     else
         if [[ "$test_external_ip_pool_clean" != true ]]; then
             printf 'ERROR: preserving AAP inventory and provider access because ExternalIPPool cleanup is incomplete\n' >&2
+        elif [[ "$test_external_ip_attachments_clean" != true ]]; then
+            printf 'ERROR: preserving EIPs, BMI, Subnet, VirtualNetwork, provider state, and route because ExternalIPAttachment cleanup is incomplete\n' >&2
+        elif [[ "$routes_clean" != true ]]; then
+            printf 'ERROR: preserving ExternalIPs and network resources because upstream route cleanup is incomplete\n' >&2
         elif [[ "$test_external_ips_clean" != true ]]; then
             printf 'ERROR: preserving test ExternalIPs and provider access because ExternalIP cleanup is incomplete\n' >&2
+        elif [[ "$test_baremetal_instances_clean" != true ]]; then
+            printf 'ERROR: preserving Subnet and VirtualNetwork because BMaaS cleanup is incomplete\n' >&2
         elif [[ "$test_subnets_clean" != true ]]; then
             printf 'ERROR: preserving VirtualNetwork and provider access because Subnet cleanup is incomplete\n' >&2
         else
@@ -4739,7 +5521,7 @@ if [[ -n "$EXISTING_OSAC_RELEASE" ]]; then
     if [[ "$OSAC_INSTALL_MODE" == auto ]] \
         && [[ "$(jq -cS . <<<"$PREVIOUS_DEPLOYMENT_SETTINGS")" == "$EXPECTED_DEPLOYMENT_SETTINGS" ]]; then
         OSAC_DEPLOYMENT_NEEDED=false
-        info "The existing OSAC release already matches the fixes-branch deployment settings."
+        info "The existing OSAC release already matches the implementation-branch deployment settings."
     else
         prepare_upgrade_values
     fi
@@ -5854,6 +6636,7 @@ if not path.exists():
         "subnets": [],
         "external_ip_pools": [],
         "external_ips": [],
+        "external_ip_attachments": [],
     }, sort_keys=True))
     raise SystemExit(0)
 expected_virtual_network_columns = {
@@ -5871,6 +6654,10 @@ expected_external_ip_pool_columns = {
 expected_external_ip_columns = {
     "uid", "fulfillment_id", "tenant_id", "pool_uid", "address",
 }
+expected_attachment_columns = {
+    "uid", "fulfillment_id", "tenant_id", "external_ip_uid",
+    "virtual_network_uid", "subnet_uid", "external_address", "phase", "payload",
+}
 connection = None
 try:
     connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=60)
@@ -5880,8 +6667,9 @@ try:
         for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
     version = connection.execute("PRAGMA user_version").fetchone()[0]
-    expected_tables = {"virtual_networks", "subnets", "external_ip_pools", "external_ips"}
-    if version != 1 or tables != expected_tables:
+    legacy_tables = {"virtual_networks", "subnets", "external_ip_pools", "external_ips"}
+    expected_tables = legacy_tables | {"attachments"}
+    if version != 1 or tables not in (legacy_tables, expected_tables):
         raise SystemExit("AgentlessNet SQLite state is incompatible with schema v1; preserving it")
 
     virtual_network_columns = {
@@ -5900,11 +6688,18 @@ try:
         row[1]
         for row in connection.execute("PRAGMA table_info(external_ips)")
     }
+    attachment_columns = set()
+    if "attachments" in tables:
+        attachment_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(attachments)")
+        }
     if (
         virtual_network_columns != expected_virtual_network_columns
         or subnet_columns != expected_subnet_columns
         or external_ip_pool_columns != expected_external_ip_pool_columns
         or external_ip_columns != expected_external_ip_columns
+        or ("attachments" in tables and attachment_columns != expected_attachment_columns)
     ):
         raise SystemExit("AgentlessNet SQLite table definitions are incompatible with schema v1; preserving it")
 
@@ -5942,6 +6737,24 @@ try:
                FROM external_ips ORDER BY uid"""
         )
     ]
+    attachment_entries = [
+        {
+            "uid": row[0],
+            "fulfillment_id": row[1],
+            "tenant_id": row[2],
+            "external_ip_uid": row[3],
+            "virtual_network_uid": row[4],
+            "subnet_uid": row[5],
+            "external_address": row[6],
+            "phase": row[7],
+            "payload": json.loads(row[8]),
+        }
+        for row in connection.execute(
+            """SELECT uid, fulfillment_id, tenant_id, external_ip_uid,
+                      virtual_network_uid, subnet_uid, external_address, phase, payload
+               FROM attachments ORDER BY uid"""
+        )
+    ] if "attachments" in tables else []
 except (OSError, sqlite3.DatabaseError, json.JSONDecodeError) as error:
     raise SystemExit("AgentlessNet SQLite state is unreadable; preserving it") from error
 finally:
@@ -5953,6 +6766,7 @@ print(json.dumps({
     "subnets": subnet_entries,
     "external_ip_pools": external_ip_pool_entries,
     "external_ips": external_ip_entries,
+    "external_ip_attachments": attachment_entries,
 }, sort_keys=True))
 PY
 }
@@ -5963,14 +6777,15 @@ save_current_state() {
       and (.virtual_networks | type == "array")
       and (.subnets | type == "array")
       and (.external_ip_pools | type == "array")
-      and (.external_ips | type == "array")' \
+      and (.external_ips | type == "array")
+      and (.external_ip_attachments | type == "array")' \
         "$CURRENT_STATE_FILE" >/dev/null \
         || die "AgentlessNet state is not a valid schema-v1 snapshot"
 }
 
 assert_baseline_state_unchanged() {
     local collection uid before after
-    for collection in virtual_networks subnets external_ip_pools external_ips; do
+    for collection in virtual_networks subnets external_ip_pools external_ips external_ip_attachments; do
         while IFS= read -r uid; do
             [[ -n "$uid" ]] || continue
             before="$(jq -cS --arg uid "$uid" --arg collection "$collection" \
@@ -6630,6 +7445,186 @@ create_primary_virtual_network_for_suite() {
     assert_baseline_state_unchanged
 }
 
+create_external_ip_attachment_test_network_and_bmi() {
+    local entry transit_cidr subnet_output user_data_file key_file public_key user_data
+    local create_output create_status=0 bmi_id
+    if [[ -z "${FIRST_FULFILLMENT_ID:-}" ]]; then
+        create_primary_virtual_network_for_suite
+    fi
+    entry="$(get_state_entry "$FIRST_K8S_UID")"
+    transit_cidr="$(jq -er '.transit.cidr' <<<"$entry")" \
+        || die "Test VirtualNetwork has no saved transit CIDR"
+    if [[ -n "$EXTERNAL_IP_ATTACHMENT_SUBNET_CIDR" ]]; then
+        SUBNET_ONE_IPV4_CIDR="$EXTERNAL_IP_ATTACHMENT_SUBNET_CIDR"
+    fi
+    resolve_test_subnet_cidrs "$VIRTUAL_NETWORK_IPV4_CIDR" "$transit_cidr"
+    EXTERNAL_IP_ATTACHMENT_SUBNET_CIDR="$SUBNET_ONE_IPV4_CIDR"
+    subnet_output="${TEMP_DIR}/create-external-ip-attachment-subnet.out"
+    create_subnet "$EXTERNAL_IP_ATTACHMENT_SUBNET_NAME" "$FIRST_FULFILLMENT_ID" \
+        "$EXTERNAL_IP_ATTACHMENT_SUBNET_CIDR" "$subnet_output" \
+        || die "Could not create ExternalIPAttachment test Subnet"
+    EXTERNAL_IP_ATTACHMENT_SUBNET_ID="$(<"${subnet_output}.id")"
+    wait_for_subnet_ready "$EXTERNAL_IP_ATTACHMENT_SUBNET_ID" "$FIRST_FULFILLMENT_ID"
+    EXTERNAL_IP_ATTACHMENT_SUBNET_CR="$(subnet_cr_json \
+        "$EXTERNAL_IP_ATTACHMENT_SUBNET_ID" "$FIRST_FULFILLMENT_ID")"
+    EXTERNAL_IP_ATTACHMENT_SUBNET_UID="$(jq -er '.metadata.uid' \
+        <<<"$EXTERNAL_IP_ATTACHMENT_SUBNET_CR")" \
+        || die "ExternalIPAttachment test Subnet has no Kubernetes UID"
+    assert_subnet_state "$EXTERNAL_IP_ATTACHMENT_SUBNET_ID" "$FIRST_FULFILLMENT_ID" \
+        "$EXTERNAL_IP_ATTACHMENT_SUBNET_CIDR"
+
+    [[ -n "$OSAC_BMI_CATALOG_ITEM" ]] \
+        || die "Set OSAC_BMI_CATALOG_ITEM to a BMaaS CatalogItem with an available host"
+    [[ "$OSAC_BMI_NETWORK_INTERFACE" =~ ^[A-Za-z0-9_.-]{1,15}$ ]] \
+        || die "OSAC_BMI_NETWORK_INTERFACE must be a valid interface name"
+    EXTERNAL_IP_RESPONSE_TOKEN="osac-eia-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+    user_data_file="${TEMP_DIR}/external-ip-attachment-bmi-user-data.yaml"
+    python3 - "$EXTERNAL_IP_RESPONSE_TOKEN" "$EXTERNAL_IP_RESPONSE_PORT" \
+        "$OSAC_BMI_NETWORK_INTERFACE" "$user_data_file" <<'PY'
+import pathlib
+import sys
+import textwrap
+
+token, port, interface, output = sys.argv[1:]
+if not token.startswith("osac-eia-") or not token.replace("-", "").isalnum():
+    raise SystemExit("invalid ExternalIPAttachment response token")
+if not port.isdecimal() or not 1 <= int(port) <= 65535:
+    raise SystemExit("invalid ExternalIPAttachment response port")
+if not interface or len(interface) > 15 or any(not (char.isalnum() or char in "_.-") for char in interface):
+    raise SystemExit("invalid ExternalIPAttachment BMI network interface")
+service_script = f'''#!/usr/bin/bash
+set -euo pipefail
+for ((attempt=0; attempt<60; attempt++)); do
+    address="$(ip -4 -o addr show dev {interface} | awk '{{split($4, parts, "/"); print parts[1]; exit}}')"
+    if [[ -n "$address" ]]; then
+        exec /usr/bin/python3 -m http.server {port} --bind "$address" --directory /var/tmp
+    fi
+    sleep 2
+done
+exit 1
+'''
+document = f'''#cloud-config
+write_files:
+  - path: /var/tmp/osac-eia-response
+    owner: root:root
+    permissions: "0644"
+    content: "{token}"
+  - path: /usr/local/sbin/osac-eia-response.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+{textwrap.indent(service_script.rstrip(), "      ")}
+  - path: /etc/systemd/system/osac-eia-response.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=OSAC ExternalIPAttachment E2E response service
+      After=network-online.target
+      [Service]
+      ExecStart=/usr/local/sbin/osac-eia-response.sh
+      Restart=always
+      [Install]
+      WantedBy=multi-user.target
+runcmd:
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, osac-eia-response.service]
+  - [bash, -lc, "if command -v firewall-cmd >/dev/null && systemctl is-active --quiet firewalld; then firewall-cmd --permanent --add-port={port}/tcp && firewall-cmd --reload; fi"]
+'''
+pathlib.Path(output).write_text(document)
+pathlib.Path(output).chmod(0o600)
+PY
+    key_file="${TEMP_DIR}/external-ip-attachment-bmi-ed25519"
+    ssh-keygen -q -t ed25519 -N '' -C osac-eia-e2e -f "$key_file" \
+        || die "Could not create the temporary BMaaS SSH key"
+    public_key="$(<"${key_file}.pub")"
+    user_data="$(<"$user_data_file")"
+    create_output="${TEMP_DIR}/create-external-ip-attachment-bmi.out"
+    local -a create_args=(
+        create baremetalinstance --name "$EXTERNAL_IP_BMI_NAME"
+        --catalog-item "$OSAC_BMI_CATALOG_ITEM"
+        --network-attachment "subnet=${EXTERNAL_IP_ATTACHMENT_SUBNET_ID},interface=${OSAC_BMI_NETWORK_INTERFACE},primary"
+        --ssh-key "$public_key" --user-data "$user_data" --run-strategy always
+    )
+    [[ -z "$OSAC_BMI_INSTANCE_TYPE" ]] || create_args+=(--instance-type "$OSAC_BMI_INSTANCE_TYPE")
+    [[ -z "${OSAC_BMI_DISK_IMAGE:-}" ]] || create_args+=(--disk-image "$OSAC_BMI_DISK_IMAGE")
+    if "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" \
+        "${create_args[@]}" >"$create_output" 2>&1; then
+        create_status=0
+    else
+        create_status=$?
+    fi
+    cat "$create_output" >&2 || return 1
+    bmi_id="$(grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
+        "$create_output" | tail -n 1)"
+    if [[ "$bmi_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        EXTERNAL_IP_BMI_ID="$bmi_id"
+        CREATED_BARE_METAL_INSTANCE_IDS+=("$bmi_id")
+    fi
+    [[ "$create_status" == 0 ]] \
+        || die "Fulfillment could not create test BMI ${EXTERNAL_IP_BMI_NAME}; recovery command: bash ./vlan-e2e.sh --cleanup --external-ip"
+    [[ -n "$EXTERNAL_IP_BMI_ID" ]] \
+        || die "Fulfillment did not return a BMI UUID for ${EXTERNAL_IP_BMI_NAME}"
+    wait_for_external_ip_bmi_ready "$EXTERNAL_IP_BMI_ID"
+}
+
+cleanup_created_bare_metal_instances() {
+    [[ "${#CREATED_BARE_METAL_INSTANCE_IDS[@]}" -gt 0 ]] || return 0
+    [[ -n "$CLI_BIN" && -x "$CLI_BIN" && -n "$CLI_CONFIG_DIR" && -d "$CLI_CONFIG_DIR" ]] \
+        || return 1
+    local id crs count cr name output_file deadline selected index
+    for id in "${CREATED_BARE_METAL_INSTANCE_IDS[@]}"; do
+        if ! crs="$(baremetal_instance_crs_json "$id")"; then
+            printf 'Could not inspect BareMetalInstance %s during cleanup; preserve its Subnet and VirtualNetwork\n' "$id" >&2
+            return 1
+        fi
+        count="$(jq -er '.items | length' <<<"$crs")" || return 1
+        if [[ "$count" == 1 ]]; then
+            cr="$(baremetal_instance_cr_json "$id")"
+            name="$(jq -er '.metadata.name' <<<"$cr")" || return 1
+            if [[ -z "$(jq -r '.metadata.deletionTimestamp // ""' <<<"$cr")" ]]; then
+                output_file="${TEMP_DIR}/delete-baremetal-instance-${id}.out"
+                if ! "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" \
+                    delete baremetalinstance "$id" >"$output_file" 2>&1; then
+                    cat "$output_file" >&2
+                    printf 'Could not delete BareMetalInstance %s (%s); preserve its Subnet and VirtualNetwork\n' \
+                        "$id" "$name" >&2
+                    return 1
+                fi
+            fi
+            deadline=$((SECONDS + 1800))
+            while ((SECONDS < deadline)); do
+                crs="$(baremetal_instance_crs_json "$id")" || return 1
+                count="$(jq -er '.items | length' <<<"$crs")" || return 1
+                [[ "$count" == 0 ]] && break
+                [[ "$count" == 1 ]] || return 1
+                sleep 5
+            done
+            [[ "$count" == 0 ]] || {
+                printf 'Timed out deleting BareMetalInstance %s (%s); preserve its Subnet and VirtualNetwork\n' \
+                    "$id" "$name" >&2
+                return 1
+            }
+        elif [[ "$count" != 0 ]]; then
+            printf 'Multiple BareMetalInstance CRs exist for test UUID %s; preserving its network resources\n' "$id" >&2
+            return 1
+        fi
+        selected="$(cleanup_cli_list_json baremetalinstance "this.id == \"${id}\"")" \
+            || return 1
+        [[ "$(jq -er 'length' <<<"$selected")" == 0 ]] || {
+            printf 'Fulfillment BareMetalInstance %s remains after Kubernetes cleanup\n' "$id" >&2
+            return 1
+        }
+        for index in "${!CREATED_BARE_METAL_INSTANCE_IDS[@]}"; do
+            if [[ "${CREATED_BARE_METAL_INSTANCE_IDS[$index]}" == "$id" ]]; then
+                unset 'CREATED_BARE_METAL_INSTANCE_IDS[index]'
+            fi
+        done
+    done
+    EXTERNAL_IP_BMI_ID=""
+    info "Test BareMetalInstance cleanup completed; its network can now be removed."
+}
+
 delete_primary_virtual_network_for_suite() {
     delete_virtual_network_by_id "$FIRST_FULFILLMENT_ID"
     printf 'delete AAP job ID (test VN): %s\n' "$LAST_DELETE_AAP_JOB_ID"
@@ -6855,8 +7850,6 @@ assert_baseline_state_unchanged
 run_full_suite() {
 info "Creating and verifying one shared IPv4 ExternalIPPool through Fulfillment..."
 create_external_ip_pool
-info "Running ExternalIP allocate, retry, release, and pool-capacity checks..."
-run_external_ip_lifecycle
 
 info "Submitting two overlapping VirtualNetwork requests concurrently through Fulfillment..."
 CREATE_ONE_OUTPUT="${TEMP_DIR}/create-one.out"
@@ -6942,6 +7935,15 @@ assert_private_vn_isolation "$FIRST_FULFILLMENT_ID" "$SECOND_FULFILLMENT_ID"
 save_current_state
 assert_baseline_state_unchanged
     run_subnet_dhcp_checks
+if [[ "$SUITE_USES_EXTERNAL_IP_ATTACHMENT" == true ]]; then
+    info "Provisioning a real BMaaS target on the test VirtualNetwork for inbound ExternalIP checks..."
+    create_external_ip_attachment_test_network_and_bmi
+    info "Running ExternalIP allocation, retry, ingress, detach, and capacity checks..."
+    run_external_ip_lifecycle
+    cleanup_created_bare_metal_instances \
+        || die "Could not offboard the test BMaaS instance; preserving its Subnet and VirtualNetwork"
+    delete_subnet_by_id "$EXTERNAL_IP_ATTACHMENT_SUBNET_ID"
+fi
 info "Deleting the first test VirtualNetwork and verifying its peer remains provisioned..."
 FIRST_PEER_ENTRY="$(get_state_entry "$SECOND_K8S_UID" | jq -cS '.')"
 delete_virtual_network_by_id "$FIRST_FULFILLMENT_ID"
@@ -6995,9 +7997,15 @@ run_external_ip_pool_suite() {
 }
 
 run_external_ip_suite() {
+    info "Creating a test VirtualNetwork, Subnet, and real BMaaS target for ExternalIP ingress..."
+    create_external_ip_attachment_test_network_and_bmi
     info "Creating the shared IPv4 ExternalIPPool used by the lifecycle test..."
     create_external_ip_pool
     run_external_ip_lifecycle
+    cleanup_created_bare_metal_instances \
+        || die "Could not offboard the test BMaaS instance; preserving its Subnet and VirtualNetwork"
+    delete_subnet_by_id "$EXTERNAL_IP_ATTACHMENT_SUBNET_ID"
+    delete_primary_virtual_network_for_suite
     info "Deleting the test-owned ExternalIPPool after all ExternalIPs were released..."
     delete_external_ip_pool
     save_current_state
@@ -7035,6 +8043,11 @@ if [[ "$CLEANUP_MODE" == true ]]; then
     if ! docker inspect "$CONTAINERLAB_NET_NODE" >/dev/null 2>&1 \
         || [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINERLAB_NET_NODE")" != true ]]; then
         die "The existing Containerlab network node is unavailable; cleanup will not deploy the fabric"
+    fi
+    if [[ "$SUITE_USES_EXTERNAL_IP_ATTACHMENT" == true ]] \
+        && { ! docker inspect "$CONTAINERLAB_UPSTREAM_ROUTER" >/dev/null 2>&1 \
+            || [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINERLAB_UPSTREAM_ROUTER")" != true ]]; }; then
+        die "The existing upstream-router test client is unavailable; cleanup will not deploy the fabric"
     fi
     write_provider_inventory
     ensure_containerlab_switches
@@ -7084,7 +8097,8 @@ jq -e '(.schema_version == 0 or .schema_version == 1)
       and (.virtual_networks | type == "array")
       and (.subnets | type == "array")
       and (.external_ip_pools | type == "array")
-      and (.external_ips | type == "array")' \
+      and (.external_ips | type == "array")
+      and (.external_ip_attachments | type == "array")' \
     "$BASELINE_STATE_FILE" >/dev/null \
     || die "AgentlessNet state must be empty or use the current schema v1 before the test starts"
 
@@ -7107,7 +8121,7 @@ if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
 fi
 case "$VLAN_E2E_SUITE" in
     full)
-        info "Existing-lab AgentlessNet E2E passed: ExternalIPPool and ExternalIP allocation/retry/release, overlapping VirtualNetworks, VN and Subnet retries, internal VLAN exclusion, AAP BMI attachment and lease lookup for real DHCP clients, gateway and same-Subnet L2 traffic across leaves, DHCP service restart, /30 lease, peer-preserving lifecycle, and BMI offboarding."
+        info "Existing-lab AgentlessNet E2E passed: ExternalIP allocation/retry/release and inbound BMaaS ExternalIPAttachment, overlapping VirtualNetworks, VN and Subnet retries, internal VLAN exclusion, AAP DHCP attachment and lease lookup for test clients, gateway and same-Subnet L2 traffic across leaves, DHCP service restart, /30 lease, peer-preserving lifecycle, and ordered cleanup."
         ;;
     virtual-network)
         info "VirtualNetwork-only E2E passed: one VN was created, verified, deleted, and cleaned up."
@@ -7119,6 +8133,6 @@ case "$VLAN_E2E_SUITE" in
         info "ExternalIPPool-only E2E passed: one pool was created, verified, deleted, and cleaned up."
         ;;
     external-ip)
-        info "ExternalIP-only E2E passed: two addresses were allocated, one UID retry reused its reservation, both addresses were released, pool capacity was restored, and the test pool was deleted."
+        info "ExternalIP E2E passed: two addresses were allocated, one UID retry reused its reservation, a real BMaaS target replied through both ExternalIPs, attachment retry and peer preservation passed, attachments were detached before EIPs and the BMI, pool capacity was restored, and test network resources were deleted. The external client uses a test-only static route; upstream BGP advertisement is not exercised."
         ;;
 esac
