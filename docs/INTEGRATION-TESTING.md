@@ -573,18 +573,18 @@ uses deployed Fulfillment/database/operator/AAP/SSH/Linux/dnsmasq/Cumulus VX
 components and untagged test clients. The separate AgentlessNet ExternalIP
 attachment journey is owned by [DEV OSAC-6308](https://redhat.atlassian.net/browse/OSAC-6308)
 and runs with `bash ./vlan-e2e.sh --external-ip` from the rebased `e2e`
-branch. It creates a real Fulfillment-backed BMI, waits for its Ready CR and
-primary Subnet address, probes an HTTP response through each attached
-ExternalIP from the Containerlab upstream-router, and verifies attachment
-detach before EIP/BMI/Subnet/VN cleanup. The runner adds a test-only static
-`/32` route to the network node, so it exercises the packet path but does not
-establish upstream BGP advertisement. It requires an available BMaaS host and
-CatalogItem; the default CatalogItem is `ci-bm-default` and the primary
-interface defaults to `eth9`. It does not establish physical-hardware, NAT, or
-full-install CI coverage. Run `bash ./vlan-e2e.sh --cleanup --external-ip` to
-recover test-owned resources without redeploying or initializing the lab.
-The Subnet/DHCP fixture still does not establish BMI reconciliation/readiness;
-only the new ExternalIPAttachment scenario uses a real Fulfillment BMI.
+branch. It uses an existing DHCP client as a synthetic BareMetalInstance
+target, supplies the controller-shaped v1 context directly to AAP, probes an
+HTTP response through each attached ExternalIP from the Containerlab
+upstream-router, and verifies retry, peer preservation, detach, and ordered
+cleanup. This exercises the deployed AAP/provider packet path; the controller
+contract tests cover dependency input and result validation. It deliberately
+does not exercise Fulfillment-to-BMI readiness or BMaaS lifecycle. The runner
+adds a test-only static `/32` route to the network node, so it does not
+establish upstream BGP advertisement, physical-hardware, NAT, or full-install
+CI coverage. Run `bash ./vlan-e2e.sh --cleanup --external-ip` to recover
+test-owned provider state and resources without redeploying or initializing
+the lab.
 
 The integration harness still has provider-dependent scenarios that cannot run
 without AAP or additional infrastructure. Changes to provisioning behavior
@@ -666,7 +666,7 @@ Touched-area requirements: [component guide](../tests/e2e/AGENTS.md#touched-area
 
 | Tier | Location / command | Exercises for real | Faked or omitted |
 |---|---|---|---|
-| E2E ([DEV] OSAC-5530/OSAC-6307/OSAC-6308 AgentlessNet lab journey) | From the repository root on `e2e`, rebased on local `osac-6308-external-ip-attachment`: set `CUMULUS_VERSION` and matching `CUMULUS_VX_IMAGE`, then run `bash ./vlan-e2e.sh` or `bash ./vlan-e2e.sh --external-ip`. Standalone recovery is `bash ./vlan-e2e.sh --cleanup --external-ip`. | The full suite covers ExternalIP allocation/retry/release and a real BMaaS ExternalIPAttachment, overlapping VirtualNetworks, Subnet retry and cleanup, DHCP service restart, `/30`, gateway and same-Subnet L2 checks. `--external-ip` creates a Fulfillment BMI from `OSAC_BMI_CATALOG_ITEM` (default `ci-bm-default`), waits for its Ready CR and primary Subnet address, starts a response service through user data, creates two attachments, retries one, probes each ExternalIP from the upstream-router, and checks detach and peer preservation. The test-only `/32` route points from upstream-router to the network node; it does not test BGP advertisement. Cleanup detaches before EIP release, pool/BMI deletion, and Subnet/VN deletion; failure preserves dependents and route. Runtime images and AAP project are pinned to the implementation branch commit, and production trees must match it. | Requires deployed BMaaS, an available host and suitable CatalogItem/interface, the source-pinned OSAC deployment, SNO, Containerlab Cumulus VX and reachable upstream-router. Simulated DHCP clients remain BMI-shaped AAP inputs and do not prove BMI readiness. This suite does not establish physical-hardware behavior, BGP advertisement, NAT, or full-install CI coverage. A successful deployed run is required to claim live reachability. |
+| E2E ([DEV] OSAC-5530/OSAC-6307/OSAC-6308 AgentlessNet lab journey) | From the repository root on `e2e`, rebased on local `osac-6308-external-ip-attachment`: set `CUMULUS_VERSION` and matching `CUMULUS_VX_IMAGE`, then run `bash ./vlan-e2e.sh` or `bash ./vlan-e2e.sh --external-ip`. Standalone recovery is `bash ./vlan-e2e.sh --cleanup --external-ip`. | The full suite covers ExternalIP allocation/retry/release and ExternalIPAttachment ingress with a synthetic DHCP target, overlapping VirtualNetworks, Subnet retry and cleanup, DHCP service restart, `/30`, gateway and same-Subnet L2 checks. `--external-ip` creates two ExternalIPs, submits controller-shaped v1 context directly to AAP for a synthetic DHCP client target, retries one attachment, probes each ExternalIP from the upstream-router, and checks detach and peer preservation. The controller contract tests validate dependency input and result handling; this E2E does not exercise Fulfillment-to-BMI readiness. The test-only `/32` route points from upstream-router to the network node; it does not test BGP advertisement. Cleanup detaches before EIP release, pool deletion, client offboarding, and Subnet/VN deletion; failure preserves dependents and route. Runtime images and AAP project are pinned to the implementation branch commit, and production trees must match it. | Requires the source-pinned OSAC deployment, SNO, Containerlab Cumulus VX, a reachable upstream-router, and DHCP client/container access. It does not require a BMaaS CatalogItem or provisionable host. Simulated DHCP clients do not prove BMaaS lifecycle/readiness. This suite does not establish physical-hardware behavior, BGP advertisement, NAT, or full-install CI coverage. A successful deployed run is required to claim live reachability. |
 | E2E (VMaaS regression) | From the repository root: `uv run pytest tests/e2e/vmaas/regression/test_compute_instance_instance_type.py` | InstanceType resize through CLI/API, CatalogItem provisioning, and Kubernetes/KubeVirt resources | Requires a configured single-node VMaaS environment; no services are mocked. |
 | E2E (VMaaS additional disks) | From the repository root: `uv run pytest tests/e2e/vmaas/regression/test_compute_instance_storage_tier.py -k empty_additional_disks_disables_catalog_item_default` | CatalogItem default application versus an explicit empty `additional_disks` wrapper, checked on the ComputeInstance CR | Requires a configured VMaaS environment with storage tiers, subnet, disk image, instance type, and VM template; no services are mocked. |
 | Unit ([DEV], CaaS teardown) | From the repository root: `uv run pytest -n 0 tests/unit/test_caas_teardown_order.py tests/unit/test_cluster_deletion_polling.py tests/unit/test_caas_deletion_diagnostics.py tests/unit/test_caas_worker_bmi_visibility.py tests/unit/test_caas_two_node_sets.py tests/unit/test_caas_selector_contracts.py` | Read-only wait logic, exact-resource NotFound, ordered worker/parent/dependent waits, shared single/two-node-set budgets, stage-specific safe failures, snapshot throttling and sanitization, worker ownership checks, NodeSet selectors with shared BMITs, and shared-only BMIT reference expectations | API/client responses and time are mocked. No deployed controllers, fulfillment, AAP, provider, or metering is exercised. |
