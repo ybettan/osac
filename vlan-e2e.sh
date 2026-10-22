@@ -38,8 +38,8 @@ OSAC-5528 is complete.
 The --external-ip and --full suites use an existing DHCP client as a synthetic
 BareMetalInstance target for the AgentlessNet ExternalIPAttachment AAP jobs.
 This validates the provider datapath and does not exercise Fulfillment-to-BMaaS
-readiness. The ingress probe uses a test-only static route from upstream-router
-to the network node; it does not test BGP advertisement.
+readiness. The ingress probe uses a test-only static route over the direct
+Containerlab peer link; it does not test BGP advertisement.
 
 Examples:
   bash ./vlan-e2e.sh
@@ -301,7 +301,10 @@ EXTERNAL_IP_SYNTHETIC_TARGET_IP=""
 EXTERNAL_IP_RESPONSE_PORT="${OSAC_EIA_RESPONSE_PORT:-18080}"
 EXTERNAL_IP_RESPONSE_TOKEN=""
 EXTERNAL_IP_CLIENT_ROUTE_GATEWAY=""
-EXTERNAL_IP_CLIENT_ROUTE_INTERFACE="eth0"
+EXTERNAL_IP_UPLINK_INTERFACE="eth2"
+EXTERNAL_IP_CLIENT_ROUTE_INTERFACE="eth1"
+EXTERNAL_IP_TEST_LINK_NODE_ADDRESS="192.0.2.1"
+EXTERNAL_IP_TEST_LINK_CLIENT_ADDRESS="192.0.2.2"
 EXTERNAL_IP_CLIENT_ROUTE_ADDRESSES=()
 CLEANUP_EIP_ADDRESSES=()
 
@@ -3002,12 +3005,13 @@ write_synthetic_external_ip_attachment_attach_vars() {
     local virtual_network_id="${12}" virtual_network_uid="${13}" virtual_network_name="${14}"
     local tenant="${15}" namespace="${16}" target_id="${17}" target_uid="${18}"
     local target_name="${19}" target_namespace="${20}" target_ip="${21}" output_file="${22}"
+    local external_interface="${23}"
     python3 - "$attachment_id" "$attachment_uid" "$attachment_name" \
         "$external_ip_id" "$external_ip_uid" "$external_ip_name" "$external_address" \
         "$subnet_id" "$subnet_uid" "$subnet_name" "$subnet_cidr" \
         "$virtual_network_id" "$virtual_network_uid" "$virtual_network_name" \
         "$tenant" "$namespace" "$target_id" "$target_uid" "$target_name" \
-        "$target_namespace" "$target_ip" "$output_file" <<'PY'
+        "$target_namespace" "$target_ip" "$output_file" "$external_interface" <<'PY'
 import json
 import pathlib
 import sys
@@ -3018,7 +3022,7 @@ import sys
     subnet_id, subnet_uid, subnet_name, subnet_cidr,
     virtual_network_id, virtual_network_uid, virtual_network_name,
     tenant, namespace, target_id, target_uid, target_name,
-    target_namespace, target_ip, output_path,
+    target_namespace, target_ip, output_path, external_interface,
 ) = sys.argv[1:]
 
 attachment = {
@@ -3083,10 +3087,13 @@ context = {
     },
 }
 output = pathlib.Path(output_path)
-output.write_text(json.dumps({"osac_job_vars": {
-    "resource": attachment,
-    "external_ip_attachment_context": context,
-}}, separators=(",", ":")) + "\n")
+output.write_text(json.dumps({
+    "agentless_net_external_interface": external_interface,
+    "osac_job_vars": {
+        "resource": attachment,
+        "external_ip_attachment_context": context,
+    },
+}, separators=(",", ":")) + "\n")
 output.chmod(0o600)
 PY
 }
@@ -3152,6 +3159,7 @@ run_synthetic_external_ip_attachment_attach_job() {
         "$EXTERNAL_IP_SYNTHETIC_TARGET_ID" "$EXTERNAL_IP_SYNTHETIC_TARGET_UID" \
         "$EXTERNAL_IP_SYNTHETIC_TARGET_NAME" "$OSAC_BMAAS_NAMESPACE" \
         "$EXTERNAL_IP_SYNTHETIC_TARGET_IP" "$extra_vars" \
+        "$EXTERNAL_IP_UPLINK_INTERFACE" \
         || return 1
     run_agentless_net_aap_job attach-external-ip "$extra_vars" "$result_file" \
         || return 1
@@ -3351,9 +3359,49 @@ delete_external_ip_attachment_and_verify() {
     info "ExternalIPAttachment ${id} is detached; AAP job ${job_id}; provider route, rules, conntrack, and state are absent"
 }
 
+prepare_external_ip_test_link() {
+    local node_addresses client_addresses route
+    node_addresses="$(docker exec "$CONTAINERLAB_NET_NODE" ip -o -4 addr show \
+        dev "$EXTERNAL_IP_UPLINK_INTERFACE" | awk '{print $4}')" || return 1
+    client_addresses="$(docker exec "$CONTAINERLAB_UPSTREAM_ROUTER" ip -o -4 addr show \
+        dev "$EXTERNAL_IP_CLIENT_ROUTE_INTERFACE" | awk '{print $4}')" || return 1
+
+    if [[ -z "$node_addresses" ]]; then
+        docker exec "$CONTAINERLAB_NET_NODE" ip address add \
+            "${EXTERNAL_IP_TEST_LINK_NODE_ADDRESS}/30" dev "$EXTERNAL_IP_UPLINK_INTERFACE" \
+            || return 1
+    elif [[ "$node_addresses" != "${EXTERNAL_IP_TEST_LINK_NODE_ADDRESS}/30" ]]; then
+        printf 'Unexpected IPv4 address on %s/%s: %s\n' \
+            "$CONTAINERLAB_NET_NODE" "$EXTERNAL_IP_UPLINK_INTERFACE" "$node_addresses" >&2
+        return 1
+    fi
+
+    if [[ -z "$client_addresses" ]]; then
+        docker exec "$CONTAINERLAB_UPSTREAM_ROUTER" ip address add \
+            "${EXTERNAL_IP_TEST_LINK_CLIENT_ADDRESS}/30" dev "$EXTERNAL_IP_CLIENT_ROUTE_INTERFACE" \
+            || return 1
+    elif [[ "$client_addresses" != "${EXTERNAL_IP_TEST_LINK_CLIENT_ADDRESS}/30" ]]; then
+        printf 'Unexpected IPv4 address on %s/%s: %s\n' \
+            "$CONTAINERLAB_UPSTREAM_ROUTER" "$EXTERNAL_IP_CLIENT_ROUTE_INTERFACE" \
+            "$client_addresses" >&2
+        return 1
+    fi
+
+    route="$(docker exec "$CONTAINERLAB_UPSTREAM_ROUTER" ip route get \
+        "$EXTERNAL_IP_TEST_LINK_NODE_ADDRESS")" || return 1
+    [[ "$route" == *"dev ${EXTERNAL_IP_CLIENT_ROUTE_INTERFACE}"* \
+        && "$route" == *"src ${EXTERNAL_IP_TEST_LINK_CLIENT_ADDRESS}"* ]] || {
+        printf 'Unexpected route to the AgentlessNet test uplink: %s\n' "$route" >&2
+        return 1
+    }
+    docker exec "$CONTAINERLAB_UPSTREAM_ROUTER" ping -c 3 -W 1 \
+        "$EXTERNAL_IP_TEST_LINK_NODE_ADDRESS" >/dev/null || return 1
+    info "ExternalIP test client link is ready on ${EXTERNAL_IP_UPLINK_INTERFACE}/${EXTERNAL_IP_CLIENT_ROUTE_INTERFACE}."
+}
+
 add_external_ip_client_route() {
     local address="$1" current gateway
-    gateway="${MGMT_PREFIX}.30"
+    gateway="$EXTERNAL_IP_TEST_LINK_NODE_ADDRESS"
     current="$(docker exec "$CONTAINERLAB_UPSTREAM_ROUTER" ip route show | \
         awk -v destination="$address" '$1 == destination || $1 == destination "/32"')" \
         || return 1
@@ -3370,7 +3418,7 @@ add_external_ip_client_route() {
 }
 
 remove_external_ip_client_route() {
-    local address="$1" current gateway="${MGMT_PREFIX}.30" index
+    local address="$1" current gateway="$EXTERNAL_IP_TEST_LINK_NODE_ADDRESS" index
     current="$(docker exec "$CONTAINERLAB_UPSTREAM_ROUTER" ip route show | \
         awk -v destination="$address" '$1 == destination || $1 == destination "/32"')" \
         || return 1
@@ -6831,16 +6879,26 @@ cleanup_dhcp_clients_and_attachments() {
     done
     [[ "$failed" == false ]] || return 1
     for container in "${DHCP_CLIENT_CONTAINERS[@]}"; do
-        if pid="$(dhcp_client_pid "$container")"; then
+        if ! docker inspect "$container" >/dev/null 2>&1; then
+            docker ps >/dev/null 2>&1 || failed=true
+            continue
+        fi
+        if pid="$(dhcp_client_pid "$container" 2>/dev/null)"; then
             docker exec "$container" kill -TERM "$pid" >/dev/null 2>&1 || true
         fi
-        docker rm -f "$container" >/dev/null 2>&1 || failed=true
+        if ! docker rm -f "$container" >/dev/null 2>&1; then
+            docker inspect "$container" >/dev/null 2>&1 || docker ps >/dev/null 2>&1 || failed=true
+        fi
     done
     for link in "${DHCP_CLIENT_HOST_LINKS[@]}"; do
         if sudo ip link show dev "$link" >/dev/null 2>&1; then
             sudo ip link delete dev "$link" || failed=true
         fi
     done
+    if [[ "$failed" == false ]]; then
+        DHCP_CLIENT_CONTAINERS=()
+        DHCP_CLIENT_HOST_LINKS=()
+    fi
     [[ "$failed" == false ]]
 }
 
@@ -7730,6 +7788,8 @@ create_primary_virtual_network_for_suite() {
 
 create_external_ip_attachment_test_network_and_client() {
     local entry transit_cidr subnet_output client container response_file response attempt
+    prepare_external_ip_test_link \
+        || die "Could not prepare the direct ExternalIP client link"
     if [[ -z "${FIRST_FULFILLMENT_ID:-}" ]]; then
         create_primary_virtual_network_for_suite
     fi
