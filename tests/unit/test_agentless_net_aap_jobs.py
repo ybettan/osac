@@ -51,6 +51,84 @@ class FakeController:
         raise AssertionError(f"unexpected Controller endpoint {endpoint}")
 
 
+class FakeNATGatewayJobController:
+    def __init__(self, *, job: dict[str, Any] | None = None) -> None:
+        self.requests: list[str] = []
+        self.job = job or {
+            "status": "successful",
+            "scm_revision": REVISION,
+            "project": 23,
+            "execution_environment": 34,
+            "extra_vars": json.dumps(
+                {
+                    "osac_job_vars": {
+                        "resource": {
+                            "apiVersion": "osac.openshift.io/v1alpha1",
+                            "kind": "NATGateway",
+                            "metadata": {
+                                "name": "agentless-natgw-run-a",
+                                "namespace": "osac-e2e-ci",
+                                "uid": "10000000-0000-4000-8000-000000000011",
+                                "generation": 4,
+                                "labels": {"osac.openshift.io/natgateway-uuid": "10000000-0000-4000-8000-000000000010"},
+                                "annotations": {
+                                    "osac.openshift.io/tenant": "osac-e2e-ci",
+                                    "osac.openshift.io/implementation-strategy": "agentless_net",
+                                    "osac.openshift.io/natgateway-contract-version": "v1",
+                                },
+                            },
+                            "spec": {
+                                "virtualNetwork": "10000000-0000-4000-8000-000000000002",
+                                "externalIP": "10000000-0000-4000-8000-000000000006",
+                            },
+                        },
+                        "nat_gateway_context": {
+                            "external_ip": {
+                                "name": "agentless-eip-run-a",
+                                "namespace": "osac-e2e-ci",
+                                "fulfillment_id": "10000000-0000-4000-8000-000000000006",
+                                "kubernetes_uid": "10000000-0000-4000-8000-000000000005",
+                                "tenant_id": "osac-e2e-ci",
+                                "address": "198.51.100.21",
+                                "state": "Allocated",
+                                "phase": "Ready",
+                            },
+                            "virtual_network": {
+                                "name": "agentless-smoke-vn-run-a",
+                                "namespace": "osac-e2e-ci",
+                                "fulfillment_id": "10000000-0000-4000-8000-000000000002",
+                                "kubernetes_uid": "10000000-0000-4000-8000-000000000003",
+                                "tenant_id": "osac-e2e-ci",
+                                "ipv4_cidr": "10.250.0.0/16",
+                                "phase": "Ready",
+                            },
+                        },
+                    }
+                }
+            ),
+            "artifacts": {
+                "osac_result": {
+                    "schemaVersion": "v1",
+                    "operation": "nat_gateway.ensure",
+                    "resourceUID": "10000000-0000-4000-8000-000000000011",
+                    "observedGeneration": 4,
+                    "data": {},
+                }
+            },
+        }
+
+    def request(self, endpoint: str, *, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        del body
+        self.requests.append(endpoint)
+        if endpoint == "/jobs/55/":
+            return self.job
+        if endpoint == "/projects/23/":
+            return {"name": "osac", "scm_revision": REVISION}
+        if endpoint == "/execution_environments/34/":
+            return {"name": "osac-ee", "image": "quay.io/osac/aap:natgw"}
+        raise AssertionError(f"unexpected Controller endpoint {endpoint}")
+
+
 class FakeCredentialController:
     def __init__(self) -> None:
         self.job_templates = {"osac-move-network-attachment": 12, "osac-query-dhcp-lease": 13}
@@ -180,6 +258,94 @@ def test_launch_accepts_successful_move_job_without_artifacts(monkeypatch: pytes
 
     assert result["status"] == "successful"
     assert result["artifacts"] == {}
+
+
+def test_inspect_nat_gateway_job_returns_only_verified_input_and_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = FakeNATGatewayJobController()
+    submitted = json.loads(controller.job["extra_vars"])
+    submitted["osac_job_vars"]["nat_gateway_context"]["api_token"] = "private-context-token"
+    controller.job["extra_vars"] = json.dumps(submitted)
+    monkeypatch.setattr(aap_jobs, "Controller", lambda: controller)
+    args = argparse.Namespace(
+        job_id=55,
+        operation="nat_gateway.ensure",
+        project_name="osac",
+        project_revision=REVISION,
+        ee_name="osac-ee",
+        ee_image="quay.io/osac/aap:natgw",
+    )
+
+    result = aap_jobs.inspect_nat_gateway_job(args)
+
+    assert result["job_id"] == 55
+    assert result["project_revision"] == REVISION
+    assert result["resource"]["metadata"]["generation"] == 4
+    assert result["resource"]["spec"]["externalIP"] == "10000000-0000-4000-8000-000000000006"
+    assert result["nat_gateway_context"]["external_ip"]["address"] == "198.51.100.21"
+    assert result["artifacts"]["osac_result"]["operation"] == "nat_gateway.ensure"
+    assert "extra_vars" not in result
+    assert "api_token" not in json.dumps(result)
+    assert "private-context-token" not in json.dumps(result)
+    assert controller.requests == ["/jobs/55/", "/projects/23/", "/execution_environments/34/"]
+
+
+@pytest.mark.parametrize(
+    ("change", "operation", "message"),
+    [
+        ("revision", "nat_gateway.ensure", "expected source revision"),
+        ("context", "nat_gateway.ensure", "does not match"),
+        ("artifact", "nat_gateway.ensure", "no NATGateway result artifact"),
+        ("artifact-operation", "nat_gateway.ensure", "mismatched NATGateway result artifact"),
+        ("project", "nat_gateway.ensure", "unexpected project"),
+        ("ee", "nat_gateway.ensure", "unexpected execution environment"),
+    ],
+)
+def test_inspect_nat_gateway_job_rejects_stale_or_malformed_evidence(
+    monkeypatch: pytest.MonkeyPatch, change: str, operation: str, message: str
+) -> None:
+    controller = FakeNATGatewayJobController()
+    if change == "revision":
+        controller.job["scm_revision"] = "b" * 40
+    elif change == "context":
+        submitted = json.loads(controller.job["extra_vars"])
+        submitted["osac_job_vars"]["nat_gateway_context"]["external_ip"]["fulfillment_id"] = "wrong-id"
+        controller.job["extra_vars"] = json.dumps(submitted)
+    elif change == "artifact":
+        controller.job["artifacts"] = {}
+    elif change == "artifact-operation":
+        controller.job["artifacts"]["osac_result"]["operation"] = "nat_gateway.delete"
+    elif change == "project":
+        monkeypatch.setattr(
+            controller,
+            "request",
+            lambda endpoint, body=None: (
+                {"name": "other", "scm_revision": REVISION}
+                if endpoint == "/projects/23/"
+                else FakeNATGatewayJobController.request(controller, endpoint, body=body)
+            ),
+        )
+    elif change == "ee":
+        monkeypatch.setattr(
+            controller,
+            "request",
+            lambda endpoint, body=None: (
+                {"name": "other", "image": "quay.io/osac/aap:old"}
+                if endpoint == "/execution_environments/34/"
+                else FakeNATGatewayJobController.request(controller, endpoint, body=body)
+            ),
+        )
+    monkeypatch.setattr(aap_jobs, "Controller", lambda: controller)
+    args = argparse.Namespace(
+        job_id=55,
+        operation=operation,
+        project_name="osac",
+        project_revision=REVISION,
+        ee_name="osac-ee",
+        ee_image="quay.io/osac/aap:natgw",
+    )
+
+    with pytest.raises(aap_jobs.AAPError, match=message):
+        aap_jobs.inspect_nat_gateway_job(args)
 
 
 @pytest.mark.parametrize(
