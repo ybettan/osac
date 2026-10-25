@@ -316,6 +316,179 @@ def launch(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def inspect_nat_gateway_job(args: argparse.Namespace) -> dict[str, Any]:
+    if len(args.project_revision) != 40 or any(
+        character not in "0123456789abcdef" for character in args.project_revision
+    ):
+        raise AAPError("AAP expected project revision must be a full lowercase Git SHA")
+    controller = Controller()
+    job = controller.request(f"/jobs/{args.job_id}/")
+    if job.get("status") != "successful":
+        raise AAPError(f"AAP job {args.job_id} is not successful")
+    if job.get("scm_revision") != args.project_revision:
+        raise AAPError(f"AAP job {args.job_id} did not use the expected source revision")
+
+    project_id = job.get("project")
+    environment_id = job.get("execution_environment")
+    if not isinstance(project_id, int) or not isinstance(environment_id, int):
+        raise AAPError(f"AAP job {args.job_id} lacks its project or execution environment")
+    project = controller.request(f"/projects/{project_id}/")
+    environment = controller.request(f"/execution_environments/{environment_id}/")
+    if project.get("name") != args.project_name:
+        raise AAPError(f"AAP job {args.job_id} uses an unexpected project")
+    if environment.get("name") != args.ee_name or environment.get("image") != args.ee_image:
+        raise AAPError(f"AAP job {args.job_id} uses an unexpected execution environment")
+
+    submitted = job.get("extra_vars")
+    if isinstance(submitted, str):
+        try:
+            submitted = json.loads(submitted)
+        except json.JSONDecodeError as error:
+            raise AAPError(f"AAP job {args.job_id} has malformed submitted variables") from error
+    if not isinstance(submitted, dict):
+        raise AAPError(f"AAP job {args.job_id} has no submitted variables")
+    job_vars = submitted.get("osac_job_vars")
+    resource = job_vars.get("resource") if isinstance(job_vars, dict) else None
+    if not isinstance(resource, dict):
+        raise AAPError(f"AAP job {args.job_id} has no NATGateway resource input")
+    metadata = resource.get("metadata")
+    spec = resource.get("spec")
+    if (
+        resource.get("apiVersion") != "osac.openshift.io/v1alpha1"
+        or resource.get("kind") != "NATGateway"
+        or not isinstance(metadata, dict)
+        or not isinstance(spec, dict)
+    ):
+        raise AAPError(f"AAP job {args.job_id} has malformed NATGateway identity")
+    labels = metadata.get("labels")
+    annotations = metadata.get("annotations")
+    if not isinstance(labels, dict) or not isinstance(annotations, dict):
+        raise AAPError(f"AAP job {args.job_id} has malformed NATGateway metadata")
+    uid = metadata.get("uid")
+    generation = metadata.get("generation")
+    gateway_id = labels.get("osac.openshift.io/natgateway-uuid")
+    tenant_id = annotations.get("osac.openshift.io/tenant")
+    contract_version = annotations.get("osac.openshift.io/natgateway-contract-version")
+    implementation_strategy = annotations.get("osac.openshift.io/implementation-strategy")
+    virtual_network_id = spec.get("virtualNetwork")
+    external_ip_id = spec.get("externalIP")
+    if (
+        not isinstance(uid, str)
+        or not uid
+        or not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or not isinstance(gateway_id, str)
+        or not gateway_id
+        or not isinstance(tenant_id, str)
+        or not tenant_id
+        or contract_version != "v1"
+        or implementation_strategy != "agentless_net"
+        or not isinstance(virtual_network_id, str)
+        or not virtual_network_id
+        or not isinstance(external_ip_id, str)
+        or not external_ip_id
+        or not isinstance(metadata.get("name"), str)
+        or not metadata["name"].startswith("agentless-natgw-")
+        or not isinstance(metadata.get("namespace"), str)
+        or not metadata["namespace"]
+    ):
+        raise AAPError(f"AAP job {args.job_id} has invalid NATGateway identity fields")
+
+    context = job_vars.get("nat_gateway_context")
+    safe_context = None
+    if args.operation == "nat_gateway.ensure":
+        if not isinstance(context, dict):
+            raise AAPError(f"AAP job {args.job_id} has no NATGateway ensure context")
+        external_ip = context.get("external_ip")
+        virtual_network = context.get("virtual_network")
+        if not isinstance(external_ip, dict) or not isinstance(virtual_network, dict):
+            raise AAPError(f"AAP job {args.job_id} has malformed NATGateway ensure context")
+        if (
+            external_ip.get("fulfillment_id") != external_ip_id
+            or external_ip.get("tenant_id") != tenant_id
+            or external_ip.get("state") != "Allocated"
+            or external_ip.get("phase") != "Ready"
+            or virtual_network.get("fulfillment_id") != virtual_network_id
+            or virtual_network.get("tenant_id") != tenant_id
+            or virtual_network.get("phase") != "Ready"
+            or not all(
+                isinstance(value, str) and value
+                for value in (
+                    external_ip.get("name"),
+                    external_ip.get("namespace"),
+                    external_ip.get("kubernetes_uid"),
+                    external_ip.get("address"),
+                    virtual_network.get("name"),
+                    virtual_network.get("namespace"),
+                    virtual_network.get("kubernetes_uid"),
+                    virtual_network.get("ipv4_cidr"),
+                )
+            )
+        ):
+            raise AAPError(f"AAP job {args.job_id} context does not match its NATGateway resource")
+        safe_context = {
+            "external_ip": {
+                key: external_ip[key]
+                for key in (
+                    "name",
+                    "namespace",
+                    "fulfillment_id",
+                    "kubernetes_uid",
+                    "tenant_id",
+                    "address",
+                    "state",
+                    "phase",
+                )
+            },
+            "virtual_network": {
+                key: virtual_network[key]
+                for key in ("name", "namespace", "fulfillment_id", "kubernetes_uid", "tenant_id", "ipv4_cidr", "phase")
+            },
+        }
+    elif context is not None and not isinstance(context, dict):
+        raise AAPError(f"AAP job {args.job_id} has malformed NATGateway delete context")
+
+    artifacts = job.get("artifacts")
+    result = artifacts.get("osac_result") if isinstance(artifacts, dict) else None
+    if not isinstance(result, dict):
+        raise AAPError(f"AAP job {args.job_id} has no NATGateway result artifact")
+    if (
+        result.get("schemaVersion") != "v1"
+        or result.get("operation") != args.operation
+        or result.get("resourceUID") != uid
+        or result.get("observedGeneration") != generation
+        or result.get("data") != {}
+    ):
+        raise AAPError(f"AAP job {args.job_id} has a mismatched NATGateway result artifact")
+    safe_result = {key: result[key] for key in ("schemaVersion", "operation", "resourceUID", "observedGeneration")}
+    safe_result["data"] = {}
+    return {
+        "job_id": args.job_id,
+        "status": job["status"],
+        "project_revision": job["scm_revision"],
+        "project_name": project["name"],
+        "execution_environment": environment["name"],
+        "execution_environment_image": environment["image"],
+        "resource": {
+            "metadata": {
+                "name": metadata.get("name"),
+                "namespace": metadata.get("namespace"),
+                "uid": uid,
+                "generation": generation,
+                "labels": {"osac.openshift.io/natgateway-uuid": gateway_id},
+                "annotations": {
+                    "osac.openshift.io/tenant": tenant_id,
+                    "osac.openshift.io/implementation-strategy": implementation_strategy,
+                    "osac.openshift.io/natgateway-contract-version": contract_version,
+                },
+            },
+            "spec": {"virtualNetwork": virtual_network_id, "externalIP": external_ip_id},
+        },
+        "nat_gateway_context": safe_context,
+        "artifacts": {"osac_result": safe_result},
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -328,6 +501,13 @@ def main() -> int:
     launch_parser.add_argument("--ee-name", required=True)
     launch_parser.add_argument("--ee-image", required=True)
     launch_parser.add_argument("--timeout", type=int, default=1200)
+    inspect_parser = subparsers.add_parser("inspect-nat-gateway-job")
+    inspect_parser.add_argument("--job-id", type=int, required=True)
+    inspect_parser.add_argument("--operation", choices=("nat_gateway.ensure", "nat_gateway.delete"), required=True)
+    inspect_parser.add_argument("--project-name", required=True)
+    inspect_parser.add_argument("--project-revision", required=True)
+    inspect_parser.add_argument("--ee-name", required=True)
+    inspect_parser.add_argument("--ee-image", required=True)
     configure_parser = subparsers.add_parser("configure-k8s-credential")
     configure_parser.add_argument("--job-template", action="append", required=True)
     configure_parser.add_argument("--credential-name", required=True)
@@ -353,6 +533,8 @@ def main() -> int:
             with os.fdopen(output_fd, "w", encoding="utf-8") as stream:
                 stream.write(json.dumps(result, indent=2) + "\n")
             print(json.dumps({key: value for key, value in result.items() if key != "artifacts"}))
+        elif args.command == "inspect-nat-gateway-job":
+            print(json.dumps(inspect_nat_gateway_job(args), sort_keys=True))
         elif args.command == "configure-k8s-credential":
             print(json.dumps(configure_k8s_credential(args)))
         else:

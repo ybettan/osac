@@ -7,6 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -15,7 +16,7 @@ SOURCE = RUNNER.read_text()
 
 
 def function_block(start: str, end: str) -> str:
-    start_index = SOURCE.index(f"{start}() {{")
+    start_index = SOURCE.index(f"\n{start}() {{") + 1
     end_index = SOURCE.index(f"\n{end}() {{", start_index)
     return SOURCE[start_index:end_index]
 
@@ -1158,7 +1159,11 @@ def test_aap_subnet_credential_is_retained_until_provider_cleanup_succeeds(tmp_p
         script = f"""
 set -uo pipefail
 CURRENT_STAGE=test
+CLEANUP_MODE=false
 SUITE_USES_SUBNET_DHCP=false
+SUITE_USES_NAT_GATEWAY=false
+SUITE_USES_EXTERNAL_IP_ATTACHMENT=false
+CREATED_NAT_GATEWAY_IDS=()
 VLAN_E2E_DEBUG=false
 PREEXISTING_PROVIDER_CLEANUP_PENDING=false
 PRESERVE_E2E_RECOVERY_ARTIFACTS=false
@@ -1206,6 +1211,7 @@ def test_provider_cleanup_keeps_aap_ca_until_subnet_credential_cleanup(tmp_path:
     script = f"""
 set -euo pipefail
 AAP_SUBNET_READER_SETUP_ATTEMPTED=true
+SUITE_USES_NAT_GATEWAY=false
 CLI_CA_FILE={shlex.quote(str(ca_file))}
 AAP_API_CA_FILE={shlex.quote(str(ca_file))}
 TEMP_DIR={shlex.quote(str(temp_dir))}
@@ -1478,7 +1484,7 @@ def test_runtime_source_pins_the_implementation_commit_and_requires_it_as_ancest
     production_file.write_text("fix source\n")
     git("add", "osac-aap/source.py")
     git("commit", "-m", "base")
-    git("checkout", "-b", "osac-6308-external-ip-attachment")
+    git("checkout", "-b", "osac-6202-natgateway-snat")
     production_file.write_text("implementation source\n")
     git("commit", "-am", "implementation")
     implementation_commit = git("rev-parse", "HEAD")
@@ -1493,23 +1499,23 @@ def test_runtime_source_pins_the_implementation_commit_and_requires_it_as_ancest
     script = f"""
 set -euo pipefail
 {helper}
-resolve_runtime_source {shlex.quote(str(repository))} osac-6308-external-ip-attachment
+resolve_runtime_source {shlex.quote(str(repository))} osac-6202-natgateway-snat
 """
     result = run_bash(tmp_path, script)
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["osac-6308-external-ip-attachment", implementation_commit]
-    assert git("merge-base", "osac-6308-external-ip-attachment", "HEAD") == implementation_commit
+    assert result.stdout.splitlines() == ["osac-6202-natgateway-snat", implementation_commit]
+    assert git("merge-base", "osac-6202-natgateway-snat", "HEAD") == implementation_commit
     assert subprocess.run(
-        ["git", "-C", str(repository), "diff", "--quiet", "osac-6308-external-ip-attachment", "HEAD", "--", "osac-aap"]
+        ["git", "-C", str(repository), "diff", "--quiet", "osac-6202-natgateway-snat", "HEAD", "--", "osac-aap"]
     ).returncode == 0
 
-    git("checkout", "osac-6308-external-ip-attachment")
+    git("checkout", "osac-6202-natgateway-snat")
     production_file.write_text("implementation advanced\n")
     git("commit", "-am", "advance implementation")
     git("checkout", "e2e")
     assert subprocess.run(
-        ["git", "-C", str(repository), "diff", "--quiet", "osac-6308-external-ip-attachment", "HEAD", "--", "osac-aap"]
+        ["git", "-C", str(repository), "diff", "--quiet", "osac-6202-natgateway-snat", "HEAD", "--", "osac-aap"]
     ).returncode == 1
     advanced = run_bash(tmp_path, script)
     assert advanced.returncode != 0
@@ -1534,7 +1540,7 @@ def test_runtime_source_rejects_a_missing_implementation_branch(tmp_path: Path) 
         tmp_path,
         f"set -euo pipefail\n{helper}\n"
         f"resolve_runtime_source {shlex.quote(str(repository))} "
-        "osac-6308-external-ip-attachment\n",
+        "osac-6202-natgateway-snat\n",
     )
     assert result.returncode != 0
 
@@ -1555,14 +1561,17 @@ def test_runner_stages_are_ordered_and_source_revision_is_pinned():
     assert 'IMAGE_SOURCE_COMMIT="$RUNTIME_SOURCE_COMMIT"' in SOURCE
 
 
-def test_full_suite_runs_attachment_lifecycle_after_creating_its_network_and_bmi():
+def test_full_suite_runs_attachment_lifecycle_after_creating_its_network_and_client():
     suite = function_block("run_full_suite", "run_virtual_network_suite")
 
     assert suite.index("create_external_ip_pool") < suite.index("run_external_ip_lifecycle")
-    assert suite.index("run_subnet_dhcp_checks") < suite.index("create_external_ip_attachment_test_network_and_bmi")
-    assert suite.index("create_external_ip_attachment_test_network_and_bmi") < suite.index("run_external_ip_lifecycle")
-    assert suite.index("run_external_ip_lifecycle") < suite.index("cleanup_created_bare_metal_instances")
-    assert suite.index("cleanup_created_bare_metal_instances") < suite.index("delete_subnet_by_id")
+    assert suite.index("run_subnet_dhcp_checks") < suite.index(
+        "create_external_ip_attachment_test_network_and_client"
+    )
+    assert suite.index("create_external_ip_attachment_test_network_and_client") < suite.index(
+        "run_external_ip_lifecycle"
+    )
+    assert suite.index("run_external_ip_lifecycle") < suite.index("run_nat_gateway_lifecycle")
 
 
 def test_external_ip_suite_selects_attachment_dependencies_but_pool_suite_stays_scoped(tmp_path: Path) -> None:
@@ -1578,16 +1587,16 @@ def test_external_ip_suite_selects_attachment_dependencies_but_pool_suite_stays_
             f"{suite_flags}\n"
             "printf '%s\\n' \"$SUITE_USES_VN $SUITE_USES_SUBNET $SUITE_USES_SUBNET_DHCP "
             "$SUITE_USES_POOL $SUITE_USES_CLI $SUITE_USES_EXTERNAL_IP "
-            '$SUITE_USES_EXTERNAL_IP_ATTACHMENT"\n',
+            '$SUITE_USES_EXTERNAL_IP_ATTACHMENT $SUITE_USES_NAT_GATEWAY"\n',
         )
 
     result = resolve("external-ip")
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "true true false true true true true"
+    assert result.stdout.strip() == "true true true true true true true false"
 
     result = resolve("external-ip-pool")
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "false false false true false false false"
+    assert result.stdout.strip() == "false false false true false false false false"
 
 
 def test_external_ip_probe_uses_upstream_route_and_allocated_external_ip(tmp_path: Path) -> None:
@@ -1599,6 +1608,7 @@ set -euo pipefail
 CONTAINERLAB_UPSTREAM_ROUTER=upstream-router
 MGMT_PREFIX=192.0.2
 EXTERNAL_IP_CLIENT_ROUTE_INTERFACE=eth0
+EXTERNAL_IP_TEST_LINK_NODE_ADDRESS=192.0.2.1
 EXTERNAL_IP_CLIENT_ROUTE_GATEWAY=
 EXTERNAL_IP_CLIENT_ROUTE_ADDRESSES=()
 EXTERNAL_IP_RESPONSE_PORT=18080
@@ -1616,7 +1626,7 @@ add_external_ip_client_route 198.51.100.21
 
     assert result.returncode == 0, result.stderr
     operations = events.read_text().splitlines()
-    assert any("ip route add 198.51.100.21/32 via 192.0.2.30 dev eth0" in line for line in operations)
+    assert any("ip route add 198.51.100.21/32 via 192.0.2.1 dev eth0" in line for line in operations)
     assert any("http://198.51.100.21:18080/osac-eia-response" in line for line in operations)
     assert all("10.250." not in line for line in operations)
 
@@ -1636,6 +1646,199 @@ def test_external_ip_cleanup_orders_detach_before_dependent_resources() -> None:
     assert positions == sorted(positions)
 
 
+def test_nat_gateway_cleanup_precedes_clients_and_all_network_dependencies() -> None:
+    cleanup = function_block("cleanup_created_virtual_networks", "export_dhcp_debug_artifacts")
+    positions = [
+        cleanup.index("cleanup_created_nat_gateways"),
+        cleanup.index("cleanup_nat_gateway_endpoint"),
+        cleanup.index("cleanup_created_external_ip_attachments"),
+        cleanup.index("remove_external_ip_client_routes"),
+        cleanup.index("cleanup_created_external_ips"),
+        cleanup.index("cleanup_created_external_ip_pool"),
+        cleanup.index("cleanup_created_subnets"),
+        cleanup.index('delete virtualnetwork "$id"'),
+        cleanup.index("restore_nat_gateway_uplink"),
+        cleanup.index("restore_provider_inventory_config"),
+    ]
+    assert positions == sorted(positions)
+
+    start = SOURCE.index("on_exit() {")
+    end = SOURCE.index("\ntrap on_exit EXIT", start)
+    on_exit = SOURCE[start:end]
+    assert on_exit.index("cleanup_created_nat_gateways") < on_exit.index(
+        "cleanup_dhcp_clients_and_attachments"
+    )
+
+
+def test_nat_gateway_cleanup_discovery_scopes_crs_and_provider_identity() -> None:
+    cleanup = function_block("prepare_suite_cleanup", "supervisor_service_status_is_absent")
+
+    assert "nat_gateway_filter='this.metadata.name.startsWith(\"agentless-natgw-\")'" in cleanup
+    assert 'nat_gateway_cr_json "$nat_gateway_id"' in cleanup
+    assert '"osac.openshift.io/natgateway-contract-version"] == "v1"' in SOURCE
+    assert ".[0].virtual_network_uid == $vn_uid" in cleanup
+    assert ".[0].external_ip_uid == $eip_uid" in cleanup
+    assert "test NATGateway provider row without a matching test CR" in cleanup
+
+
+def test_nat_gateway_uplink_override_and_restore_are_guarded() -> None:
+    configure = function_block("configure_nat_gateway_uplink", "restore_nat_gateway_uplink")
+    restore = function_block("restore_nat_gateway_uplink", "remove_netnode_public_key")
+
+    assert '"/metadata/resourceVersion",value:$rv' in configure
+    assert '"/data/AGENTLESS_NET_EXTERNAL_INTERFACE",value:"eth2"' in configure
+    assert "original_annotations_present" in configure
+    assert '"/metadata/resourceVersion",value:$rv' in restore
+    assert '"/data/AGENTLESS_NET_EXTERNAL_INTERFACE",value:"eth2"' in restore
+    assert "$backup[0].original_present" in restore
+    assert "annotations_empty_after_restore" in restore
+    assert "NATGateway uplink override changed; preserving its current ConfigMap value" in restore
+
+
+@pytest.mark.parametrize("original_value", [None, "eth1"])
+def test_nat_gateway_uplink_override_restores_the_original_configmap(
+    tmp_path: Path, original_value: str | None
+) -> None:
+    configure = function_block("configure_nat_gateway_uplink", "restore_nat_gateway_uplink")
+    restore = function_block("restore_nat_gateway_uplink", "remove_netnode_public_key")
+    temp_dir = tmp_path / "uplink-override"
+    temp_dir.mkdir()
+    data = {"OTHER_SETTING": "preserve"}
+    if original_value is not None:
+        data["AGENTLESS_NET_EXTERNAL_INTERFACE"] = original_value
+    initial = json.dumps({"metadata": {"resourceVersion": "10"}, "data": data})
+    script = f"""
+set -euo pipefail
+SUITE_USES_NAT_GATEWAY=true
+CLEANUP_MODE=false
+DHCP_CLIENT_PREFIX=test-run
+NAT_GATEWAY_UPLINK_OWNER_ANNOTATION=osac.openshift.io/vlan-e2e-natgw-uplink-owner
+NAT_GATEWAY_UPLINK_BACKUP_ANNOTATION=osac.openshift.io/vlan-e2e-natgw-uplink-original
+NAT_GATEWAY_UPLINK_CHANGED_BY_RUN=false
+NAT_GATEWAY_UPLINK_BACKUP=
+NAT_GATEWAY_UPLINK_OWNER=
+NAT_GATEWAY_UPLINK_EXPECTED=
+AAP_NETWORKING_SECRET=network-fulfillment-ig
+OSAC_NAMESPACE=osac-e2e-ci
+TEMP_DIR={shlex.quote(str(temp_dir))}
+PATCH_COUNT=0
+CONFIG_PATCH_FILE=
+RESTORE_PATCH_FILE=
+OWNER_PATCH_PATH=/metadata/annotations/osac.openshift.io~1vlan-e2e-natgw-uplink-owner
+BACKUP_PATCH_PATH=/metadata/annotations/osac.openshift.io~1vlan-e2e-natgw-uplink-original
+die() {{ printf '%s\\n' "$*" >&2; exit 1; }}
+info() {{ :; }}
+oc() {{
+    if [[ "$1" == get ]]; then
+        case "$PATCH_COUNT" in
+            0|2) jq -c . <<<"$INITIAL_CONFIG_MAP" ;;
+            1)
+                owner="$(jq -r --arg path "$OWNER_PATCH_PATH" \
+                    '[.[] | select(.path == $path)][0].value' "$CONFIG_PATCH_FILE")"
+                backup="$(jq -r --arg path "$BACKUP_PATCH_PATH" \
+                    '[.[] | select(.path == $path)][0].value' "$CONFIG_PATCH_FILE")"
+                jq -cn --argjson initial "$INITIAL_CONFIG_MAP" --arg owner "$owner" --arg backup "$backup" '
+                  $initial
+                  | .metadata.resourceVersion = "12"
+                  | .metadata.annotations = ((.metadata.annotations // {{}}) + {{
+                      "osac.openshift.io/vlan-e2e-natgw-uplink-owner": $owner,
+                      "osac.openshift.io/vlan-e2e-natgw-uplink-original": $backup
+                    }})
+                  | .data.AGENTLESS_NET_EXTERNAL_INTERFACE = "eth2"'
+                ;;
+        esac
+    elif [[ "$1" == patch ]]; then
+        PATCH_COUNT=$((PATCH_COUNT + 1))
+        for argument in "$@"; do
+            case "$argument" in
+                --patch-file=*)
+                    if [[ "$PATCH_COUNT" == 1 ]]; then
+                        CONFIG_PATCH_FILE="${{argument#*=}}"
+                    else
+                        RESTORE_PATCH_FILE="${{argument#*=}}"
+                    fi
+                    ;;
+            esac
+        done
+    else
+        return 1
+    fi
+}}
+{configure}
+{restore}
+configure_nat_gateway_uplink
+restore_nat_gateway_uplink
+[[ "$NAT_GATEWAY_UPLINK_CHANGED_BY_RUN" == false ]]
+[[ "$PATCH_COUNT" == 2 ]]
+jq -e --arg rv 10 'any(.[]; .op == "test" and .path == "/metadata/resourceVersion" and .value == $rv)' \
+    "$CONFIG_PATCH_FILE" >/dev/null
+jq -e --arg rv 12 'any(.[]; .op == "test" and .path == "/metadata/resourceVersion" and .value == $rv)' \
+    "$RESTORE_PATCH_FILE" >/dev/null
+"""
+    result = run_bash(tmp_path, script, {"INITIAL_CONFIG_MAP": initial})
+
+    assert result.returncode == 0, result.stderr
+    restore_patch = json.loads((temp_dir / "nat-gateway-uplink-restore.json").read_text())
+    data_path = "/data/AGENTLESS_NET_EXTERNAL_INTERFACE"
+    if original_value is None:
+        assert any(
+            operation.get("op") == "remove" and operation.get("path") == data_path
+            for operation in restore_patch
+        )
+        assert any(
+            operation.get("op") == "remove" and operation.get("path") == "/metadata/annotations"
+            for operation in restore_patch
+        )
+    else:
+        assert any(
+            operation.get("op") == "replace"
+            and operation.get("path") == data_path
+            and operation.get("value") == original_value
+            for operation in restore_patch
+        )
+
+
+def test_failed_nat_gateway_cleanup_preserves_all_dependencies(tmp_path: Path) -> None:
+    cleanup = function_block("cleanup_created_virtual_networks", "export_dhcp_debug_artifacts")
+    events = tmp_path / "failed-nat-gateway-cleanup.log"
+    script = f"""
+set -euo pipefail
+CLEANUP_MODE=false
+CLEANUP_DISCOVERY_COMPLETE=false
+CLEANUP_PENDING_POOL_IDS=()
+SUITE_USES_NAT_GATEWAY=true
+CREATED_NAT_GATEWAY_IDS=(natgateway-id)
+CREATED_EXTERNAL_IP_ATTACHMENT_IDS=()
+CREATED_EXTERNAL_IP_IDS=(external-ip-id)
+CREATED_BARE_METAL_INSTANCE_IDS=(bmi-id)
+CREATED_SUBNET_IDS=(subnet-id)
+CREATED_IDS=()
+TEMP_DIR=/tmp
+CLI_BIN=/bin/true
+CLI_CONFIG_DIR=/tmp
+EXTERNAL_IP_POOL_PENDING_CLEANUP=true
+PRESERVE_E2E_RECOVERY_ARTIFACTS=false
+EVENTS={shlex.quote(str(events))}
+cleanup_created_nat_gateways() {{ printf 'nat-gateway\\n' >>"$EVENTS"; return 1; }}
+cleanup_nat_gateway_endpoint() {{ printf 'endpoint\\n' >>"$EVENTS"; return 0; }}
+cleanup_created_external_ip_attachments() {{ printf 'attachment\\n' >>"$EVENTS"; return 0; }}
+remove_external_ip_client_routes() {{ printf 'route\\n' >>"$EVENTS"; return 0; }}
+cleanup_created_external_ips() {{ printf 'external-ip\\n' >>"$EVENTS"; return 0; }}
+cleanup_created_external_ip_pool() {{ printf 'pool\\n' >>"$EVENTS"; return 0; }}
+cleanup_created_bare_metal_instances() {{ printf 'bmi\\n' >>"$EVENTS"; return 0; }}
+cleanup_created_subnets() {{ printf 'subnet\\n' >>"$EVENTS"; return 0; }}
+restore_nat_gateway_uplink() {{ printf 'uplink\\n' >>"$EVENTS"; return 0; }}
+restore_provider_inventory_config() {{ printf 'inventory\\n' >>"$EVENTS"; return 0; }}
+info() {{ :; }}
+{cleanup}
+if cleanup_created_virtual_networks 0; then exit 1; fi
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert events.read_text().splitlines() == ["nat-gateway"]
+
+
 def test_failed_attachment_detach_preserves_all_dependent_resources(tmp_path: Path) -> None:
     cleanup = function_block("cleanup_created_virtual_networks", "on_exit")
     events = tmp_path / "failed-attachment-cleanup.log"
@@ -1644,7 +1847,9 @@ set -euo pipefail
 CLEANUP_MODE=false
 CLEANUP_DISCOVERY_COMPLETE=false
 CLEANUP_PENDING_POOL_IDS=()
+SUITE_USES_NAT_GATEWAY=false
 CREATED_EXTERNAL_IP_ATTACHMENT_IDS=(attachment-id)
+CREATED_NAT_GATEWAY_IDS=()
 CREATED_EXTERNAL_IP_IDS=(external-ip-id)
 CREATED_BARE_METAL_INSTANCE_IDS=(bmi-id)
 CREATED_SUBNET_IDS=(subnet-id)
@@ -1672,13 +1877,17 @@ if cleanup_created_virtual_networks 0; then exit 1; fi
 
 
 def test_standalone_external_ip_cleanup_is_idempotent_for_absent_attachment(tmp_path: Path) -> None:
-    remove_id = function_block("external_ip_attachment_remove_created_id", "create_external_ip_attachment")
+    remove_id = function_block("external_ip_attachment_remove_created_id", "delete_external_ip_attachment_and_verify")
     cleanup = function_block("cleanup_created_external_ip_attachments", "remove_external_ip_client_routes")
     script = f"""
 set -euo pipefail
 CLI_BIN=/bin/true
 CLI_CONFIG_DIR=/tmp
 CREATED_EXTERNAL_IP_ATTACHMENT_IDS=(already-removed)
+CREATED_SYNTHETIC_EXTERNAL_IP_ATTACHMENT_IDS=()
+CREATED_SYNTHETIC_EXTERNAL_IP_ATTACHMENT_UIDS=()
+CREATED_EXTERNAL_IP_IDS=()
+CREATED_BARE_METAL_INSTANCE_IDS=()
 state_snapshot() {{ printf '{{"external_ip_attachments":[]}}\\n'; }}
 external_ip_attachment_crs_json() {{ printf '{{"items":[]}}\\n'; }}
 {remove_id}
@@ -1699,47 +1908,30 @@ def test_external_ip_state_snapshot_and_peer_checks_include_attachments() -> Non
     assert "changed its peer attachment state" in SOURCE
 
 
-def test_external_ip_attachment_target_is_created_through_fulfillment() -> None:
+def test_external_ip_attachment_uses_a_synthetic_dhcp_client_target() -> None:
     setup = function_block(
-        "create_external_ip_attachment_test_network_and_bmi", "delete_primary_virtual_network_for_suite"
+        "create_external_ip_attachment_test_network_and_client", "cleanup_created_bare_metal_instances"
     )
-    wait = function_block("wait_for_external_ip_bmi_ready", "external_ip_attachment_assert_result")
 
-    assert 'create baremetalinstance --name "$EXTERNAL_IP_BMI_NAME"' in setup
-    assert '--catalog-item "$OSAC_BMI_CATALOG_ITEM"' in setup
-    assert 'wait_for_external_ip_bmi_ready "$EXTERNAL_IP_BMI_ID"' in setup
-    assert "select(.primary == true)" in wait
-    assert '"$subnet_ref" == "$EXTERNAL_IP_ATTACHMENT_SUBNET_ID"' in wait
-    assert ".status.phase" in wait and "== Ready" in wait
+    assert 'client="$EXTERNAL_IP_SYNTHETIC_CLIENT"' in setup
+    assert 'attach_client_to_subnet "$client" "$EXTERNAL_IP_ATTACHMENT_SUBNET_ID"' in setup
+    assert 'discover_client_dhcp_lease "$client"' in setup
+    assert 'EXTERNAL_IP_SYNTHETIC_TARGET_UID="${CLIENT_BMI_UID[$client]:-}"' in setup
+    assert 'EXTERNAL_IP_SYNTHETIC_TARGET_IP=' in setup
+    assert 'create baremetalinstance' not in setup
+    assert 'catalog-item' not in setup
     assert '"kind": "BareMetalInstance"' not in setup
-    assert "ip -4 -o addr show dev {interface}" in setup
-    assert '--bind "$address"' in setup
 
 
-def test_external_ip_bmi_user_data_binds_response_service_to_primary_interface(tmp_path: Path) -> None:
-    setup = function_block("create_external_ip_attachment_test_network_and_bmi", "cleanup_created_bare_metal_instances")
-    body_start = setup.index("<<'PY'\n") + len("<<'PY'\n")
-    body_end = setup.index("\nPY\n", body_start)
-    generator = setup[body_start:body_end]
-    output = tmp_path / "bmi-user-data.yaml"
-    result = subprocess.run(
-        [sys.executable, "-", "osac-eia-test-token", "18080", "eth9", str(output)],
-        input=generator,
-        capture_output=True,
-        text=True,
-        check=False,
+def test_external_ip_synthetic_target_serves_the_expected_response() -> None:
+    setup = function_block(
+        "create_external_ip_attachment_test_network_and_client", "cleanup_created_bare_metal_instances"
     )
 
-    assert result.returncode == 0, result.stderr
-    user_data = yaml.safe_load(output.read_text())
-    files = {entry["path"]: entry for entry in user_data["write_files"]}
-    response_service = files["/usr/local/sbin/osac-eia-response.sh"]["content"]
-    assert "ip -4 -o addr show dev eth9" in response_service
-    assert '--bind "$address"' in response_service
-    service_unit = files["/etc/systemd/system/osac-eia-response.service"]["content"]
-    assert "ExecStart=/usr/local/sbin/osac-eia-response.sh" in service_unit
-    assert "/osac-eia-response" not in response_service
-    assert files["/var/tmp/osac-eia-response"]["content"] == "osac-eia-test-token"
+    assert 'docker cp "$response_file" "$container:/tmp/osac-eia-response"' in setup
+    assert 'docker exec -d "$container" busybox httpd' in setup
+    assert '"http://127.0.0.1:${EXTERNAL_IP_RESPONSE_PORT}/osac-eia-response"' in setup
+    assert '[[ "$response" == "$EXTERNAL_IP_RESPONSE_TOKEN" ]]' in setup
 
 
 def test_attachment_cleanup_discovery_checks_prefix_tenant_and_parent_scope() -> None:
@@ -1758,7 +1950,9 @@ def test_state_snapshot_includes_attachment_rows_and_accepts_existing_schema_v1(
     body_end = helper.index("\nPY\n", body_start)
     snapshot_code = helper[body_start:body_end]
 
-    def create_state(path: Path, *, attachments: bool) -> None:
+    def create_state(
+        path: Path, *, attachments: bool, nat_gateways: bool = False, unknown_table: bool = False
+    ) -> None:
         connection = sqlite3.connect(path)
         connection.executescript(
             """
@@ -1795,6 +1989,29 @@ def test_state_snapshot_includes_attachment_rows_and_accepts_existing_schema_v1(
                     json.dumps({"context": {"target": {"ip_address": "10.250.1.5"}}}),
                 ),
             )
+        if nat_gateways:
+            connection.executescript(
+                """
+                CREATE TABLE nat_gateways (uid TEXT, fulfillment_id TEXT, tenant_id TEXT,
+                  external_ip_uid TEXT, virtual_network_uid TEXT, external_address TEXT,
+                  phase TEXT, payload TEXT);
+                """
+            )
+            connection.execute(
+                "INSERT INTO nat_gateways VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "nat-gateway-uid",
+                    "nat-gateway-id",
+                    "test-tenant",
+                    "eip-uid",
+                    "vn-uid",
+                    "198.51.100.22",
+                    "ready",
+                    json.dumps({"source_cidrs": [{"subnet_uid": "subnet-uid", "cidr": "10.250.1.0/24"}]}),
+                ),
+            )
+        if unknown_table:
+            connection.execute("CREATE TABLE unexpected (value TEXT)")
         connection.execute("PRAGMA user_version=1")
         connection.commit()
         connection.close()
@@ -1806,7 +2023,7 @@ def test_state_snapshot_includes_attachment_rows_and_accepts_existing_schema_v1(
         return json.loads(result.stdout)
 
     current_schema = tmp_path / "current.sqlite3"
-    create_state(current_schema, attachments=True)
+    create_state(current_schema, attachments=True, nat_gateways=True)
     snapshot = read_state(current_schema)
     assert snapshot["external_ip_attachments"] == [
         {
@@ -1821,10 +2038,38 @@ def test_state_snapshot_includes_attachment_rows_and_accepts_existing_schema_v1(
             "payload": {"context": {"target": {"ip_address": "10.250.1.5"}}},
         }
     ]
+    assert snapshot["nat_gateways"] == [
+        {
+            "uid": "nat-gateway-uid",
+            "fulfillment_id": "nat-gateway-id",
+            "tenant_id": "test-tenant",
+            "external_ip_uid": "eip-uid",
+            "virtual_network_uid": "vn-uid",
+            "external_address": "198.51.100.22",
+            "phase": "ready",
+            "payload": {"source_cidrs": [{"subnet_uid": "subnet-uid", "cidr": "10.250.1.0/24"}]},
+        }
+    ]
+
+    attachment_schema = tmp_path / "attachment-schema.sqlite3"
+    create_state(attachment_schema, attachments=True)
+    assert read_state(attachment_schema)["nat_gateways"] == []
 
     previous_schema = tmp_path / "previous.sqlite3"
     create_state(previous_schema, attachments=False)
     assert read_state(previous_schema)["external_ip_attachments"] == []
+    assert read_state(previous_schema)["nat_gateways"] == []
+
+    unknown_schema = tmp_path / "unknown-schema.sqlite3"
+    create_state(unknown_schema, attachments=False, unknown_table=True)
+    result = subprocess.run(
+        [sys.executable, "-", str(unknown_schema)],
+        input=snapshot_code,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
 
 
 def test_suite_flags_select_the_same_scope_for_run_and_cleanup(tmp_path):
@@ -1869,6 +2114,14 @@ def test_suite_flags_select_the_same_scope_for_run_and_cleanup(tmp_path):
     result = parse(["--cleanup", "--external-ip"])
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "cleanup=true suite=external-ip"
+
+    result = parse(["--nat-gateway"])
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "cleanup=false suite=nat-gateway"
+
+    result = parse(["--cleanup", "--nat-gateway"])
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "cleanup=true suite=nat-gateway"
 
     result = parse(["--cleanup", "--suite", "external-ip-pool"])
     assert result.returncode == 0, result.stderr
