@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# OSAC-5528/OSAC-5530/OSAC-6306/OSAC-6307 AgentlessNet development lab:
+# OSAC-5528/OSAC-5530/OSAC-6202/OSAC-6306/OSAC-6307 AgentlessNet development lab:
 #   1. Boot or reuse the SNO with cluster-tool.
 #   2. Build and push runtime images when source inputs changed, or reuse their tags.
 #   3. Install or upgrade OSAC with those custom images.
@@ -23,6 +23,7 @@ Suites:
   subnet-dhcp       Create a parent VirtualNetwork and run the Subnet/DHCP E2E.
   external-ip-pool  Create, verify, and delete one ExternalIPPool.
   external-ip       Verify ExternalIP allocation and ExternalIPAttachment ingress.
+  nat-gateway       Verify NATGateway v1 SNAT, Subnet sources, retry, and cleanup.
 
 All suites boot or reuse the SNO, deploy or reuse OSAC and the Containerlab
 fabric, initialize the declared trunks, and run the selected checks. Set
@@ -40,6 +41,10 @@ BareMetalInstance target for the AgentlessNet ExternalIPAttachment AAP jobs.
 This validates the provider datapath and does not exercise Fulfillment-to-BMaaS
 readiness. The ingress probe uses a test-only static route over the direct
 Containerlab peer link; it does not test BGP advertisement.
+The --nat-gateway suite and --full suite use a test-owned HTTP endpoint on the
+upstream-router and a test-only static return route. The endpoint reports the
+observed source IPv4 address. This is local VLAN lab validation; it does not
+verify remote BGP advertisement/convergence or physical hardware.
 
 Examples:
   bash ./vlan-e2e.sh
@@ -47,11 +52,13 @@ Examples:
   bash ./vlan-e2e.sh --subnet-dhcp
   bash ./vlan-e2e.sh --external-ip-pool
   bash ./vlan-e2e.sh --external-ip
+  bash ./vlan-e2e.sh --nat-gateway
   bash ./vlan-e2e.sh --cleanup --suite full
   bash ./vlan-e2e.sh --cleanup --subnet-dhcp
   bash ./vlan-e2e.sh --cleanup --virtual-network
   bash ./vlan-e2e.sh --cleanup --external-ip-pool
   bash ./vlan-e2e.sh --cleanup --external-ip
+  bash ./vlan-e2e.sh --cleanup --nat-gateway
 USAGE
 }
 
@@ -77,7 +84,7 @@ while (($# > 0)); do
             [[ "$SUITE_SELECTED" == false ]] || argument_error "--suite may be specified only once"
             (($# >= 2)) || argument_error "--suite requires a value"
             case "$2" in
-                full|virtual-network|subnet-dhcp|external-ip-pool|external-ip)
+                full|virtual-network|subnet-dhcp|external-ip-pool|external-ip|nat-gateway)
                     VLAN_E2E_SUITE="$2"
                     ;;
                 *) argument_error "unsupported suite: $2" ;;
@@ -85,7 +92,7 @@ while (($# > 0)); do
             SUITE_SELECTED=true
             shift 2
             ;;
-        --full|--virtual-network|--subnet-dhcp|--external-ip-pool|--external-ip)
+        --full|--virtual-network|--subnet-dhcp|--external-ip-pool|--external-ip|--nat-gateway)
             [[ "$SUITE_SELECTED" == false ]] || argument_error "a suite may be specified only once"
             VLAN_E2E_SUITE="${1#--}"
             SUITE_SELECTED=true
@@ -104,6 +111,7 @@ case "$VLAN_E2E_SUITE" in
         SUITE_USES_CLI=true
         SUITE_USES_EXTERNAL_IP=true
         SUITE_USES_EXTERNAL_IP_ATTACHMENT=true
+        SUITE_USES_NAT_GATEWAY=true
         ;;
     virtual-network)
         SUITE_USES_VN=true
@@ -113,6 +121,7 @@ case "$VLAN_E2E_SUITE" in
         SUITE_USES_CLI=true
         SUITE_USES_EXTERNAL_IP=false
         SUITE_USES_EXTERNAL_IP_ATTACHMENT=false
+        SUITE_USES_NAT_GATEWAY=false
         ;;
     subnet-dhcp)
         SUITE_USES_VN=true
@@ -122,6 +131,7 @@ case "$VLAN_E2E_SUITE" in
         SUITE_USES_CLI=true
         SUITE_USES_EXTERNAL_IP=false
         SUITE_USES_EXTERNAL_IP_ATTACHMENT=false
+        SUITE_USES_NAT_GATEWAY=false
         ;;
     external-ip-pool)
         SUITE_USES_VN=false
@@ -131,6 +141,7 @@ case "$VLAN_E2E_SUITE" in
         SUITE_USES_CLI=false
         SUITE_USES_EXTERNAL_IP=false
         SUITE_USES_EXTERNAL_IP_ATTACHMENT=false
+        SUITE_USES_NAT_GATEWAY=false
         ;;
     external-ip)
         SUITE_USES_VN=true
@@ -140,8 +151,24 @@ case "$VLAN_E2E_SUITE" in
         SUITE_USES_CLI=true
         SUITE_USES_EXTERNAL_IP=true
         SUITE_USES_EXTERNAL_IP_ATTACHMENT=true
+        SUITE_USES_NAT_GATEWAY=false
+        ;;
+    nat-gateway)
+        SUITE_USES_VN=true
+        SUITE_USES_SUBNET=true
+        SUITE_USES_SUBNET_DHCP=true
+        SUITE_USES_POOL=true
+        SUITE_USES_CLI=true
+        SUITE_USES_EXTERNAL_IP=true
+        SUITE_USES_EXTERNAL_IP_ATTACHMENT=false
+        SUITE_USES_NAT_GATEWAY=true
         ;;
 esac
+
+SUITE_USES_EXTERNAL_ROUTING=false
+if [[ "$SUITE_USES_EXTERNAL_IP_ATTACHMENT" == true || "$SUITE_USES_NAT_GATEWAY" == true ]]; then
+    SUITE_USES_EXTERNAL_ROUTING=true
+fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AAP_DIR="${REPO_ROOT}/osac-aap"
@@ -185,7 +212,7 @@ CLIENT_IMAGE="${CLIENT_IMAGE:-busybox:1.36.1}"
 VLAN_E2E_DEBUG="${VLAN_E2E_DEBUG:-false}"
 VLAN_E2E_ARTIFACT_DIR="${VLAN_E2E_ARTIFACT_DIR:-}"
 DHCP_CLIENT_PREFIX="${DHCP_CLIENT_PREFIX:-osac5530-$(date -u +%Y%m%d%H%M%S)}"
-IMPLEMENTATION_BRANCH_NAME="osac-6308-external-ip-attachment"
+IMPLEMENTATION_BRANCH_NAME="osac-6202-natgateway-snat"
 CURRENT_BRANCH="$(git -C "$REPO_ROOT" branch --show-current)"
 if [[ "$CURRENT_BRANCH" != e2e ]]; then
     printf 'ERROR: run vlan-e2e.sh from the e2e branch; current branch is %s\n' "$CURRENT_BRANCH" >&2
@@ -277,6 +304,14 @@ SUBNET_TWO_NAME="${SUBNET_TWO_NAME:-${VIRTUAL_NETWORK_NAME}-subnet-b}"
 SUBNET_THREE_NAME="${SUBNET_THREE_NAME:-${VIRTUAL_NETWORK_NAME}-subnet-30}"
 EXTERNAL_IP_ATTACHMENT_SUBNET_NAME="${VIRTUAL_NETWORK_NAME}-eip-subnet"
 EXTERNAL_IP_ATTACHMENT_SUBNET_CIDR="${OSAC_EIA_SUBNET_IPV4_CIDR:-}"
+SUBNET_ONE_IPV4_CIDR_EXPLICIT=false
+SUBNET_TWO_IPV4_CIDR_EXPLICIT=false
+if [[ -n "${SUBNET_ONE_IPV4_CIDR:-}" ]]; then
+    SUBNET_ONE_IPV4_CIDR_EXPLICIT=true
+fi
+if [[ -n "${SUBNET_TWO_IPV4_CIDR:-}" ]]; then
+    SUBNET_TWO_IPV4_CIDR_EXPLICIT=true
+fi
 SUBNET_ONE_IPV4_CIDR="${SUBNET_ONE_IPV4_CIDR:-}"
 SUBNET_TWO_IPV4_CIDR="${SUBNET_TWO_IPV4_CIDR:-}"
 SUBNET_THREE_IPV4_CIDR="${SUBNET_THREE_IPV4_CIDR:-}"
@@ -293,6 +328,29 @@ EXTERNAL_IP_TWO_NAME="${EXTERNAL_IP_PREFIX}-b"
 EXTERNAL_IP_ATTACHMENT_PREFIX="agentless-eip-attach-$(date -u +%Y%m%d%H%M%S)-$$"
 EXTERNAL_IP_ATTACHMENT_ONE_NAME="${EXTERNAL_IP_ATTACHMENT_PREFIX}-a"
 EXTERNAL_IP_ATTACHMENT_TWO_NAME="${EXTERNAL_IP_ATTACHMENT_PREFIX}-b"
+NAT_GATEWAY_PREFIX="agentless-natgw-$(date -u +%Y%m%d%H%M%S)-$$"
+NAT_GATEWAY_ONE_NAME="${NAT_GATEWAY_PREFIX}-a"
+NAT_GATEWAY_TWO_NAME="${NAT_GATEWAY_PREFIX}-b"
+NAT_GATEWAY_SUBNET_ONE_NAME="${VIRTUAL_NETWORK_NAME}-natgw-subnet-a"
+NAT_GATEWAY_SUBNET_TWO_NAME="${VIRTUAL_NETWORK_NAME}-natgw-subnet-b"
+NAT_GATEWAY_PEER_SUBNET_NAME="${PEER_VIRTUAL_NETWORK_NAME}-natgw-subnet-a"
+NAT_GATEWAY_SUBNET_ONE_CIDR=""
+NAT_GATEWAY_SUBNET_TWO_CIDR=""
+NAT_GATEWAY_ONE_ID=""
+NAT_GATEWAY_TWO_ID=""
+NAT_GATEWAY_ONE_UID=""
+NAT_GATEWAY_TWO_UID=""
+NAT_GATEWAY_ONE_ADDRESS=""
+NAT_GATEWAY_TWO_ADDRESS=""
+NAT_GATEWAY_ONE_SUBNET_ID=""
+NAT_GATEWAY_ONE_SUBNET_UID=""
+NAT_GATEWAY_TWO_SUBNET_ID=""
+NAT_GATEWAY_TWO_SUBNET_UID=""
+NAT_GATEWAY_ONE_INITIAL_STATE=""
+NAT_GATEWAY_TWO_INITIAL_STATE=""
+LAST_NAT_GATEWAY_JOB_ID=""
+LAST_NAT_GATEWAY_STATE=""
+LAST_NAT_GATEWAY_CLEANUP_JOB_ID=""
 EXTERNAL_IP_SYNTHETIC_CLIENT="a1"
 EXTERNAL_IP_SYNTHETIC_TARGET_NAME="vlan-e2e-synthetic-dhcp-target"
 EXTERNAL_IP_SYNTHETIC_TARGET_ID=""
@@ -306,6 +364,16 @@ EXTERNAL_IP_CLIENT_ROUTE_INTERFACE="eth1"
 EXTERNAL_IP_TEST_LINK_NODE_ADDRESS="192.0.2.1"
 EXTERNAL_IP_TEST_LINK_CLIENT_ADDRESS="192.0.2.2"
 EXTERNAL_IP_CLIENT_ROUTE_ADDRESSES=()
+NAT_GATEWAY_RESPONSE_PORT="${OSAC_NAT_GATEWAY_RESPONSE_PORT:-18081}"
+NAT_GATEWAY_RESPONSE_TOKEN=""
+NAT_GATEWAY_ENDPOINT_CONTAINER=""
+NAT_GATEWAY_ENDPOINT_CREATED_BY_RUN=false
+NAT_GATEWAY_UPLINK_CHANGED_BY_RUN=false
+NAT_GATEWAY_UPLINK_BACKUP=""
+NAT_GATEWAY_UPLINK_EXPECTED=""
+NAT_GATEWAY_UPLINK_OWNER=""
+NAT_GATEWAY_UPLINK_OWNER_ANNOTATION="osac.openshift.io/vlan-e2e-natgw-uplink-owner"
+NAT_GATEWAY_UPLINK_BACKUP_ANNOTATION="osac.openshift.io/vlan-e2e-natgw-uplink-original"
 CLEANUP_EIP_ADDRESSES=()
 
 CLI_BIN="${OSAC_CLI_BIN:-}"
@@ -319,6 +387,8 @@ CREATED_IDS=()
 CREATED_SUBNET_IDS=()
 CREATED_EXTERNAL_IP_IDS=()
 CREATED_EXTERNAL_IP_ATTACHMENT_IDS=()
+CREATED_NAT_GATEWAY_IDS=()
+CREATED_NAT_GATEWAY_UIDS=()
 CREATED_SYNTHETIC_EXTERNAL_IP_ATTACHMENT_IDS=()
 CREATED_SYNTHETIC_EXTERNAL_IP_ATTACHMENT_UIDS=()
 CREATED_BARE_METAL_INSTANCE_IDS=()
@@ -326,6 +396,8 @@ CLEANUP_VN_UIDS=()
 CLEANUP_SUBNET_UIDS=()
 CLEANUP_ATTACHMENT_UIDS=()
 CLEANUP_ATTACHMENT_IDS=()
+CLEANUP_NAT_GATEWAY_IDS=()
+CLEANUP_NAT_GATEWAY_UIDS=()
 CLEANUP_SYNTHETIC_ATTACHMENT_UIDS=()
 CLEANUP_SYNTHETIC_ATTACHMENT_IDS=()
 CLEANUP_BMI_IDS=()
@@ -409,6 +481,7 @@ subnet_label_selector() { printf 'osac.openshift.io/subnet-uuid=%s' "$1"; }
 external_ip_pool_label_selector() { printf 'osac.openshift.io/externalippool-uuid=%s' "$1"; }
 external_ip_label_selector() { printf 'osac.openshift.io/externalip-uuid=%s' "$1"; }
 external_ip_attachment_label_selector() { printf 'osac.openshift.io/externalipattachment-uuid=%s' "$1"; }
+nat_gateway_label_selector() { printf 'osac.openshift.io/natgateway-uuid=%s' "$1"; }
 baremetal_instance_label_selector() { printf 'osac.openshift.io/baremetalinstance-uuid=%s' "$1"; }
 
 assert_provider_schema_v1() {
@@ -781,7 +854,7 @@ restore_netnode_download_network() {
 prepare_containerlab_net_node() {
     local public_key authorized_exists package_log bridge_status
     local -a provider_packages=(iptables iproute2 python3 openssh sudo conntrack-tools procps iputils dnsmasq supervisor)
-    if [[ "$SUITE_USES_EXTERNAL_IP_ATTACHMENT" == true ]]; then
+    if [[ "$SUITE_USES_EXTERNAL_ROUTING" == true ]]; then
         provider_packages+=(frr frr-openrc openrc)
     fi
     ensure_aap_ssh_key
@@ -790,7 +863,7 @@ prepare_containerlab_net_node() {
         docker exec "$CONTAINERLAB_NET_NODE" sh -c \
             'for tool in iptables ip python3 sshd sudo conntrack dnsmasq supervisorctl; do command -v "$tool" >/dev/null || exit 1; done' \
             || die "The existing Containerlab network node lacks provider cleanup tools; cleanup will not install packages"
-        if [[ "$SUITE_USES_EXTERNAL_IP_ATTACHMENT" == true ]]; then
+        if [[ "$SUITE_USES_EXTERNAL_ROUTING" == true ]]; then
             docker exec "$CONTAINERLAB_NET_NODE" sh -c \
                 'for tool in vtysh rc-service pgrep; do command -v "$tool" >/dev/null || exit 1; done; test -x /etc/init.d/frr; test -f /etc/frr/daemons' \
                 || die "The network node lacks FRR; cleanup will not install packages"
@@ -820,7 +893,7 @@ prepare_containerlab_net_node() {
                 || die "Could not disconnect the temporary Docker bridge from the Containerlab network node"
         fi
     fi
-    if [[ "$SUITE_USES_EXTERNAL_IP_ATTACHMENT" == true ]]; then
+    if [[ "$SUITE_USES_EXTERNAL_ROUTING" == true ]]; then
         prepare_containerlab_frr
     fi
     CONTAINERLAB_ACCESS_CONFIGURED=true
@@ -1925,6 +1998,139 @@ PY
     INVENTORY_CONFIGMAP_CHANGED_BY_RUN=false
 }
 
+configure_nat_gateway_uplink() {
+    local current_json current_owner backup_json resource_version
+    local original_present original_value annotations_present patch_file
+    [[ "$SUITE_USES_NAT_GATEWAY" == true ]] || return 0
+    current_json="$(oc get configmap "$AAP_NETWORKING_SECRET" -n "$OSAC_NAMESPACE" -o json)" \
+        || die "Could not read network-fulfillment-ig before configuring the NATGateway test uplink"
+    current_owner="$(jq -r --arg key "$NAT_GATEWAY_UPLINK_OWNER_ANNOTATION" \
+        '.metadata.annotations[$key] // ""' <<<"$current_json")"
+    if [[ -n "$current_owner" ]]; then
+        if [[ "$CLEANUP_MODE" != true ]]; then
+            die "A previous NATGateway test still owns the network uplink override; run --cleanup --nat-gateway first"
+        fi
+        backup_json="$(jq -r --arg key "$NAT_GATEWAY_UPLINK_BACKUP_ANNOTATION" \
+            '.metadata.annotations[$key] // ""' <<<"$current_json")"
+        jq -e --arg owner "$current_owner" \
+            '.owner == $owner and (.original_present | type == "boolean")
+             and (.original_value | type == "string")
+             and (.original_annotations_present | type == "boolean")' <<<"$backup_json" >/dev/null \
+            || die "Saved NATGateway uplink recovery metadata is invalid"
+        [[ "$(jq -r '.data.AGENTLESS_NET_EXTERNAL_INTERFACE // ""' <<<"$current_json")" == eth2 ]] \
+            || die "The NATGateway uplink changed after the interrupted run; preserving the current ConfigMap"
+        NAT_GATEWAY_UPLINK_OWNER="$current_owner"
+        NAT_GATEWAY_UPLINK_BACKUP="$backup_json"
+        NAT_GATEWAY_UPLINK_EXPECTED=eth2
+        NAT_GATEWAY_UPLINK_CHANGED_BY_RUN=true
+        return 0
+    fi
+    [[ "$CLEANUP_MODE" != true ]] || return 0
+
+    original_present="$(jq -r '.data | has("AGENTLESS_NET_EXTERNAL_INTERFACE")' <<<"$current_json")"
+    original_value="$(jq -r '.data.AGENTLESS_NET_EXTERNAL_INTERFACE // ""' <<<"$current_json")"
+    annotations_present="$(jq -r '(.metadata.annotations | type) == "object"' <<<"$current_json")"
+    NAT_GATEWAY_UPLINK_OWNER="vlan-e2e-natgw-${DHCP_CLIENT_PREFIX}"
+    NAT_GATEWAY_UPLINK_EXPECTED=eth2
+    backup_json="$(jq -cn --arg owner "$NAT_GATEWAY_UPLINK_OWNER" \
+        --argjson present "$original_present" --arg value "$original_value" \
+        --argjson annotations_present "$annotations_present" \
+        '{owner:$owner,original_present:$present,original_value:$value,
+          original_annotations_present:$annotations_present}')"
+    resource_version="$(jq -er '.metadata.resourceVersion' <<<"$current_json")" \
+        || die "network-fulfillment-ig has no resourceVersion for a guarded NATGateway uplink update"
+    patch_file="${TEMP_DIR}/nat-gateway-uplink-patch.json"
+    jq -n --arg rv "$resource_version" --arg owner_key "$NAT_GATEWAY_UPLINK_OWNER_ANNOTATION" \
+        --arg backup_key "$NAT_GATEWAY_UPLINK_BACKUP_ANNOTATION" \
+        --arg owner "$NAT_GATEWAY_UPLINK_OWNER" --arg backup "$backup_json" \
+        --arg annotations_present "$annotations_present" '
+      [{op:"test",path:"/metadata/resourceVersion",value:$rv}]
+      + (if $annotations_present == "true" then [] else
+          [{op:"add",path:"/metadata/annotations",value:{}}] end)
+      + [
+          {op:"add",path:("/metadata/annotations/" + ($owner_key | gsub("/";"~1"))),value:$owner},
+          {op:"add",path:("/metadata/annotations/" + ($backup_key | gsub("/";"~1"))),value:$backup},
+          {op:"add",path:"/data/AGENTLESS_NET_EXTERNAL_INTERFACE",value:"eth2"}
+        ]' >"$patch_file" || die "Could not prepare the guarded NATGateway uplink patch"
+    oc patch configmap "$AAP_NETWORKING_SECRET" -n "$OSAC_NAMESPACE" \
+        --type=json --patch-file="$patch_file" >/dev/null \
+        || die "Could not install the temporary NATGateway uplink override"
+    current_json="$(oc get configmap "$AAP_NETWORKING_SECRET" -n "$OSAC_NAMESPACE" -o json)" \
+        || die "Could not verify the NATGateway uplink override"
+    jq -e --arg owner_key "$NAT_GATEWAY_UPLINK_OWNER_ANNOTATION" \
+        --arg backup_key "$NAT_GATEWAY_UPLINK_BACKUP_ANNOTATION" \
+        --arg owner "$NAT_GATEWAY_UPLINK_OWNER" --arg backup "$backup_json" '
+      .data.AGENTLESS_NET_EXTERNAL_INTERFACE == "eth2"
+      and .metadata.annotations[$owner_key] == $owner
+      and .metadata.annotations[$backup_key] == $backup' <<<"$current_json" >/dev/null \
+        || die "network-fulfillment-ig did not retain the guarded NATGateway uplink override"
+    NAT_GATEWAY_UPLINK_BACKUP="$backup_json"
+    NAT_GATEWAY_UPLINK_CHANGED_BY_RUN=true
+    info "Configured the AAP network instance group to use external interface eth2 for NATGateway jobs."
+}
+
+restore_nat_gateway_uplink() {
+    local current_json resource_version backup_json patch_file owner annotations_empty_after_restore
+    [[ "$NAT_GATEWAY_UPLINK_CHANGED_BY_RUN" == true ]] || return 0
+    current_json="$(oc get configmap "$AAP_NETWORKING_SECRET" -n "$OSAC_NAMESPACE" -o json)" \
+        || { printf 'ERROR: cannot read network-fulfillment-ig while restoring the NATGateway uplink\n' >&2; return 1; }
+    owner="$(jq -r --arg key "$NAT_GATEWAY_UPLINK_OWNER_ANNOTATION" \
+        '.metadata.annotations[$key] // ""' <<<"$current_json")"
+    jq -e --arg owner "$NAT_GATEWAY_UPLINK_OWNER" \
+        --arg owner_key "$NAT_GATEWAY_UPLINK_OWNER_ANNOTATION" \
+        --arg backup_key "$NAT_GATEWAY_UPLINK_BACKUP_ANNOTATION" \
+        --arg backup "$NAT_GATEWAY_UPLINK_BACKUP" '
+      .metadata.annotations[$owner_key] == $owner
+      and .metadata.annotations[$backup_key] == $backup
+      and .data.AGENTLESS_NET_EXTERNAL_INTERFACE == "eth2"' \
+        <<<"$current_json" >/dev/null \
+        || { printf 'ERROR: NATGateway uplink override changed; preserving its current ConfigMap value\n' >&2; return 1; }
+    jq -e --arg owner "$owner" \
+        '.owner == $owner and (.original_present | type == "boolean")
+         and (.original_value | type == "string")
+         and (.original_annotations_present | type == "boolean")' <<<"$NAT_GATEWAY_UPLINK_BACKUP" >/dev/null \
+        || { printf 'ERROR: saved NATGateway uplink recovery metadata is invalid\n' >&2; return 1; }
+    annotations_empty_after_restore="$(jq -r --arg owner_key "$NAT_GATEWAY_UPLINK_OWNER_ANNOTATION" \
+        --arg backup_key "$NAT_GATEWAY_UPLINK_BACKUP_ANNOTATION" \
+        '((.metadata.annotations // {}) | del(.[$owner_key], .[$backup_key]) | length) == 0' \
+        <<<"$current_json")"
+    resource_version="$(jq -er '.metadata.resourceVersion' <<<"$current_json")" || return 1
+    patch_file="${TEMP_DIR}/nat-gateway-uplink-restore.json"
+    jq -n --arg rv "$resource_version" --arg owner "$owner" \
+        --arg owner_key "$NAT_GATEWAY_UPLINK_OWNER_ANNOTATION" \
+        --arg backup_key "$NAT_GATEWAY_UPLINK_BACKUP_ANNOTATION" \
+        --argjson remove_empty_annotations "$annotations_empty_after_restore" \
+        --slurpfile backup <(printf '%s\n' "$NAT_GATEWAY_UPLINK_BACKUP") '
+      [{op:"test",path:"/metadata/resourceVersion",value:$rv},
+       {op:"test",path:("/metadata/annotations/" + ($owner_key | gsub("/";"~1"))),value:$owner},
+       {op:"test",path:"/data/AGENTLESS_NET_EXTERNAL_INTERFACE",value:"eth2"}]
+      + (if $backup[0].original_present then
+          [{op:"replace",path:"/data/AGENTLESS_NET_EXTERNAL_INTERFACE",value:$backup[0].original_value}]
+        else [{op:"remove",path:"/data/AGENTLESS_NET_EXTERNAL_INTERFACE"}] end)
+      + [{op:"remove",path:("/metadata/annotations/" + ($owner_key | gsub("/";"~1")))},
+         {op:"remove",path:("/metadata/annotations/" + ($backup_key | gsub("/";"~1")))}]
+      + (if ($backup[0].original_annotations_present | not)
+          and $remove_empty_annotations
+          then [{op:"remove",path:"/metadata/annotations"}] else [] end)' \
+        >"$patch_file" || return 1
+    oc patch configmap "$AAP_NETWORKING_SECRET" -n "$OSAC_NAMESPACE" \
+        --type=json --patch-file="$patch_file" >/dev/null || return 1
+    current_json="$(oc get configmap "$AAP_NETWORKING_SECRET" -n "$OSAC_NAMESPACE" -o json)" \
+        || return 1
+    jq -e --slurpfile backup <(printf '%s\n' "$NAT_GATEWAY_UPLINK_BACKUP") '
+      ((.data | has("AGENTLESS_NET_EXTERNAL_INTERFACE")) == $backup[0].original_present)
+      and (if $backup[0].original_present then
+        .data.AGENTLESS_NET_EXTERNAL_INTERFACE == $backup[0].original_value
+      else (.data | has("AGENTLESS_NET_EXTERNAL_INTERFACE") | not) end)
+      and ((.metadata.annotations // {}) | has("osac.openshift.io/vlan-e2e-natgw-uplink-owner") | not)
+      and ((.metadata.annotations // {}) | has("osac.openshift.io/vlan-e2e-natgw-uplink-original") | not)' \
+        <<<"$current_json" >/dev/null || return 1
+    NAT_GATEWAY_UPLINK_CHANGED_BY_RUN=false
+    NAT_GATEWAY_UPLINK_OWNER=""
+    NAT_GATEWAY_UPLINK_BACKUP=""
+    info "Restored the original AgentlessNet AAP external-interface setting."
+}
+
 remove_netnode_public_key() {
     local public_key
     [[ "$SSH_PUBLIC_KEY_INSTALLED_BY_RUN" == true && -f "$SSH_PUBLIC_KEY_FILE" ]] || return 0
@@ -2952,6 +3158,44 @@ external_ip_attachment_cr_json() {
       end' <<<"$json"
 }
 
+nat_gateway_crs_json() {
+    local selector
+    selector="$(nat_gateway_label_selector "$1")"
+    oc get natgateways -n "$NETWORKING_NAMESPACE" -l "$selector" \
+        -o json --request-timeout=20s
+}
+
+nat_gateway_cr_json() {
+    local id="$1" expected_virtual_network="$2" expected_external_ip="$3" json
+    json="$(nat_gateway_crs_json "$id")" \
+        || die "Kubernetes API failed while looking up NATGateway UUID ${id}"
+    jq -ce --arg id "$id" --arg tenant "$OSAC_TENANT" \
+        --arg namespace "$NETWORKING_NAMESPACE" \
+        --arg virtual_network "$expected_virtual_network" \
+        --arg external_ip "$expected_external_ip" '
+      if (.items | length) != 1 then
+        error("expected one NATGateway CR for Fulfillment UUID " + $id)
+      else
+        .items[0] as $gateway
+        | if $gateway.metadata.labels["osac.openshift.io/natgateway-uuid"] != $id then
+            error("NATGateway UUID label does not match the requested resource")
+          elif $gateway.metadata.annotations["osac.openshift.io/tenant"] != $tenant then
+            error("NATGateway tenant annotation does not match the test tenant")
+          elif $gateway.metadata.annotations["osac.openshift.io/implementation-strategy"] != "agentless_net" then
+            error("NATGateway did not resolve to AgentlessNet")
+          elif $gateway.metadata.annotations["osac.openshift.io/natgateway-contract-version"] != "v1" then
+            error("NATGateway is not using the v1 contract")
+          elif $gateway.metadata.namespace != $namespace then
+            error("NATGateway is in an unexpected namespace")
+          elif ($gateway.metadata.name | startswith("agentless-natgw-") | not) then
+            error("NATGateway is outside the test name scope")
+          elif $gateway.spec.virtualNetwork != $virtual_network
+            or $gateway.spec.externalIP != $external_ip then
+            error("NATGateway dependency references do not match the test request")
+          else $gateway end
+      end' <<<"$json"
+}
+
 baremetal_instance_crs_json() {
     local selector
     selector="$(baremetal_instance_label_selector "$1")"
@@ -3462,6 +3706,104 @@ wait_for_external_ip_response() {
     die "ExternalIP ${address} did not return the expected synthetic target response from the upstream-router"
 }
 
+prepare_nat_gateway_endpoint() {
+    local script_file token_file response
+    [[ "$SUITE_USES_NAT_GATEWAY" == true ]] || return 0
+    prepare_external_ip_test_link \
+        || die "Could not prepare the direct NATGateway test peer link"
+    NAT_GATEWAY_ENDPOINT_CONTAINER="osac-natgw-source-endpoint"
+    if docker inspect "$NAT_GATEWAY_ENDPOINT_CONTAINER" >/dev/null 2>&1; then
+        die "NATGateway test endpoint ${NAT_GATEWAY_ENDPOINT_CONTAINER} already exists; recover the prior run first"
+    fi
+    NAT_GATEWAY_RESPONSE_TOKEN="osac-natgw-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+    token_file="${TEMP_DIR}/nat-gateway-endpoint-token"
+    script_file="${TEMP_DIR}/nat-gateway-endpoint-cgi"
+    printf '%s' "$NAT_GATEWAY_RESPONSE_TOKEN" >"$token_file"
+    chmod 0600 "$token_file"
+    cat >"$script_file" <<'CGI'
+#!/bin/sh
+printf 'Content-Type: application/json\r\n\r\n'
+token="$(cat /www/natgw-token)"
+printf '{"token":"%s","source_ip":"%s"}\n' "$token" "${REMOTE_ADDR:-}"
+CGI
+    chmod 0700 "$script_file"
+    docker image inspect "$CLIENT_IMAGE" >/dev/null 2>&1 || docker pull "$CLIENT_IMAGE"
+    docker run -d --name "$NAT_GATEWAY_ENDPOINT_CONTAINER" \
+        --label osac.openshift.io/e2e-owner=agentless-natgateway \
+        --network "container:${CONTAINERLAB_UPSTREAM_ROUTER}" \
+        "$CLIENT_IMAGE" sh -c 'while true; do sleep 3600; done' >/dev/null \
+        || die "Could not start the NATGateway test endpoint container"
+    NAT_GATEWAY_ENDPOINT_CREATED_BY_RUN=true
+    docker exec "$NAT_GATEWAY_ENDPOINT_CONTAINER" mkdir -p /www/cgi-bin \
+        || die "Could not prepare the NATGateway test endpoint document root"
+    docker cp "$token_file" "${NAT_GATEWAY_ENDPOINT_CONTAINER}:/www/natgw-token" >/dev/null \
+        || die "Could not install the private NATGateway test token"
+    docker cp "$script_file" "${NAT_GATEWAY_ENDPOINT_CONTAINER}:/www/cgi-bin/observe" >/dev/null \
+        || die "Could not install the NATGateway source-observation endpoint"
+    docker exec "$NAT_GATEWAY_ENDPOINT_CONTAINER" chmod 0600 /www/natgw-token
+    docker exec "$NAT_GATEWAY_ENDPOINT_CONTAINER" chmod 0700 /www/cgi-bin/observe
+    docker exec -d "$NAT_GATEWAY_ENDPOINT_CONTAINER" \
+        busybox httpd -f -p "$NAT_GATEWAY_RESPONSE_PORT" -h /www \
+        || die "Could not start the NATGateway source-observation endpoint"
+    for ((attempt = 1; attempt <= 30; attempt++)); do
+        if response="$(docker exec "$NAT_GATEWAY_ENDPOINT_CONTAINER" \
+            wget -q -T 5 -O - "http://127.0.0.1:${NAT_GATEWAY_RESPONSE_PORT}/cgi-bin/observe" 2>/dev/null)" \
+            && jq -e --arg token "$NAT_GATEWAY_RESPONSE_TOKEN" \
+                '.token == $token and (.source_ip | type == "string" and length > 0)' \
+                <<<"$response" >/dev/null; then
+            info "NATGateway source-observation endpoint is ready on port ${NAT_GATEWAY_RESPONSE_PORT}."
+            return 0
+        fi
+        sleep 2
+    done
+    die "NATGateway source-observation endpoint did not become ready"
+}
+
+probe_nat_gateway_endpoint() {
+    local client="$1" external_address="$2" container
+    container="$(client_container "$client")"
+    docker exec "$container" wget -q -T 5 -O - \
+        "http://${external_address}:${NAT_GATEWAY_RESPONSE_PORT}/cgi-bin/observe"
+}
+
+wait_for_nat_gateway_source() {
+    local client="$1" external_address="$2" deadline=$((SECONDS + 300)) response
+    while ((SECONDS < deadline)); do
+        if response="$(probe_nat_gateway_endpoint "$client" "$external_address" 2>/dev/null)" \
+            && jq -e --arg token "$NAT_GATEWAY_RESPONSE_TOKEN" \
+                --arg source "$external_address" \
+                '.token == $token and .source_ip == $source' <<<"$response" >/dev/null; then
+            info "Client ${client} reached the endpoint through NATGateway ${external_address}; observed source ${external_address}."
+            return 0
+        fi
+        sleep 2
+    done
+    die "Client ${client} did not reach the NATGateway endpoint with source ${external_address}"
+}
+
+cleanup_nat_gateway_endpoint() {
+    local existing_owner network_mode
+    NAT_GATEWAY_ENDPOINT_CONTAINER="${NAT_GATEWAY_ENDPOINT_CONTAINER:-osac-natgw-source-endpoint}"
+    if [[ "$NAT_GATEWAY_ENDPOINT_CREATED_BY_RUN" != true ]]; then
+        [[ "${CLEANUP_MODE:-false}" == true ]] || return 0
+        docker inspect "$NAT_GATEWAY_ENDPOINT_CONTAINER" >/dev/null 2>&1 || return 0
+        existing_owner="$(docker inspect -f '{{ index .Config.Labels "osac.openshift.io/e2e-owner" }}' \
+            "$NAT_GATEWAY_ENDPOINT_CONTAINER")" || return 1
+        network_mode="$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$NAT_GATEWAY_ENDPOINT_CONTAINER")" \
+            || return 1
+        [[ "$existing_owner" == agentless-natgateway \
+            && "$network_mode" == "container:${CONTAINERLAB_UPSTREAM_ROUTER}" ]] || {
+            printf 'Refusing to remove an endpoint container outside the NATGateway e2e scope\n' >&2
+            return 1
+        }
+    fi
+    docker rm -f "$NAT_GATEWAY_ENDPOINT_CONTAINER" >/dev/null \
+        || return 1
+    NAT_GATEWAY_ENDPOINT_CREATED_BY_RUN=false
+    NAT_GATEWAY_ENDPOINT_CONTAINER=""
+    NAT_GATEWAY_RESPONSE_TOKEN=""
+}
+
 assert_external_ip_attachment_provider_absent() {
     local uid="$1" address="$2" namespace="$3" state routes nat forwarding conntrack
     state="$(state_snapshot)" || return 1
@@ -3596,6 +3938,25 @@ sys.stdout.write(json.dumps(artifacts, sort_keys=True))
 PY
 )
 
+nat_gateway_aap_job_details() (
+    local job_id="$1" operation="$2" route token
+    route="$(oc get route osac-aap -n "$OSAC_NAMESPACE" -o jsonpath='{.spec.host}')" \
+        || return 1
+    token="$(oc exec deployment/osac-operator -n "$OSAC_NAMESPACE" -- \
+        sh -c 'printf %s "$OSAC_AAP_TOKEN"' 2>/dev/null)" \
+        || return 1
+    [[ -n "$route" && -n "$token" ]] || return 1
+    AAP_API_ROUTE="https://${route}" AAP_API_TOKEN="$token" \
+        AAP_API_CA_FILE="$AAP_API_CA_FILE" \
+        python3 "$AAP_JOBS_HELPER" inspect-nat-gateway-job \
+            --job-id "$job_id" \
+            --operation "$operation" \
+            --project-name "$AAP_PROJECT_NAME" \
+            --project-revision "$RUNTIME_SOURCE_COMMIT" \
+            --ee-name "$AAP_EXECUTION_ENVIRONMENT_NAME" \
+            --ee-image "$AAP_IMAGE"
+)
+
 external_ip_assert_result() {
     local artifacts="$1" operation="$2" uid="$3" generation="$4" address="${5:-}"
     jq -e --arg operation "$operation" --arg uid "$uid" \
@@ -3608,6 +3969,255 @@ external_ip_assert_result() {
         and (if $operation == "external_ip.allocate"
              then ($result.data.address == $address and $address != "")
              else $result.data == {} end)' <<<"$artifacts" >/dev/null
+}
+
+nat_gateway_assert_result() {
+    local result="$1" operation="$2" uid="$3" generation="$4"
+    jq -e --arg operation "$operation" --arg uid "$uid" \
+        --argjson generation "$generation" '
+      .schemaVersion == "v1"
+      and .operation == $operation
+      and .resourceUID == $uid
+      and .observedGeneration == $generation
+      and .data == {}' <<<"$result" >/dev/null
+}
+
+nat_gateway_assert_ensure_job() {
+    local job="$1" gateway_cr="$2" external_ip_cr="$3" virtual_network_cr="$4"
+    local expected_context expected_uid expected_generation
+    expected_uid="$(jq -er '.metadata.uid' <<<"$gateway_cr")" \
+        || die "NATGateway CR has no Kubernetes UID"
+    expected_generation="$(jq -er '.metadata.generation' <<<"$gateway_cr")" \
+        || die "NATGateway CR has no generation"
+    expected_context="$(jq -ncS --argjson ip "$external_ip_cr" --argjson vn "$virtual_network_cr" '
+      {
+        external_ip: {
+          name: $ip.metadata.name,
+          namespace: $ip.metadata.namespace,
+          fulfillment_id: $ip.metadata.labels["osac.openshift.io/externalip-uuid"],
+          kubernetes_uid: $ip.metadata.uid,
+          tenant_id: $ip.metadata.annotations["osac.openshift.io/tenant"],
+          address: $ip.status.address,
+          state: $ip.status.state,
+          phase: $ip.status.phase
+        },
+        virtual_network: {
+          name: $vn.metadata.name,
+          namespace: $vn.metadata.namespace,
+          fulfillment_id: $vn.metadata.labels["osac.openshift.io/virtualnetwork-uuid"],
+          kubernetes_uid: $vn.metadata.uid,
+          tenant_id: $vn.metadata.annotations["osac.openshift.io/tenant"],
+          ipv4_cidr: $vn.spec.ipv4Cidr,
+          phase: $vn.status.phase
+        }
+      }')" || die "Could not construct the expected NATGateway job context"
+    jq -e --arg uid "$expected_uid" --argjson generation "$expected_generation" \
+        --argjson gateway "$gateway_cr" --argjson context "$expected_context" '
+      .status == "successful"
+      and .resource.metadata.uid == $uid
+      and .resource.metadata.generation == $generation
+      and .resource.metadata.labels["osac.openshift.io/natgateway-uuid"]
+          == $gateway.metadata.labels["osac.openshift.io/natgateway-uuid"]
+      and .resource.metadata.annotations["osac.openshift.io/tenant"]
+          == $gateway.metadata.annotations["osac.openshift.io/tenant"]
+      and .resource.metadata.annotations["osac.openshift.io/implementation-strategy"] == "agentless_net"
+      and .resource.metadata.annotations["osac.openshift.io/natgateway-contract-version"] == "v1"
+      and .resource.spec.virtualNetwork == $gateway.spec.virtualNetwork
+      and .resource.spec.externalIP == $gateway.spec.externalIP
+      and .nat_gateway_context == $context' <<<"$job" >/dev/null \
+        || die "AAP ensure job input does not match the current NATGateway and dependencies"
+    nat_gateway_assert_result "$(jq -c '.artifacts.osac_result' <<<"$job")" \
+        nat_gateway.ensure "$expected_uid" "$expected_generation" \
+        || die "AAP ensure artifact does not match NATGateway ${expected_uid}"
+}
+
+nat_gateway_assert_delete_job() {
+    local job="$1" gateway_cr="$2" expected_uid expected_generation
+    expected_uid="$(jq -er '.metadata.uid' <<<"$gateway_cr")" \
+        || die "Deleting NATGateway has no Kubernetes UID"
+    expected_generation="$(jq -er '.metadata.generation' <<<"$gateway_cr")" \
+        || die "Deleting NATGateway has no generation"
+    jq -e --arg uid "$expected_uid" --argjson generation "$expected_generation" \
+        --argjson gateway "$gateway_cr" '
+      .status == "successful"
+      and .resource.metadata.uid == $uid
+      and .resource.metadata.generation == $generation
+      and .resource.metadata.labels["osac.openshift.io/natgateway-uuid"]
+          == $gateway.metadata.labels["osac.openshift.io/natgateway-uuid"]
+      and .resource.metadata.annotations["osac.openshift.io/tenant"]
+          == $gateway.metadata.annotations["osac.openshift.io/tenant"]
+      and .resource.metadata.annotations["osac.openshift.io/implementation-strategy"] == "agentless_net"
+      and .resource.metadata.annotations["osac.openshift.io/natgateway-contract-version"] == "v1"
+      and .resource.spec.virtualNetwork == $gateway.spec.virtualNetwork
+      and .resource.spec.externalIP == $gateway.spec.externalIP' <<<"$job" >/dev/null \
+        || die "AAP delete job input does not match deleting NATGateway ${expected_uid}"
+    nat_gateway_assert_result "$(jq -c '.artifacts.osac_result' <<<"$job")" \
+        nat_gateway.delete "$expected_uid" "$expected_generation" \
+        || die "AAP delete artifact does not match NATGateway ${expected_uid}"
+}
+
+nat_gateway_assert_provider_state() {
+    local id="$1" uid="$2" virtual_network_uid="$3" external_ip_uid="$4"
+    local address="$5" expected_sources="$6" entry
+    entry="$(get_nat_gateway_state_entry "$uid" "$id")" \
+        || die "NATGateway ${id} has no unique saved provider row"
+    jq -e --arg id "$id" --arg uid "$uid" --arg tenant "$OSAC_TENANT" \
+        --arg vn_uid "$virtual_network_uid" --arg eip_uid "$external_ip_uid" \
+        --arg address "$address" --argjson sources "$expected_sources" '
+      .uid == $uid
+      and .fulfillment_id == $id
+      and .tenant_id == $tenant
+      and .external_ip_uid == $eip_uid
+      and .virtual_network_uid == $vn_uid
+      and .external_address == $address
+      and .phase == "ready"
+      and .payload.phase == "ready"
+      and .payload.source_cidrs == $sources
+      and .payload.applied_source_cidrs == $sources
+      and .payload.source_revision == .payload.applied_revision
+      and .payload.cleanup_source_cidrs == []
+      and .payload.provider.external_interface == "eth2"
+      and (.payload.provider.next_hop | type == "string" and length > 0)' \
+        <<<"$entry" >/dev/null \
+        || die "NATGateway ${id} provider state does not match its current dependencies and Subnets"
+    printf '%s\n' "$entry"
+}
+
+nat_gateway_wait_for_provider_sources() {
+    local id="$1" virtual_network_id="$2" external_ip_id="$3" expected_sources="$4"
+    local deadline=$((SECONDS + AAP_JOB_TIMEOUT + 300)) gateway_cr phase job job_state
+    local uid virtual_network_cr virtual_network_uid external_ip_cr external_ip_uid address state
+    gateway_cr="$(nat_gateway_cr_json "$id" "$virtual_network_id" "$external_ip_id")" \
+        || die "Could not inspect NATGateway ${id} while waiting for Subnet source reconciliation"
+    uid="$(jq -er '.metadata.uid' <<<"$gateway_cr")" \
+        || die "NATGateway ${id} has no Kubernetes UID"
+    virtual_network_cr="$(virtual_network_cr_json "$virtual_network_id")" \
+        || die "Could not inspect NATGateway ${id} VirtualNetwork"
+    virtual_network_uid="$(jq -er '.metadata.uid' <<<"$virtual_network_cr")" \
+        || die "NATGateway ${id} VirtualNetwork has no Kubernetes UID"
+    external_ip_cr="$(external_ip_cr_json "$external_ip_id")" \
+        || die "Could not inspect NATGateway ${id} ExternalIP"
+    external_ip_uid="$(jq -er '.metadata.uid' <<<"$external_ip_cr")" \
+        || die "NATGateway ${id} ExternalIP has no Kubernetes UID"
+    address="$(jq -er '.status.address' <<<"$external_ip_cr")" \
+        || die "NATGateway ${id} ExternalIP has no allocated address"
+
+    while ((SECONDS < deadline)); do
+        gateway_cr="$(nat_gateway_cr_json "$id" "$virtual_network_id" "$external_ip_id")" \
+            || die "Could not inspect NATGateway ${id} while waiting for source reconciliation"
+        phase="$(jq -r '.status.phase // ""' <<<"$gateway_cr")"
+        job="$(jq -c '[.status.provisioningJobs[]? | select(.type == "provision")] | last // {}' \
+            <<<"$gateway_cr")"
+        job_state="$(jq -r '.state // ""' <<<"$job")"
+        if [[ "$phase" == Failed || "$job_state" == Failed || "$job_state" == Canceled ]]; then
+            printf '%s\n' "$gateway_cr" >&2
+            die "NATGateway ${id} failed while reconciling Subnet sources"
+        fi
+        if [[ "$phase" == Ready && "$job_state" == Succeeded ]] \
+            && jq -e --arg uid "$uid" --arg id "$id" --argjson sources "$expected_sources" '
+              ([.nat_gateways[] | select(.uid == $uid and .fulfillment_id == $id)] | length) == 1
+              and ([.nat_gateways[] | select(.uid == $uid and .fulfillment_id == $id)][0]
+                | .phase == "ready"
+                  and .payload.phase == "ready"
+                  and .payload.source_cidrs == $sources
+                  and .payload.applied_source_cidrs == $sources
+                  and .payload.source_revision == .payload.applied_revision
+                  and .payload.cleanup_source_cidrs == [])' \
+                <<<"$(state_snapshot)" >/dev/null; then
+            nat_gateway_wait_for_ready "$id" "$virtual_network_id" "$external_ip_id" >&2
+            state="$(nat_gateway_assert_provider_state "$id" "$uid" "$virtual_network_uid" \
+                "$external_ip_uid" "$address" "$expected_sources")"
+            nat_gateway_assert_provider_rules "$id" "$uid" "$address" "$state" \
+                "$expected_sources"
+            printf '%s\n' "$state"
+            return 0
+        fi
+        sleep 2
+    done
+    die "Timed out waiting for NATGateway ${id} to reconcile Subnet source CIDRs"
+}
+
+nat_gateway_assert_provider_rules() {
+    local id="$1" uid="$2" address="$3" entry="$4" sources="$5"
+    local namespace namespace_interface next_hop nat_rules forward_rules bypass_rules
+    local source subnet_uid cidr owned count route first_hook forwarding_rules snat_line isolation_line
+    local owned_source_rules expected_source_count
+    namespace="$(jq -er '.payload.provider.namespace_name' <<<"$entry")"
+    namespace_interface="$(jq -er '.payload.provider.namespace_interface' <<<"$entry")"
+    next_hop="$(jq -er '.payload.provider.next_hop' <<<"$entry")"
+    nat_rules="$(netnode ip netns exec "$namespace" iptables -w -t nat -S POSTROUTING)" \
+        || die "Could not inspect NATGateway ${id} namespace SNAT rules"
+    owned_source_rules="$(grep -F -- "osac-ngw:${uid}:snat:" <<<"$nat_rules" || true)"
+    expected_source_count="$(jq -er 'length' <<<"$sources")" \
+        || die "Could not count NATGateway ${id} source Subnets"
+    if [[ -n "$owned_source_rules" ]]; then
+        count="$(wc -l <<<"$owned_source_rules" | tr -d ' ')"
+    else
+        count=0
+    fi
+    [[ "$count" == "$expected_source_count" ]] \
+        || die "NATGateway ${id} has stale or missing UID-owned source rules"
+    for source in $(jq -r '.[] | @base64' <<<"$sources"); do
+        subnet_uid="$(base64 -d <<<"$source" | jq -er '.subnet_uid')"
+        cidr="$(base64 -d <<<"$source" | jq -er '.cidr')"
+        owned="$(grep -F -- "osac-ngw:${uid}:snat:${subnet_uid}" <<<"$nat_rules" || true)"
+        count="$(wc -l <<<"$owned" | tr -d ' ')"
+        [[ "$count" == 1 && "$owned" == *"-s ${cidr}"* \
+            && "$owned" == *"-o ${namespace_interface}"* \
+            && "$owned" == *"--to-source ${address}"* && "$owned" == *"-j SNAT"* ]] \
+            || die "NATGateway ${id} does not have exactly one explicit SNAT rule for ${subnet_uid}"
+    done
+    forward_rules="$(netnode iptables -w -t filter -S OSAC-SNAT-FORWARD 2>/dev/null || true)"
+    owned="$(grep -F -- "osac-ngw:${uid}:forward-" <<<"$forward_rules" || true)"
+    count="$(wc -l <<<"$owned" | tr -d ' ')"
+    [[ "$count" == 2 ]] || die "NATGateway ${id} does not own exactly two host forwarding rules"
+    bypass_rules="$(netnode iptables -w -t nat -S OSAC-SNAT-BYPASS 2>/dev/null || true)"
+    owned="$(grep -F -- "osac-ngw:${uid}:bypass" <<<"$bypass_rules" || true)"
+    count="$(wc -l <<<"$owned" | tr -d ' ')"
+    [[ "$count" == 1 && "$owned" == *"-s ${address}/32"* && "$owned" == *"-j ACCEPT"* ]] \
+        || die "NATGateway ${id} does not own exactly one address-scoped MASQUERADE bypass rule"
+    first_hook="$(netnode iptables -w -t nat -S POSTROUTING \
+        | awk '$1 == "-A" && $2 == "POSTROUTING" {print; exit}')"
+    [[ "$first_hook" == "-A POSTROUTING -j OSAC-SNAT-BYPASS" ]] \
+        || die "NATGateway MASQUERADE bypass hook is not first in host POSTROUTING"
+    forwarding_rules="$(netnode iptables -w -t filter -S FORWARD)"
+    snat_line="$(grep -nF -- '-A FORWARD -j OSAC-SNAT-FORWARD' <<<"$forwarding_rules" | head -n 1 | cut -d: -f1)"
+    [[ -n "$snat_line" ]] || die "NATGateway host forwarding hook is missing"
+    isolation_line="$(grep -nF -- '-A FORWARD -j OSAC-VN-ISOLATION' <<<"$forwarding_rules" | head -n 1 | cut -d: -f1)"
+    if [[ -n "$isolation_line" && "$snat_line" -ge "$isolation_line" ]]; then
+        die "NATGateway forwarding hook is below the VirtualNetwork isolation hook"
+    fi
+    route="$(netnode vtysh -c "show ip route ${address}/32" 2>&1)" \
+        || die "Could not inspect the NATGateway local /32 route"
+    [[ "$route" == *"${address}/32"* && "$route" == *"via ${next_hop}"* ]] \
+        || die "NATGateway ${id} local /32 route does not use its saved next hop"
+}
+
+nat_gateway_assert_provider_absent() {
+    local uid="$1" address="$2" namespace="$3" state nat_rules forward_rules bypass_rules route conntrack address_pattern
+    state="$(state_snapshot)" || return 1
+    if jq -e --arg uid "$uid" 'any(.nat_gateways[]; .uid == $uid)' <<<"$state" >/dev/null; then
+        printf 'NATGateway provider row remains for UID %s\n' "$uid" >&2
+        return 1
+    fi
+    nat_rules="$(netnode ip netns exec "$namespace" iptables -w -t nat -S POSTROUTING 2>&1 || true)"
+    forward_rules="$(netnode iptables -w -t filter -S OSAC-SNAT-FORWARD 2>&1 || true)"
+    bypass_rules="$(netnode iptables -w -t nat -S OSAC-SNAT-BYPASS 2>&1 || true)"
+    if grep -Fq -- "osac-ngw:${uid}:" <<<"$nat_rules$forward_rules$bypass_rules"; then
+        printf 'NATGateway rules remain for UID %s\n' "$uid" >&2
+        return 1
+    fi
+    route="$(netnode vtysh -c "show ip route ${address}/32" 2>&1 || true)"
+    if grep -Fq -- "${address}/32" <<<"$route"; then
+        printf 'NATGateway local route %s remains after deletion\n' "$address" >&2
+        return 1
+    fi
+    conntrack="$(netnode ip netns exec "$namespace" conntrack -L -f ipv4 2>&1 || true)"
+    address_pattern="$(sed 's/\./\\./g' <<<"$address")"
+    if grep -E "(^| )(src|dst)=${address_pattern}([[:space:]]|$)" <<<"$conntrack"; then
+        printf 'NATGateway conntrack entries remain for address %s\n' "$address" >&2
+        return 1
+    fi
 }
 
 external_ip_validate_address() {
@@ -3694,6 +4304,284 @@ wait_for_external_ip_ready() {
         sleep 2
     done
     die "Timed out waiting for ExternalIP ${id} to become Ready"
+}
+
+create_nat_gateway() {
+    local name="$1" virtual_network_id="$2" external_ip_id="$3" output_file="$4"
+    local output id create_status=0
+    if "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" \
+        create natgateway --name "$name" --virtual-network "$virtual_network_id" \
+        --externalip "$external_ip_id" >"$output_file" 2>&1; then
+        create_status=0
+    else
+        create_status=$?
+    fi
+    output="$(cat "$output_file")" || return 1
+    printf '%s\n' "$output" >&2
+    id="$(sed -nE 's/.*\(ID: ([0-9a-f-]+)\).*/\1/p' <<<"$output" | tail -n 1)"
+    if [[ "$id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        CREATED_NAT_GATEWAY_IDS+=("$id")
+        printf '%s\n' "$id" >"${output_file}.id" || return 1
+    fi
+    [[ "$create_status" == 0 && "$id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+        || return 1
+    return 0
+}
+
+nat_gateway_wait_for_ready() {
+    local id="$1" virtual_network_id="$2" external_ip_id="$3"
+    local deadline=$((SECONDS + AAP_JOB_TIMEOUT + 300))
+    local crs count cr phase job job_id job_state uid generation ready details ip_cr vn_cr
+    LAST_NAT_GATEWAY_JOB_ID=""
+    LAST_NAT_GATEWAY_STATE=""
+    while ((SECONDS < deadline)); do
+        if ! crs="$(nat_gateway_crs_json "$id")"; then
+            die "Kubernetes API failed while looking up NATGateway UUID ${id}"
+        fi
+        count="$(jq -er '.items | length' <<<"$crs")" \
+            || die "Could not count NATGateway CRs for UUID ${id}"
+        if [[ "$count" == 0 ]]; then
+            sleep 2
+            continue
+        fi
+        [[ "$count" == 1 ]] || die "Expected one NATGateway CR for UUID ${id}; found ${count}"
+        cr="$(nat_gateway_cr_json "$id" "$virtual_network_id" "$external_ip_id")"
+        phase="$(jq -r '.status.phase // ""' <<<"$cr")"
+        job="$(jq -c '[.status.provisioningJobs[]? | select(.type == "provision")] | last // {}' <<<"$cr")"
+        job_id="$(jq -r '.jobID // ""' <<<"$job")"
+        job_state="$(jq -r '.state // ""' <<<"$job")"
+        LAST_NAT_GATEWAY_STATE="$phase"
+        if [[ "$phase" == Failed || "$job_state" == Failed || "$job_state" == Canceled ]]; then
+            printf '%s\n' "$cr" >&2
+            die "NATGateway ${id} failed provisioning"
+        fi
+        ready="$(jq -r 'any(.status.conditions[]?; .type == "Ready" and .status == "True")' <<<"$cr")"
+        if [[ "$phase" == Ready && "$ready" == true && "$job_state" == Succeeded && -n "$job_id" ]]; then
+            uid="$(jq -er '.metadata.uid' <<<"$cr")"
+            generation="$(jq -er '.metadata.generation' <<<"$cr")"
+            ip_cr="$(external_ip_cr_json "$external_ip_id")"
+            vn_cr="$(virtual_network_cr_json "$virtual_network_id")"
+            if ! details="$(nat_gateway_aap_job_details "$job_id" nat_gateway.ensure)"; then
+                die "Could not inspect successful NATGateway ensure job ${job_id}"
+            fi
+            nat_gateway_assert_ensure_job "$details" "$cr" "$ip_cr" "$vn_cr"
+            LAST_NAT_GATEWAY_JOB_ID="$job_id"
+            return 0
+        fi
+        sleep 2
+    done
+    die "Timed out waiting for NATGateway ${id} to become Ready"
+}
+
+nat_gateway_retry_and_verify() {
+    local id="$1" virtual_network_id="$2" external_ip_id="$3"
+    local cr cr_name uid generation original_job before_state after_state ip_address
+    cr="$(nat_gateway_cr_json "$id" "$virtual_network_id" "$external_ip_id")"
+    uid="$(jq -er '.metadata.uid' <<<"$cr")"
+    generation="$(jq -er '.metadata.generation' <<<"$cr")"
+    original_job="$(jq -er '[.status.provisioningJobs[]? | select(.type == "provision") | .jobID] | last' <<<"$cr")"
+    before_state="$(get_nat_gateway_state_entry "$uid" "$id")"
+    ip_address="$(jq -er '.status.address' <<<"$(external_ip_cr_json "$external_ip_id")")"
+    cr_name="$(jq -er '.metadata.name' <<<"$cr")"
+    oc patch natgateway "$cr_name" -n "$NETWORKING_NAMESPACE" --subresource=status \
+        --type=merge -p '{"status":{"phase":"Progressing","conditions":[],"provisioningJobs":[]}}' >/dev/null \
+        || die "Could not reset NATGateway ${id} status to exercise controller retry"
+    nat_gateway_wait_for_ready "$id" "$virtual_network_id" "$external_ip_id"
+    [[ "$LAST_NAT_GATEWAY_JOB_ID" != "$original_job" ]] \
+        || die "NATGateway retry did not create a new AAP job"
+    cr="$(nat_gateway_cr_json "$id" "$virtual_network_id" "$external_ip_id")"
+    [[ "$(jq -er '.metadata.uid' <<<"$cr")" == "$uid" \
+        && "$(jq -er '.metadata.generation' <<<"$cr")" == "$generation" \
+        && "$(jq -er '.status.address' <<<"$(external_ip_cr_json "$external_ip_id")")" == "$ip_address" ]] \
+        || die "NATGateway retry changed resource identity, generation, or ExternalIP"
+    after_state="$(get_nat_gateway_state_entry "$uid" "$id")"
+    jq -e --argjson before "$before_state" '
+      .uid == $before.uid
+      and .fulfillment_id == $before.fulfillment_id
+      and .external_ip_uid == $before.external_ip_uid
+      and .external_address == $before.external_address
+      and .virtual_network_uid == $before.virtual_network_uid
+      and .phase == $before.phase
+      and .payload.provider == $before.payload.provider
+      and .payload.source_cidrs == $before.payload.source_cidrs
+      and .payload.source_revision == $before.payload.source_revision
+      and .payload.applied_source_cidrs == $before.payload.applied_source_cidrs
+      and .payload.applied_revision == $before.payload.applied_revision
+      and .payload.cleanup_source_cidrs == $before.payload.cleanup_source_cidrs' <<<"$after_state" >/dev/null \
+        || die "NATGateway retry changed its UID-owned provider identity"
+}
+
+nat_gateway_add_hold_finalizer() {
+    local gateway_cr="$1" name="$2" uid="$3" finalizers resource_version patch_file
+    finalizers="$(jq -c '.metadata.finalizers // []' <<<"$gateway_cr")"
+    if jq -e --arg hold 'osac.openshift.io/e2e-hold-natgateway' \
+        'index($hold) != null' <<<"$finalizers" >/dev/null; then
+        return 0
+    fi
+    jq -e --arg operator 'osac.openshift.io/natgateway-finalizer' \
+        'index($operator) != null' <<<"$finalizers" >/dev/null \
+        || die "NATGateway ${uid} lacks its operator finalizer before test deletion"
+    resource_version="$(jq -er '.metadata.resourceVersion' <<<"$gateway_cr")"
+    patch_file="${TEMP_DIR}/nat-gateway-hold-finalizer-${uid}.json"
+    jq -n --arg rv "$resource_version" --arg uid "$uid" \
+        --arg name "$name" --arg hold 'osac.openshift.io/e2e-hold-natgateway' \
+        '[{op:"test",path:"/metadata/resourceVersion",value:$rv},
+          {op:"test",path:"/metadata/uid",value:$uid},
+          {op:"add",path:"/metadata/finalizers/-",value:$hold}]' >"$patch_file"
+    oc patch natgateway "$name" -n "$NETWORKING_NAMESPACE" --type=json \
+        --patch-file="$patch_file" >/dev/null \
+        || die "Could not add the NATGateway test hold finalizer"
+}
+
+nat_gateway_remove_hold_finalizer() {
+    local id="$1" virtual_network_id="$2" external_ip_id="$3" gateway_cr name uid rv finalizers
+    local patch_file
+    gateway_cr="$(nat_gateway_cr_json "$id" "$virtual_network_id" "$external_ip_id")" \
+        || return 1
+    name="$(jq -er '.metadata.name' <<<"$gateway_cr")" || return 1
+    uid="$(jq -er '.metadata.uid' <<<"$gateway_cr")" || return 1
+    rv="$(jq -er '.metadata.resourceVersion' <<<"$gateway_cr")" || return 1
+    finalizers="$(jq -c '.metadata.finalizers // []' <<<"$gateway_cr")" || return 1
+    jq -e --arg hold 'osac.openshift.io/e2e-hold-natgateway' \
+        'index($hold) != null' <<<"$finalizers" >/dev/null || return 1
+    patch_file="${TEMP_DIR}/nat-gateway-release-hold-${uid}.json"
+    jq -n --arg rv "$rv" --arg uid "$uid" --arg hold 'osac.openshift.io/e2e-hold-natgateway' \
+        --argjson finalizers "$finalizers" \
+        '[{op:"test",path:"/metadata/resourceVersion",value:$rv},
+          {op:"test",path:"/metadata/uid",value:$uid},
+          {op:"replace",path:"/metadata/finalizers",value:($finalizers | map(select(. != $hold)))}]' \
+        >"$patch_file" || return 1
+    oc patch natgateway "$name" -n "$NETWORKING_NAMESPACE" --type=json \
+        --patch-file="$patch_file" >/dev/null || return 1
+}
+
+delete_nat_gateway_and_verify() {
+    local id="$1" virtual_network_id="$2" external_ip_id="$3"
+    local gateway_cr name uid generation address vn_cr vn_uid entry namespace state provider_rows
+    local output_file crs count job job_id job_state finalizers deadline details
+    local operator_finalizer='osac.openshift.io/natgateway-finalizer'
+    local hold_finalizer='osac.openshift.io/e2e-hold-natgateway'
+    gateway_cr="$(nat_gateway_cr_json "$id" "$virtual_network_id" "$external_ip_id")" \
+        || return 1
+    name="$(jq -er '.metadata.name' <<<"$gateway_cr")" || return 1
+    uid="$(jq -er '.metadata.uid' <<<"$gateway_cr")" || return 1
+    generation="$(jq -er '.metadata.generation' <<<"$gateway_cr")" || return 1
+    address="$(jq -er '.status.address' <<<"$(external_ip_cr_json "$external_ip_id")")" || return 1
+    vn_cr="$(virtual_network_cr_json "$virtual_network_id")" || return 1
+    vn_uid="$(jq -er '.metadata.uid' <<<"$vn_cr")" || return 1
+    state="$(state_snapshot)" || return 1
+    provider_rows="$(jq -ce --arg uid "$uid" \
+        '[.nat_gateways[] | select(.uid == $uid)]' <<<"$state")" || return 1
+    [[ "$(jq -er 'length' <<<"$provider_rows")" -le 1 ]] || return 1
+    entry="$(jq -c '.[0] // empty' <<<"$provider_rows")"
+    if [[ -n "$entry" ]]; then
+        namespace="$(jq -er '.payload.provider.namespace_name' <<<"$entry")" || return 1
+    else
+        local vn_entry
+        vn_entry="$(get_state_entry "$vn_uid")" || return 1
+        namespace="$(jq -er '.namespace_name' <<<"$vn_entry")" || return 1
+    fi
+    if [[ -z "$(jq -r '.metadata.deletionTimestamp // ""' <<<"$gateway_cr")" ]]; then
+        nat_gateway_add_hold_finalizer "$gateway_cr" "$name" "$uid" || return 1
+        output_file="${TEMP_DIR}/delete-nat-gateway-${id}.out"
+        if ! "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" \
+            delete natgateway "$id" >"$output_file" 2>&1; then
+            cat "$output_file" >&2
+            printf 'Fulfillment could not delete test NATGateway %s\n' "$id" >&2
+            return 1
+        fi
+    fi
+    deadline=$((SECONDS + AAP_JOB_TIMEOUT + 300))
+    while ((SECONDS < deadline)); do
+        if ! crs="$(nat_gateway_crs_json "$id")"; then
+            printf 'Kubernetes API failed while waiting for NATGateway %s deletion\n' "$id" >&2
+            return 1
+        fi
+        count="$(jq -er '.items | length' <<<"$crs")" || return 1
+        [[ "$count" == 1 ]] || { printf 'NATGateway %s disappeared before its held result was verified\n' "$id" >&2; return 1; }
+        gateway_cr="$(jq -c '.items[0]' <<<"$crs")"
+        [[ "$(jq -r '.metadata.uid' <<<"$gateway_cr")" == "$uid" ]] \
+            || { printf 'NATGateway %s UID changed during deletion\n' "$id" >&2; return 1; }
+        job="$(jq -c '[.status.provisioningJobs[]? | select(.type == "deprovision")] | last // {}' <<<"$gateway_cr")"
+        job_id="$(jq -r '.jobID // ""' <<<"$job")"
+        job_state="$(jq -r '.state // ""' <<<"$job")"
+        if [[ "$job_state" == Failed || "$job_state" == Canceled ]]; then
+            printf 'NATGateway delete job %s ended in %s; retaining dependencies\n' "$job_id" "$job_state" >&2
+            return 1
+        fi
+        finalizers="$(jq -c '.metadata.finalizers // []' <<<"$gateway_cr")"
+        if [[ -n "$job_id" && "$job_state" == Succeeded ]] \
+            && ! jq -e --arg operator "$operator_finalizer" 'index($operator) != null' \
+                <<<"$finalizers" >/dev/null; then
+            if ! details="$(nat_gateway_aap_job_details "$job_id" nat_gateway.delete)"; then
+                printf 'Could not inspect NATGateway delete job %s; retaining dependencies\n' "$job_id" >&2
+                return 1
+            fi
+            nat_gateway_assert_delete_job "$details" "$gateway_cr" || return 1
+            [[ "$finalizers" == *"$hold_finalizer"* ]] \
+                || { printf 'NATGateway test hold finalizer was lost before result verification\n' >&2; return 1; }
+            break
+        fi
+        sleep 2
+    done
+    [[ "$SECONDS" -lt "$deadline" ]] \
+        || { printf 'Timed out waiting for NATGateway %s delete job/result\n' "$id" >&2; return 1; }
+    nat_gateway_assert_provider_absent "$uid" "$address" "$namespace" || return 1
+    local eip_cr eip_state
+    eip_cr="$(external_ip_cr_json "$external_ip_id")" || return 1
+    eip_state="$(jq -r '.status.state // ""' <<<"$eip_cr")"
+    [[ "$eip_state" == Allocated && "$(jq -r '.status.address' <<<"$eip_cr")" == "$address" ]] \
+        || { printf 'ExternalIP %s was released before NATGateway cleanup completed\n' "$external_ip_id" >&2; return 1; }
+    nat_gateway_remove_hold_finalizer "$id" "$virtual_network_id" "$external_ip_id" || return 1
+    deadline=$((SECONDS + 600))
+    while ((SECONDS < deadline)); do
+        crs="$(nat_gateway_crs_json "$id")" || return 1
+        count="$(jq -er '.items | length' <<<"$crs")" || return 1
+        [[ "$count" == 0 ]] && break
+        sleep 2
+    done
+    [[ "$count" == 0 ]] || { printf 'Timed out waiting for NATGateway %s removal\n' "$id" >&2; return 1; }
+    LAST_NAT_GATEWAY_CLEANUP_JOB_ID="$job_id"
+    local index
+    for index in "${!CREATED_NAT_GATEWAY_IDS[@]}"; do
+        if [[ "${CREATED_NAT_GATEWAY_IDS[$index]}" == "$id" ]]; then
+            unset 'CREATED_NAT_GATEWAY_IDS[index]'
+            unset 'CREATED_NAT_GATEWAY_UIDS[index]'
+        fi
+    done
+    info "NATGateway ${id} provider cleanup accepted by AAP job ${job_id}."
+}
+
+cleanup_created_nat_gateways() {
+    local id crs count cr virtual_network_id external_ip_id
+    [[ "${#CREATED_NAT_GATEWAY_IDS[@]}" -gt 0 ]] || return 0
+    [[ -n "$CLI_BIN" && -x "$CLI_BIN" && -n "$CLI_CONFIG_DIR" && -d "$CLI_CONFIG_DIR" ]] \
+        || return 1
+    for id in "${CREATED_NAT_GATEWAY_IDS[@]}"; do
+        [[ -n "$id" ]] || continue
+        if ! crs="$(nat_gateway_crs_json "$id")"; then
+            printf 'Could not inspect NATGateway %s during cleanup\n' "$id" >&2
+            return 1
+        fi
+        count="$(jq -er '.items | length' <<<"$crs")" || return 1
+        if [[ "$count" == 0 ]]; then
+            local state
+            state="$(state_snapshot)" || return 1
+            if jq -e --arg id "$id" 'any(.nat_gateways[]; .fulfillment_id == $id)' \
+                <<<"$state" >/dev/null; then
+                printf 'NATGateway %s is gone from Kubernetes but its provider row remains\n' "$id" >&2
+                return 1
+            fi
+            printf 'NATGateway %s disappeared before its provider cleanup could be verified\n' "$id" >&2
+            return 1
+        fi
+        [[ "$count" == 1 ]] || { printf 'Found multiple NATGateway CRs for %s\n' "$id" >&2; return 1; }
+        cr="$(jq -c '.items[0]' <<<"$crs")"
+        virtual_network_id="$(jq -er '.spec.virtualNetwork' <<<"$cr")" || return 1
+        external_ip_id="$(jq -er '.spec.externalIP' <<<"$cr")" || return 1
+        cr="$(nat_gateway_cr_json "$id" "$virtual_network_id" "$external_ip_id")" || return 1
+        delete_nat_gateway_and_verify "$id" "$virtual_network_id" "$external_ip_id" || return 1
+    done
 }
 
 external_ip_remove_created_id() {
@@ -4541,6 +5429,7 @@ cleanup_interrupted_dhcp_clients() {
 prepare_suite_cleanup() {
     local vn_filter subnet_filter eip_filter vn_items subnet_items eip_items
     local bmi_filter bmi_items attachment_filter attachment_items attachment_object attachment_id attachment_cr attachment_uid
+    local nat_gateway_filter nat_gateway_items nat_gateway_object nat_gateway_cr nat_gateway_crs nat_gateway_uid nat_gateway_vn_id nat_gateway_vn_uid nat_gateway_vn_cr nat_gateway_eip_id nat_gateway_eip_uid nat_gateway_eip_cr nat_gateway_id
     local pool_request pool_response pool_error pool_items external_ips state_before=""
     local pool_object pool_id pool_name pool_cidr pool_crs pool_count pool_cr pool_uid
     local pool_state pool_status allocated available total active_count
@@ -4548,6 +5437,7 @@ prepare_suite_cleanup() {
     local pool_ip_crs pool_ip_count pool_eip_ids_json selected_parent parent_id_candidate
     local provider_ip_rows provider_ip_count assigned_id
     local vn_ids_json subnet_ids_json pool_uids_json pool_ids_json eip_uids_json eip_ids_json attachment_uids_json attachment_ids_json
+    local nat_gateway_uids_json nat_gateway_ids_json selected_nat_gateway_ids_json nat_gateway_orphan_rows
     local snapshot synthetic_row synthetic_id synthetic_uid synthetic_eip_id synthetic_address
     local -a vn_ids=() vn_uids=() subnet_ids=() subnet_uids=()
     local -a pool_ids=() pool_uids=() pool_cidrs=() pool_eip_ids_jsons=()
@@ -4555,6 +5445,7 @@ prepare_suite_cleanup() {
     local -a eip_ids=() eip_uids=() assigned_eip_ids=()
     local -a bmi_ids=() bmi_uids=() attachment_ids=() attachment_uids=()
     local -a synthetic_attachment_ids=() synthetic_attachment_uids=()
+    local -a nat_gateway_ids=() nat_gateway_uids=() nat_gateway_vn_ids=() nat_gateway_eip_ids=()
     local -a pool_eip_ids=() pool_eip_uids=()
     local index
 
@@ -4696,6 +5587,77 @@ prepare_suite_cleanup() {
             attachment_ids+=("$attachment_id")
             attachment_uids+=("$attachment_uid")
         done < <(jq -r '.[].id' <<<"$attachment_items")
+    fi
+
+    nat_gateway_items='[]'
+    if [[ "$SUITE_USES_NAT_GATEWAY" == true ]]; then
+        nat_gateway_filter='this.metadata.name.startsWith("agentless-natgw-")'
+        nat_gateway_items="$(cleanup_cli_list_json natgateway "$nat_gateway_filter")" \
+            || die "Could not list test NATGateways for cleanup"
+        jq -e --arg tenant "$OSAC_TENANT" '
+          all(.[]; .metadata.tenant == $tenant
+            and (.metadata.name | startswith("agentless-natgw-"))
+            and (.id | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")))' \
+            <<<"$nat_gateway_items" >/dev/null \
+            || die "Fulfillment returned a NATGateway outside the test tenant or name scope"
+        if [[ "$(jq -er 'length' <<<"$nat_gateway_items")" -gt 0 ]]; then
+            state_before="$(state_snapshot)" \
+                || die "Could not read AgentlessNet state before NATGateway cleanup discovery"
+        fi
+        while IFS= read -r nat_gateway_object; do
+            [[ -n "$nat_gateway_object" ]] || continue
+            nat_gateway_id="$(jq -er '.id' <<<"$nat_gateway_object")"
+            nat_gateway_crs="$(nat_gateway_crs_json "$nat_gateway_id")" \
+                || die "Could not find NATGateway CR ${nat_gateway_id} during cleanup discovery"
+            [[ "$(jq -er '.items | length' <<<"$nat_gateway_crs")" == 1 ]] \
+                || die "NATGateway ${nat_gateway_id} has no unique Kubernetes CR"
+            nat_gateway_cr="$(jq -c '.items[0]' <<<"$nat_gateway_crs")"
+            nat_gateway_vn_id="$(jq -er '.spec.virtualNetwork' <<<"$nat_gateway_cr")" \
+                || die "NATGateway ${nat_gateway_id} has no VirtualNetwork reference"
+            nat_gateway_eip_id="$(jq -er '.spec.externalIP' <<<"$nat_gateway_cr")" \
+                || die "NATGateway ${nat_gateway_id} has no ExternalIP reference"
+            nat_gateway_cr="$(nat_gateway_cr_json "$nat_gateway_id" \
+                "$nat_gateway_vn_id" "$nat_gateway_eip_id")" \
+                || die "NATGateway ${nat_gateway_id} identity is outside cleanup scope"
+            selected_parent=false
+            for parent_id_candidate in "${vn_ids[@]}"; do
+                [[ "$parent_id_candidate" == "$nat_gateway_vn_id" ]] && selected_parent=true
+            done
+            [[ "$selected_parent" == true ]] \
+                || die "NATGateway ${nat_gateway_id} references a VirtualNetwork outside cleanup scope"
+            nat_gateway_uid="$(jq -er '.metadata.uid' <<<"$nat_gateway_cr")" \
+                || die "NATGateway ${nat_gateway_id} has no Kubernetes UID"
+            nat_gateway_vn_cr="$(virtual_network_cr_json "$nat_gateway_vn_id")" \
+                || die "NATGateway ${nat_gateway_id} VirtualNetwork CR is unavailable"
+            nat_gateway_vn_uid="$(jq -er '.metadata.uid' <<<"$nat_gateway_vn_cr")" \
+                || die "NATGateway ${nat_gateway_id} VirtualNetwork has no Kubernetes UID"
+            nat_gateway_eip_cr="$(external_ip_cr_json "$nat_gateway_eip_id")" \
+                || die "NATGateway ${nat_gateway_id} ExternalIP CR is unavailable"
+            nat_gateway_eip_uid="$(jq -er '.metadata.uid' <<<"$nat_gateway_eip_cr")" \
+                || die "NATGateway ${nat_gateway_id} ExternalIP has no Kubernetes UID"
+            local provider_rows provider_count
+            provider_rows="$(jq -ce --arg uid "$nat_gateway_uid" \
+                '[.nat_gateways[] | select(.uid == $uid)]' <<<"$state_before")" \
+                || die "Could not inspect saved NATGateway provider state"
+            provider_count="$(jq -er 'length' <<<"$provider_rows")"
+            [[ "$provider_count" -le 1 ]] \
+                || die "NATGateway ${nat_gateway_id} has duplicate provider rows"
+            if [[ "$provider_count" == 1 ]]; then
+                jq -e --arg id "$nat_gateway_id" --arg uid "$nat_gateway_uid" \
+                    --arg vn_uid "$nat_gateway_vn_uid" --arg eip_uid "$nat_gateway_eip_uid" \
+                    --arg tenant "$OSAC_TENANT" '
+                  .[0].uid == $uid
+                  and .[0].fulfillment_id == $id
+                  and .[0].tenant_id == $tenant
+                  and .[0].virtual_network_uid == $vn_uid
+                  and .[0].external_ip_uid == $eip_uid' <<<"$provider_rows" >/dev/null \
+                    || die "NATGateway ${nat_gateway_id} saved provider identity is outside cleanup scope"
+            fi
+            nat_gateway_ids+=("$nat_gateway_id")
+            nat_gateway_uids+=("$nat_gateway_uid")
+            nat_gateway_vn_ids+=("$nat_gateway_vn_id")
+            nat_gateway_eip_ids+=("$nat_gateway_eip_id")
+        done < <(jq -c '.[]' <<<"$nat_gateway_items")
     fi
 
     pool_items='[]'
@@ -4844,9 +5806,37 @@ prepare_suite_cleanup() {
         fi
     fi
 
+    if [[ "$SUITE_USES_NAT_GATEWAY" == true ]]; then
+        for nat_gateway_eip_id in "${nat_gateway_eip_ids[@]}"; do
+            local selected_nat_gateway_eip=false
+            for eip_id in "${eip_ids[@]}"; do
+                [[ "$eip_id" == "$nat_gateway_eip_id" ]] && selected_nat_gateway_eip=true
+            done
+            [[ "$selected_nat_gateway_eip" == true ]] \
+                || die "Test NATGateway references an ExternalIP outside the selected E2E pool"
+        done
+    fi
+
     if [[ -z "$state_before" ]]; then
         state_before="$(state_snapshot)" \
             || die "Could not snapshot AgentlessNet state before suite cleanup"
+    fi
+    if [[ "$SUITE_USES_NAT_GATEWAY" == true ]]; then
+        selected_nat_gateway_ids_json="$(cleanup_array_json "${nat_gateway_ids[@]}")"
+        nat_gateway_orphan_rows="$(jq -ce --arg tenant "$OSAC_TENANT" \
+            --arg custom_vn "$VIRTUAL_NETWORK_NAME_INPUT" \
+            --argjson ids "$selected_nat_gateway_ids_json" '
+          [.nat_gateways[]
+            | select(.tenant_id == $tenant
+              and ((.payload.context.external_ip.name // "") | startswith("agentless-eip-"))
+              and (((.payload.context.virtual_network.name // "") | startswith("agentless-smoke-vn-"))
+                or ($custom_vn != "" and
+                  ((.payload.context.virtual_network.name // "") | startswith($custom_vn)))))
+            | select((.fulfillment_id as $id | ($ids | index($id))) == null)]' \
+            <<<"$state_before")" \
+            || die "Could not check for orphaned test NATGateway provider rows"
+        [[ "$(jq -er 'length' <<<"$nat_gateway_orphan_rows")" == 0 ]] \
+            || die "Found a test NATGateway provider row without a matching test CR; preserving state for manual recovery"
     fi
     if [[ "$SUITE_USES_EXTERNAL_IP_ATTACHMENT" == true ]]; then
         while IFS= read -r synthetic_row; do
@@ -4904,6 +5894,8 @@ prepare_suite_cleanup() {
     CLEANUP_EIP_IDS=("${eip_ids[@]}")
     CLEANUP_ATTACHMENT_UIDS=("${attachment_uids[@]}" "${synthetic_attachment_uids[@]}")
     CLEANUP_ATTACHMENT_IDS=("${attachment_ids[@]}" "${synthetic_attachment_ids[@]}")
+    CLEANUP_NAT_GATEWAY_UIDS=("${nat_gateway_uids[@]}")
+    CLEANUP_NAT_GATEWAY_IDS=("${nat_gateway_ids[@]}")
     CLEANUP_SYNTHETIC_ATTACHMENT_UIDS=("${synthetic_attachment_uids[@]}")
     CLEANUP_SYNTHETIC_ATTACHMENT_IDS=("${synthetic_attachment_ids[@]}")
     CLEANUP_BMI_IDS=("${bmi_ids[@]}")
@@ -4913,6 +5905,8 @@ prepare_suite_cleanup() {
     CREATED_SUBNET_IDS=("${subnet_ids[@]}")
     CREATED_EXTERNAL_IP_IDS=("${eip_ids[@]}")
     CREATED_EXTERNAL_IP_ATTACHMENT_IDS=("${attachment_ids[@]}")
+    CREATED_NAT_GATEWAY_IDS=("${nat_gateway_ids[@]}")
+    CREATED_NAT_GATEWAY_UIDS=("${nat_gateway_uids[@]}")
     CREATED_SYNTHETIC_EXTERNAL_IP_ATTACHMENT_IDS=("${synthetic_attachment_ids[@]}")
     CREATED_SYNTHETIC_EXTERNAL_IP_ATTACHMENT_UIDS=("${synthetic_attachment_uids[@]}")
     CREATED_BARE_METAL_INSTANCE_IDS=("${bmi_ids[@]}")
@@ -4925,10 +5919,13 @@ prepare_suite_cleanup() {
     eip_ids_json="$(cleanup_array_json "${CLEANUP_EIP_IDS[@]}")"
     attachment_uids_json="$(cleanup_array_json "${CLEANUP_ATTACHMENT_UIDS[@]}")"
     attachment_ids_json="$(cleanup_array_json "${CLEANUP_ATTACHMENT_IDS[@]}")"
+    nat_gateway_uids_json="$(cleanup_array_json "${CLEANUP_NAT_GATEWAY_UIDS[@]}")"
+    nat_gateway_ids_json="$(cleanup_array_json "${CLEANUP_NAT_GATEWAY_IDS[@]}")"
     jq --argjson vns "$vn_ids_json" --argjson subnets "$subnet_ids_json" \
         --argjson pools "$pool_uids_json" --argjson pool_ids "$pool_ids_json" \
         --argjson ips "$eip_uids_json" --argjson ip_ids "$eip_ids_json" \
-        --argjson attachments "$attachment_uids_json" --argjson attachment_ids "$attachment_ids_json" '
+        --argjson attachments "$attachment_uids_json" --argjson attachment_ids "$attachment_ids_json" \
+        --argjson nat_gateways "$nat_gateway_uids_json" --argjson nat_gateway_ids "$nat_gateway_ids_json" '
       .virtual_networks |= map(select((.uid as $uid | ($vns | index($uid))) == null))
       | .subnets |= map(select((.uid as $uid | ($subnets | index($uid))) == null))
       | .external_ip_pools |= map(select(
@@ -4939,7 +5936,10 @@ prepare_suite_cleanup() {
           and (.fulfillment_id as $id | ($ip_ids | index($id))) == null))
       | .external_ip_attachments |= map(select(
           (.uid as $uid | ($attachments | index($uid))) == null
-          and (.fulfillment_id as $id | ($attachment_ids | index($id))) == null))' \
+          and (.fulfillment_id as $id | ($attachment_ids | index($id))) == null))
+      | .nat_gateways |= map(select(
+          (.uid as $uid | ($nat_gateways | index($uid))) == null
+          and (.fulfillment_id as $id | ($nat_gateway_ids | index($id))) == null))' \
         "$CURRENT_STATE_FILE" >"$BASELINE_STATE_FILE" \
         || die "Could not compute the unrelated provider-state baseline for cleanup"
     CLEANUP_DISCOVERY_COMPLETE=true
@@ -4947,7 +5947,19 @@ prepare_suite_cleanup() {
         CLEANUP_CLIENTS_COMPLETE=false
     fi
 
-    info "Suite cleanup found ${#CLEANUP_ATTACHMENT_IDS[@]} ExternalIPAttachments (${#CLEANUP_SYNTHETIC_ATTACHMENT_IDS[@]} synthetic), ${#CLEANUP_EIP_IDS[@]} ExternalIPs, ${#CLEANUP_BMI_IDS[@]} legacy BMaaS instances, ${#CLEANUP_POOL_IDS[@]} test pools, ${#CREATED_SUBNET_IDS[@]} Subnets, and ${#CREATED_IDS[@]} VirtualNetworks."
+    info "Suite cleanup found ${#CLEANUP_NAT_GATEWAY_IDS[@]} NATGateways, ${#CLEANUP_ATTACHMENT_IDS[@]} ExternalIPAttachments (${#CLEANUP_SYNTHETIC_ATTACHMENT_IDS[@]} synthetic), ${#CLEANUP_EIP_IDS[@]} ExternalIPs, ${#CLEANUP_BMI_IDS[@]} legacy BMaaS instances, ${#CLEANUP_POOL_IDS[@]} test pools, ${#CREATED_SUBNET_IDS[@]} Subnets, and ${#CREATED_IDS[@]} VirtualNetworks."
+    if [[ "$SUITE_USES_NAT_GATEWAY" == true ]]; then
+        if ! cleanup_created_nat_gateways; then
+            CLEANUP_CLIENTS_COMPLETE=false
+            PRESERVE_E2E_RECOVERY_ARTIFACTS=true
+            die "Could not clean up all test NATGateways; preserving clients, ExternalIPs, pool, Subnets, VirtualNetworks, endpoint, routes, and AAP configuration"
+        fi
+        if ! cleanup_nat_gateway_endpoint; then
+            CLEANUP_CLIENTS_COMPLETE=false
+            PRESERVE_E2E_RECOVERY_ARTIFACTS=true
+            die "Could not remove the NATGateway test endpoint; preserving dependent test resources and AAP configuration"
+        fi
+    fi
     if [[ "${#CREATED_EXTERNAL_IP_ATTACHMENT_IDS[@]}" -gt 0 \
         || "${#CREATED_SYNTHETIC_EXTERNAL_IP_ATTACHMENT_IDS[@]}" -gt 0 ]]; then
         cleanup_created_external_ip_attachments \
@@ -5034,6 +6046,13 @@ verify_suite_cleanup_provider_state() {
             return 1
         fi
     done
+    for uid in "${CLEANUP_NAT_GATEWAY_UIDS[@]}"; do
+        if jq -e --arg uid "$uid" 'any(.nat_gateways[]; .uid == $uid)' \
+            <<<"$current" >/dev/null; then
+            printf 'Deleted test NATGateway provider row remains for UID %s\n' "$uid" >&2
+            return 1
+        fi
+    done
 
     if [[ -s "$CLEANUP_STATE_FILE" ]]; then
         while IFS= read -r entry; do
@@ -5108,7 +6127,7 @@ verify_suite_cleanup_provider_state() {
             "$CLEANUP_STATE_FILE")
     fi
 
-    for collection in virtual_networks subnets external_ip_pools external_ips external_ip_attachments; do
+    for collection in virtual_networks subnets external_ip_pools external_ips external_ip_attachments nat_gateways; do
         baseline_uids="$(jq -r --arg collection "$collection" \
             'if (.[$collection] | type) != "array" then error("invalid state collection") else .[$collection][].uid end' \
             "$BASELINE_STATE_FILE")" || return 1
@@ -5130,31 +6149,46 @@ verify_suite_cleanup_provider_state() {
 
 cleanup_created_virtual_networks() {
     local cleanup_incomplete=false
+    local test_nat_gateways_clean=true
     local test_vns_clean=true test_subnets_clean=true test_external_ips_clean=true test_external_ip_pool_clean=true
     local test_external_ip_attachments_clean=true test_baremetal_instances_clean=true routes_clean=true
     local id selector current
-    if ! cleanup_created_external_ip_attachments; then
+    if [[ "$SUITE_USES_NAT_GATEWAY" == true ]] && ! cleanup_created_nat_gateways; then
+        test_nat_gateways_clean=false
+        printf 'ERROR: preserving clients, ExternalIPs, pool, Subnets, VirtualNetworks, endpoint, routes, and AAP configuration because NATGateway cleanup is incomplete\n' >&2
+        cleanup_incomplete=true
+    elif [[ "$SUITE_USES_NAT_GATEWAY" == true ]] && ! cleanup_nat_gateway_endpoint; then
+        test_nat_gateways_clean=false
+        printf 'ERROR: preserving test dependencies and AAP configuration because NATGateway endpoint cleanup is incomplete\n' >&2
+        cleanup_incomplete=true
+    fi
+    if [[ "$test_nat_gateways_clean" == true ]] && ! cleanup_created_external_ip_attachments; then
         test_external_ip_attachments_clean=false
         printf 'ERROR: preserving test ExternalIPs, DHCP target, Subnet, VirtualNetwork, route, and provider state because detach cleanup is incomplete\n' >&2
         cleanup_incomplete=true
+    elif [[ "$test_nat_gateways_clean" != true ]]; then
+        test_external_ip_attachments_clean=false
     fi
-    if [[ "$test_external_ip_attachments_clean" == true ]] && ! remove_external_ip_client_routes; then
+    if [[ "$test_nat_gateways_clean" == true && "$test_external_ip_attachments_clean" == true ]] \
+        && ! remove_external_ip_client_routes; then
         routes_clean=false
         printf 'ERROR: preserving test ExternalIPs and network resources because upstream route cleanup is incomplete\n' >&2
         cleanup_incomplete=true
     fi
-    if [[ "$test_external_ip_attachments_clean" == true && "$routes_clean" == true ]] \
+    if [[ "$test_nat_gateways_clean" == true && "$test_external_ip_attachments_clean" == true \
+        && "$routes_clean" == true ]] \
         && ! cleanup_created_external_ips; then
         test_external_ips_clean=false
         printf 'ERROR: preserving test ExternalIPs and provider state because cleanup is incomplete\n' >&2
         cleanup_incomplete=true
     fi
-    if [[ "$test_external_ip_attachments_clean" == true && "$routes_clean" == true \
+    if [[ "$test_nat_gateways_clean" == true && "$test_external_ip_attachments_clean" == true \
+        && "$routes_clean" == true \
         && "$test_external_ips_clean" == true ]] && ! cleanup_created_external_ip_pool; then
         test_external_ip_pool_clean=false
         printf 'ERROR: preserving the ExternalIPPool and provider access because pool cleanup is incomplete\n' >&2
         cleanup_incomplete=true
-    elif [[ "$test_external_ip_attachments_clean" != true || "$routes_clean" != true \
+    elif [[ "$test_nat_gateways_clean" != true || "$test_external_ip_attachments_clean" != true || "$routes_clean" != true \
         || "$test_external_ips_clean" != true ]]; then
         test_external_ip_pool_clean=false
     fi
@@ -5165,7 +6199,8 @@ cleanup_created_virtual_networks() {
         printf 'ERROR: preserving provider access; test ExternalIPPool cleanup is incomplete\n' >&2
         cleanup_incomplete=true
     fi
-    if [[ "$test_external_ips_clean" == true && "$test_external_ip_pool_clean" == true \
+    if [[ "$test_nat_gateways_clean" == true && "$test_external_ips_clean" == true \
+        && "$test_external_ip_pool_clean" == true \
         && "$test_external_ip_attachments_clean" == true && "$routes_clean" == true \
         && "${#CREATED_BARE_METAL_INSTANCE_IDS[@]}" -gt 0 ]] \
         && ! cleanup_created_bare_metal_instances; then
@@ -5173,18 +6208,20 @@ cleanup_created_virtual_networks() {
         printf 'ERROR: preserving target Subnet and VirtualNetwork because legacy BMaaS cleanup is incomplete\n' >&2
         cleanup_incomplete=true
     fi
-    if [[ "$test_external_ip_attachments_clean" == true && "$routes_clean" == true \
+    if [[ "$test_nat_gateways_clean" == true && "$test_external_ip_attachments_clean" == true \
+        && "$routes_clean" == true \
         && "$test_external_ips_clean" == true && "$test_external_ip_pool_clean" == true \
         && "$test_baremetal_instances_clean" == true ]] && ! cleanup_created_subnets; then
         test_subnets_clean=false
         printf 'ERROR: test-owned Subnet cleanup is incomplete; preserving its provider and DHCP state for recovery\n' >&2
         cleanup_incomplete=true
-    elif [[ "$test_external_ip_attachments_clean" != true || "$routes_clean" != true \
+    elif [[ "$test_nat_gateways_clean" != true || "$test_external_ip_attachments_clean" != true || "$routes_clean" != true \
         || "$test_external_ips_clean" != true || "$test_external_ip_pool_clean" != true \
         || "$test_baremetal_instances_clean" != true ]]; then
         test_subnets_clean=false
     fi
-    if [[ "$test_subnets_clean" == true && -n "$CLI_BIN" && -x "$CLI_BIN" \
+    if [[ "$test_nat_gateways_clean" == true && "$test_subnets_clean" == true \
+        && -n "$CLI_BIN" && -x "$CLI_BIN" \
         && -n "$CLI_CONFIG_DIR" && -d "$CLI_CONFIG_DIR" ]]; then
         for id in "${CREATED_IDS[@]}"; do
             local selector current
@@ -5216,6 +6253,7 @@ cleanup_created_virtual_networks() {
     done
     if [[ "${CLEANUP_MODE:-false}" == true \
         && "${CLEANUP_DISCOVERY_COMPLETE:-false}" == true \
+        && "$test_nat_gateways_clean" == true \
         && "$test_external_ip_attachments_clean" == true && "$routes_clean" == true \
         && "$test_external_ips_clean" == true \
         && "$test_external_ip_pool_clean" == true && "$test_baremetal_instances_clean" == true \
@@ -5226,7 +6264,8 @@ cleanup_created_virtual_networks() {
             cleanup_incomplete=true
         fi
     fi
-    if [[ "$test_external_ip_attachments_clean" == true && "$routes_clean" == true \
+    if [[ "$test_nat_gateways_clean" == true \
+        && "$test_external_ip_attachments_clean" == true && "$routes_clean" == true \
         && "$test_external_ips_clean" == true && "$test_external_ip_pool_clean" == true \
         && "$test_baremetal_instances_clean" == true \
         && "$test_subnets_clean" == true \
@@ -5255,6 +6294,10 @@ cleanup_created_virtual_networks() {
             printf 'ERROR: could not disconnect the temporary Docker bridge from the Containerlab network node\n' >&2
             cleanup_incomplete=true
         fi
+        if [[ "$SUITE_USES_NAT_GATEWAY" == true ]] && ! restore_nat_gateway_uplink; then
+            printf 'ERROR: could not restore the original NATGateway AAP uplink setting\n' >&2
+            cleanup_incomplete=true
+        fi
         if ! restore_provider_inventory_config; then
             printf 'ERROR: could not restore the original network-fulfillment-ig inventory state\n' >&2
             cleanup_incomplete=true
@@ -5264,7 +6307,9 @@ cleanup_created_virtual_networks() {
             cleanup_incomplete=true
         fi
     else
-        if [[ "$test_external_ip_pool_clean" != true ]]; then
+        if [[ "$test_nat_gateways_clean" != true ]]; then
+            printf 'ERROR: preserving clients, endpoints, routes, ExternalIPs, Subnets, VirtualNetworks, and AAP configuration because NATGateway cleanup is incomplete\n' >&2
+        elif [[ "$test_external_ip_pool_clean" != true ]]; then
             printf 'ERROR: preserving AAP inventory and provider access because ExternalIPPool cleanup is incomplete\n' >&2
         elif [[ "$test_external_ip_attachments_clean" != true ]]; then
             printf 'ERROR: preserving EIPs, DHCP target, Subnet, VirtualNetwork, provider state, and route because ExternalIPAttachment cleanup is incomplete\n' >&2
@@ -5416,6 +6461,19 @@ on_exit() {
         && ! export_dhcp_debug_artifacts; then
         printf 'ERROR: could not preserve the requested DHCP debug artifacts\n' >&2
         cleanup_status=1
+    fi
+    if [[ "${CLEANUP_MODE:-false}" != true && "$SUITE_USES_NAT_GATEWAY" == true ]]; then
+        if ! cleanup_created_nat_gateways; then
+            printf 'ERROR: NATGateway cleanup is incomplete; preserving clients, ExternalIPs, pool, Subnets, VirtualNetworks, endpoint, routes, and AAP configuration\n' >&2
+            cleanup_status=1
+            provider_cleanup_allowed=false
+            PRESERVE_E2E_RECOVERY_ARTIFACTS=true
+        elif ! cleanup_nat_gateway_endpoint; then
+            printf 'ERROR: NATGateway endpoint cleanup is incomplete; preserving dependent resources and AAP configuration\n' >&2
+            cleanup_status=1
+            provider_cleanup_allowed=false
+            PRESERVE_E2E_RECOVERY_ARTIFACTS=true
+        fi
     fi
     if [[ "${CLEANUP_MODE:-false}" != true \
         && "$SUITE_USES_EXTERNAL_IP_ATTACHMENT" == true \
@@ -6977,6 +8035,7 @@ if not path.exists():
         "external_ip_pools": [],
         "external_ips": [],
         "external_ip_attachments": [],
+        "nat_gateways": [],
     }, sort_keys=True))
     raise SystemExit(0)
 expected_virtual_network_columns = {
@@ -6998,6 +8057,10 @@ expected_attachment_columns = {
     "uid", "fulfillment_id", "tenant_id", "external_ip_uid",
     "virtual_network_uid", "subnet_uid", "external_address", "phase", "payload",
 }
+expected_nat_gateway_columns = {
+    "uid", "fulfillment_id", "tenant_id", "external_ip_uid",
+    "virtual_network_uid", "external_address", "phase", "payload",
+}
 connection = None
 try:
     connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=60)
@@ -7008,8 +8071,9 @@ try:
     }
     version = connection.execute("PRAGMA user_version").fetchone()[0]
     legacy_tables = {"virtual_networks", "subnets", "external_ip_pools", "external_ips"}
-    expected_tables = legacy_tables | {"attachments"}
-    if version != 1 or tables not in (legacy_tables, expected_tables):
+    attachment_tables = legacy_tables | {"attachments"}
+    current_tables = attachment_tables | {"nat_gateways"}
+    if version != 1 or tables not in (legacy_tables, attachment_tables, current_tables):
         raise SystemExit("AgentlessNet SQLite state is incompatible with schema v1; preserving it")
 
     virtual_network_columns = {
@@ -7034,12 +8098,19 @@ try:
             row[1]
             for row in connection.execute("PRAGMA table_info(attachments)")
         }
+    nat_gateway_columns = set()
+    if "nat_gateways" in tables:
+        nat_gateway_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(nat_gateways)")
+        }
     if (
         virtual_network_columns != expected_virtual_network_columns
         or subnet_columns != expected_subnet_columns
         or external_ip_pool_columns != expected_external_ip_pool_columns
         or external_ip_columns != expected_external_ip_columns
         or ("attachments" in tables and attachment_columns != expected_attachment_columns)
+        or ("nat_gateways" in tables and nat_gateway_columns != expected_nat_gateway_columns)
     ):
         raise SystemExit("AgentlessNet SQLite table definitions are incompatible with schema v1; preserving it")
 
@@ -7095,6 +8166,23 @@ try:
                FROM attachments ORDER BY uid"""
         )
     ] if "attachments" in tables else []
+    nat_gateway_entries = [
+        {
+            "uid": row[0],
+            "fulfillment_id": row[1],
+            "tenant_id": row[2],
+            "external_ip_uid": row[3],
+            "virtual_network_uid": row[4],
+            "external_address": row[5],
+            "phase": row[6],
+            "payload": json.loads(row[7]),
+        }
+        for row in connection.execute(
+            """SELECT uid, fulfillment_id, tenant_id, external_ip_uid,
+                      virtual_network_uid, external_address, phase, payload
+               FROM nat_gateways ORDER BY uid"""
+        )
+    ] if "nat_gateways" in tables else []
 except (OSError, sqlite3.DatabaseError, json.JSONDecodeError) as error:
     raise SystemExit("AgentlessNet SQLite state is unreadable; preserving it") from error
 finally:
@@ -7107,6 +8195,7 @@ print(json.dumps({
     "external_ip_pools": external_ip_pool_entries,
     "external_ips": external_ip_entries,
     "external_ip_attachments": attachment_entries,
+    "nat_gateways": nat_gateway_entries,
 }, sort_keys=True))
 PY
 }
@@ -7118,14 +8207,15 @@ save_current_state() {
       and (.subnets | type == "array")
       and (.external_ip_pools | type == "array")
       and (.external_ips | type == "array")
-      and (.external_ip_attachments | type == "array")' \
+      and (.external_ip_attachments | type == "array")
+      and (.nat_gateways | type == "array")' \
         "$CURRENT_STATE_FILE" >/dev/null \
         || die "AgentlessNet state is not a valid schema-v1 snapshot"
 }
 
 assert_baseline_state_unchanged() {
     local collection uid before after
-    for collection in virtual_networks subnets external_ip_pools external_ips external_ip_attachments; do
+    for collection in virtual_networks subnets external_ip_pools external_ips external_ip_attachments nat_gateways; do
         while IFS= read -r uid; do
             [[ -n "$uid" ]] || continue
             before="$(jq -cS --arg uid "$uid" --arg collection "$collection" \
@@ -7162,6 +8252,15 @@ get_external_ip_pool_state_entry() {
     jq -ceS --arg uid "$uid" --arg id "$fulfillment_id" '
       [.external_ip_pools[] | select(.uid == $uid and .fulfillment_id == $id)]
       | if length == 1 then .[0] else error("expected exactly one ExternalIPPool state entry") end' \
+      "$CURRENT_STATE_FILE"
+}
+
+get_nat_gateway_state_entry() {
+    local uid="$1" fulfillment_id="$2"
+    save_current_state
+    jq -ceS --arg uid "$uid" --arg id "$fulfillment_id" '
+      [.nat_gateways[] | select(.uid == $uid and .fulfillment_id == $id)]
+      | if length == 1 then .[0] else error("expected exactly one NATGateway provider state entry") end' \
       "$CURRENT_STATE_FILE"
 }
 
@@ -7706,6 +8805,106 @@ PY
     read -r SUBNET_ONE_IPV4_CIDR SUBNET_TWO_IPV4_CIDR <<<"$subnet_output"
 }
 
+resolve_nat_gateway_subnet_cidrs() {
+    local parent_cidr="$1" first_transit="$2" peer_transit="$3" override_one="" override_two="" selected
+    [[ "$SUBNET_ONE_IPV4_CIDR_EXPLICIT" == true ]] && override_one="$SUBNET_ONE_IPV4_CIDR"
+    [[ "$SUBNET_TWO_IPV4_CIDR_EXPLICIT" == true ]] && override_two="$SUBNET_TWO_IPV4_CIDR"
+    selected="$(python3 - "$parent_cidr" "$first_transit" "$peer_transit" \
+        "$override_one" "$override_two" <<'PY'
+import ipaddress
+import sys
+
+parent = ipaddress.ip_network(sys.argv[1], strict=True)
+transits = [ipaddress.ip_network(value, strict=True) for value in sys.argv[2:4]]
+overrides = sys.argv[4:6]
+if not isinstance(parent, ipaddress.IPv4Network) or any(
+    not isinstance(value, ipaddress.IPv4Network) for value in transits
+):
+    raise SystemExit("NATGateway VLAN lab requires IPv4 parent and transit networks")
+if any(not value.subnet_of(parent) for value in transits):
+    raise SystemExit("Both VirtualNetwork transit ranges must be inside the shared test CIDR")
+
+def validate(value: str, label: str):
+    network = ipaddress.ip_network(value, strict=True)
+    if not isinstance(network, ipaddress.IPv4Network) or network.prefixlen > 30 or str(network) != value:
+        raise SystemExit(f"{label} must be a canonical IPv4 subnet of /30 or larger")
+    if not network.subnet_of(parent) or any(network.overlaps(transit) for transit in transits):
+        raise SystemExit(f"{label} must be inside the parent and outside both transit ranges")
+    return network
+
+if overrides[0]:
+    first = validate(overrides[0], "SUBNET_ONE_IPV4_CIDR")
+else:
+    prefix = max(parent.prefixlen + 1, 24)
+    if prefix > 30:
+        raise SystemExit("VirtualNetwork CIDR is too small for NATGateway DHCP Subnets")
+    first = next((candidate for candidate in parent.subnets(new_prefix=prefix)
+                  if not any(candidate.overlaps(transit) for transit in transits)), None)
+    if first is None:
+        raise SystemExit("VirtualNetwork CIDR has no test Subnet outside both transit ranges")
+
+if overrides[1]:
+    second = validate(overrides[1], "SUBNET_TWO_IPV4_CIDR")
+else:
+    second = next((candidate for candidate in parent.subnets(new_prefix=first.prefixlen)
+                   if not candidate.overlaps(first)
+                   and not any(candidate.overlaps(transit) for transit in transits)), None)
+    if second is None:
+        raise SystemExit("VirtualNetwork CIDR has no second test Subnet outside transit and the first Subnet")
+if first.overlaps(second) or first.network_address + 2 >= first.broadcast_address - 1:
+    raise SystemExit("NATGateway test Subnets must be disjoint and the first must support two DHCP clients")
+print(first, second)
+PY
+    )" || die "Could not select NATGateway Subnet CIDRs outside both transit links"
+    read -r NAT_GATEWAY_SUBNET_ONE_CIDR NAT_GATEWAY_SUBNET_TWO_CIDR <<<"$selected"
+}
+
+create_nat_gateway_subnet() {
+    local name="$1" parent_id="$2" cidr="$3" output_file="$4" id cr uid job_id
+    create_subnet "$name" "$parent_id" "$cidr" "$output_file" \
+        || die "Could not create NATGateway test Subnet ${name}"
+    id="$(<"${output_file}.id")"
+    wait_for_subnet_ready "$id" "$parent_id"
+    cr="$(subnet_cr_json "$id" "$parent_id")"
+    uid="$(jq -er '.metadata.uid' <<<"$cr")" \
+        || die "NATGateway test Subnet ${id} has no Kubernetes UID"
+    job_id="$(jq -er '.status.provisioningJobs | map(.jobID // empty) | last' <<<"$cr")" \
+        || die "NATGateway test Subnet ${id} has no AAP provision job"
+    wait_for_subnet_aap_provision_success "$id" "$parent_id" "$job_id"
+    assert_subnet_state "$id" "$parent_id" "$cidr"
+    LAST_NAT_GATEWAY_SUBNET_ID="$id"
+    LAST_NAT_GATEWAY_SUBNET_UID="$uid"
+    LAST_NAT_GATEWAY_SUBNET_CIDR="$cidr"
+}
+
+ensure_nat_gateway_dhcp_client() {
+    local client="$1" container tracked=false
+    container="$(client_container "$client")"
+    for tracked in "${DHCP_CLIENT_CONTAINERS[@]}"; do
+        [[ "$tracked" == "$container" ]] && return 0
+    done
+    if docker inspect "$container" >/dev/null 2>&1; then
+        die "DHCP client ${container} exists outside this run; recover its prior run before NATGateway testing"
+    fi
+    docker image inspect "$CLIENT_IMAGE" >/dev/null 2>&1 || docker pull "$CLIENT_IMAGE"
+    create_dhcp_client_container "$client"
+}
+
+attach_nat_gateway_dhcp_client() {
+    local client="$1" subnet_id="$2" subnet_entry="$3"
+    ensure_nat_gateway_dhcp_client "$client"
+    if [[ "${CLIENT_ATTACHMENT_PENDING[$client]:-false}" == true \
+        || "${CLIENT_ATTACHMENT_ACTIVE[$client]:-false}" == true ]]; then
+        detach_dhcp_client "$client"
+    fi
+    attach_client_to_subnet "$client" "$subnet_id"
+    start_dhcp_client "$client"
+    discover_client_dhcp_lease "$client"
+    write_client_lease_expectations "$client=$subnet_entry"
+    assert_real_client_leases "$client"
+    assert_client_gateway "$client" "$subnet_entry"
+}
+
 resolve_test_subnet_30_cidr() {
     local parent_cidr="$1" transit_cidr="$2" used_cidr="$3" subnet_output
     subnet_output="$(python3 - "$parent_cidr" "$transit_cidr" "$used_cidr" \
@@ -8138,6 +9337,364 @@ save_current_state
 assert_baseline_state_unchanged
 }
 
+create_nat_gateway_virtual_networks() {
+    local output_file create_status=0
+    if [[ -z "${FIRST_FULFILLMENT_ID:-}" ]]; then
+        create_primary_virtual_network_for_suite
+    fi
+    if [[ -z "${SECOND_FULFILLMENT_ID:-}" ]]; then
+        output_file="${TEMP_DIR}/create-natgw-peer-vn.out"
+        if create_virtual_network "$PEER_VIRTUAL_NETWORK_NAME" "$output_file"; then
+            create_status=0
+        else
+            create_status=$?
+        fi
+        if [[ -s "${output_file}.id" ]]; then
+            SECOND_FULFILLMENT_ID="$(<"${output_file}.id")"
+            CREATED_IDS+=("$SECOND_FULFILLMENT_ID")
+        fi
+        [[ "$create_status" == 0 && -n "$SECOND_FULFILLMENT_ID" ]] \
+            || die "Could not create NATGateway peer VirtualNetwork"
+        wait_for_virtual_network_ready "$SECOND_FULFILLMENT_ID"
+        SECOND_CR="$(virtual_network_cr_json "$SECOND_FULFILLMENT_ID")"
+        SECOND_CR_NAME="$(jq -er '.metadata.name' <<<"$SECOND_CR")"
+        SECOND_K8S_UID="$(jq -er '.metadata.uid' <<<"$SECOND_CR")"
+        SECOND_AAP_JOB_ID="$(jq -er '.status.provisioningJobs | map(.jobID // empty) | last' <<<"$SECOND_CR")"
+        wait_for_aap_provision_success "$SECOND_FULFILLMENT_ID" "$SECOND_AAP_JOB_ID"
+        SECOND_ENTRY="$(get_state_entry "$SECOND_K8S_UID")"
+        SECOND_NAMESPACE_NAME="$(jq -r '.namespace_name' <<<"$SECOND_ENTRY")"
+        SECOND_HOST_INTERFACE="$(jq -r '.uplink.host_interface' <<<"$SECOND_ENTRY")"
+        assert_virtual_network_state "$SECOND_FULFILLMENT_ID" "$VIRTUAL_NETWORK_IPV4_CIDR"
+    fi
+    assert_private_vn_isolation "$FIRST_FULFILLMENT_ID" "$SECOND_FULFILLMENT_ID"
+    save_current_state
+    assert_baseline_state_unchanged
+}
+
+nat_gateway_create_subnets() {
+    local first_entry second_entry first_transit second_transit output_file
+    first_entry="$(get_state_entry "$FIRST_K8S_UID")"
+    second_entry="$(get_state_entry "$SECOND_K8S_UID")"
+    first_transit="$(jq -er '.transit.cidr' <<<"$first_entry")" \
+        || die "Primary VirtualNetwork has no saved transit CIDR"
+    second_transit="$(jq -er '.transit.cidr' <<<"$second_entry")" \
+        || die "Peer VirtualNetwork has no saved transit CIDR"
+    resolve_nat_gateway_subnet_cidrs "$VIRTUAL_NETWORK_IPV4_CIDR" \
+        "$first_transit" "$second_transit"
+
+    output_file="${TEMP_DIR}/create-natgw-subnet-a1.out"
+    create_nat_gateway_subnet "$NAT_GATEWAY_SUBNET_ONE_NAME" "$FIRST_FULFILLMENT_ID" \
+        "$NAT_GATEWAY_SUBNET_ONE_CIDR" "$output_file"
+    NAT_GATEWAY_SUBNET_ONE_ID="$LAST_NAT_GATEWAY_SUBNET_ID"
+    NAT_GATEWAY_SUBNET_ONE_UID="$LAST_NAT_GATEWAY_SUBNET_UID"
+    NAT_GATEWAY_SUBNET_ONE_ENTRY="$(get_subnet_state_entry "$NAT_GATEWAY_SUBNET_ONE_UID")"
+    output_file="${TEMP_DIR}/create-natgw-subnet-peer.out"
+    create_nat_gateway_subnet "$NAT_GATEWAY_PEER_SUBNET_NAME" "$SECOND_FULFILLMENT_ID" \
+        "$NAT_GATEWAY_SUBNET_ONE_CIDR" "$output_file"
+    NAT_GATEWAY_PEER_SUBNET_ID="$LAST_NAT_GATEWAY_SUBNET_ID"
+    NAT_GATEWAY_PEER_SUBNET_UID="$LAST_NAT_GATEWAY_SUBNET_UID"
+    NAT_GATEWAY_PEER_SUBNET_ENTRY="$(get_subnet_state_entry "$NAT_GATEWAY_PEER_SUBNET_UID")"
+    [[ "$NAT_GATEWAY_SUBNET_ONE_UID" != "$NAT_GATEWAY_PEER_SUBNET_UID" ]] \
+        || die "Overlapping VirtualNetworks unexpectedly received the same Subnet UID"
+}
+
+nat_gateway_expect_create_rejected() {
+    local name="$1" virtual_network_id="$2" external_ip_id="$3"
+    local output_file="$4" before_state="$5" before_cr_count after_state after_cr_count output id
+    before_cr_count="$(oc get natgateways -n "$NETWORKING_NAMESPACE" -o json \
+        | jq -er --arg prefix "$NAT_GATEWAY_PREFIX" \
+            '[.items[] | select(.metadata.name | startswith($prefix))] | length')" \
+        || die "Could not snapshot NATGateway CR count before a negative Create"
+    if "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" \
+        create natgateway --name "$name" --virtual-network "$virtual_network_id" \
+        --externalip "$external_ip_id" >"$output_file" 2>&1; then
+        output="$(cat "$output_file")"
+        id="$(sed -nE 's/.*\(ID: ([0-9a-f-]+)\).*/\1/p' <<<"$output" | tail -n 1)"
+        if [[ "$id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            CREATED_NAT_GATEWAY_IDS+=("$id")
+        fi
+        die "Fulfillment unexpectedly accepted invalid NATGateway create ${name}"
+    fi
+    output="$(cat "$output_file")" || die "Could not read rejected NATGateway Create output"
+    printf '%s\n' "$output" >&2
+    grep -Eiq 'already|in use|one NAT|unique|FailedPrecondition|InvalidArgument' <<<"$output" \
+        || die "NATGateway ${name} failed for an unexpected reason"
+    after_cr_count="$(oc get natgateways -n "$NETWORKING_NAMESPACE" -o json \
+        | jq -er --arg prefix "$NAT_GATEWAY_PREFIX" \
+            '[.items[] | select(.metadata.name | startswith($prefix))] | length')" \
+        || die "Could not verify NATGateway CR count after a negative Create"
+    [[ "$after_cr_count" == "$before_cr_count" ]] \
+        || die "Rejected NATGateway create ${name} left an unexpected Kubernetes CR"
+    after_state="$(state_snapshot)" || die "Could not inspect provider state after rejected NATGateway Create"
+    jq -e --argjson before "$before_state" '
+      .nat_gateways == $before.nat_gateways
+      and .external_ips == $before.external_ips' <<<"$after_state" >/dev/null \
+        || die "Rejected NATGateway create ${name} changed consumer or ExternalIP provider state"
+}
+
+nat_gateway_ensure_client_container() {
+    local client="$1" container tracked
+    container="$(client_container "$client")"
+    for tracked in "${DHCP_CLIENT_CONTAINERS[@]}"; do
+        [[ "$tracked" == "$container" ]] && return 0
+    done
+    if docker inspect "$container" >/dev/null 2>&1; then
+        die "DHCP client ${container} exists outside this run; recover its prior run before NATGateway testing"
+    fi
+    docker image inspect "$CLIENT_IMAGE" >/dev/null 2>&1 || docker pull "$CLIENT_IMAGE"
+    create_dhcp_client_container "$client"
+}
+
+nat_gateway_attach_client() {
+    local client="$1" subnet_id="$2" subnet_entry="$3"
+    nat_gateway_ensure_client_container "$client"
+    if [[ "${CLIENT_ATTACHMENT_PENDING[$client]:-false}" == true \
+        || "${CLIENT_ATTACHMENT_ACTIVE[$client]:-false}" == true ]]; then
+        detach_dhcp_client "$client"
+    fi
+    attach_client_to_subnet "$client" "$subnet_id"
+    start_dhcp_client "$client"
+    discover_client_dhcp_lease "$client"
+    assert_client_gateway "$client" "$subnet_entry"
+}
+
+nat_gateway_assert_client_leases() {
+    local specs=() client entry subnet_id
+    for client in "$@"; do
+        case "$client" in
+            a1) entry="$(get_subnet_state_entry "$NAT_GATEWAY_SUBNET_ONE_UID")" ;;
+            a2)
+                subnet_id="${CLIENT_ATTACHMENT_SUBNET[$client]:-}"
+                if [[ "$subnet_id" == "$NAT_GATEWAY_SUBNET_TWO_ID" ]]; then
+                    entry="$(get_subnet_state_entry "$NAT_GATEWAY_SUBNET_TWO_UID")"
+                else
+                    entry="$(get_subnet_state_entry "$NAT_GATEWAY_SUBNET_ONE_UID")"
+                fi
+                ;;
+            b1) entry="$(get_subnet_state_entry "$NAT_GATEWAY_PEER_SUBNET_UID")" ;;
+            *) die "Unknown NATGateway DHCP client ${client}" ;;
+        esac
+        specs+=("${client}=${entry}")
+    done
+    write_client_lease_expectations "${specs[@]}"
+    assert_real_client_leases "$@"
+}
+
+run_nat_gateway_lifecycle() {
+    local pool_status total output_file source_one source_two sources_empty
+    local source_primary_one source_primary_two source_peer before_state after_state
+    local gateway_cr gateway_entry ip_cr peer_entry peer_address peer_eip_state_before_a_delete
+    configure_nat_gateway_uplink
+    prepare_nat_gateway_endpoint
+
+    if [[ "${EXTERNAL_IP_POOL_PENDING_CLEANUP:-false}" != true ]]; then
+        die "NATGateway lifecycle requires a test-owned ExternalIPPool"
+    fi
+    pool_status="$(external_ip_pool_get_json)" \
+        || die "Could not read ExternalIPPool capacity before NATGateway tests"
+    total="$(jq -er '.object.status.total | tonumber' <<<"$pool_status")" \
+        || die "ExternalIPPool has no total capacity"
+    EXTERNAL_IP_POOL_INITIAL_AVAILABLE="$(jq -er '.object.status.available | tonumber' <<<"$pool_status")" \
+        || die "ExternalIPPool has no available capacity"
+    EXTERNAL_IP_POOL_INITIAL_ALLOCATED="$(jq -er '(.object.status.allocated // 0) | tonumber' <<<"$pool_status")" \
+        || die "ExternalIPPool has an invalid allocated counter"
+    [[ "$total" -ge 2 && "$EXTERNAL_IP_POOL_INITIAL_ALLOCATED" == 0 ]] \
+        || die "NATGateway test pool must have at least two free addresses and no existing allocations"
+
+    output_file="${TEMP_DIR}/create-natgw-external-ip-a.out"
+    create_external_ip "$EXTERNAL_IP_ONE_NAME" "$output_file" \
+        || die "Could not create NATGateway test ExternalIP A"
+    EXTERNAL_IP_ONE_ID="$(<"${output_file}.id")"
+    external_ip_pool_wait_for_delta 1
+    wait_for_external_ip_ready "$EXTERNAL_IP_ONE_ID"
+    EXTERNAL_IP_ONE_UID="$LAST_EXTERNAL_IP_UID"
+    EXTERNAL_IP_ONE_ADDRESS="$LAST_EXTERNAL_IP_ADDRESS"
+    output_file="${TEMP_DIR}/create-natgw-external-ip-b.out"
+    create_external_ip "$EXTERNAL_IP_TWO_NAME" "$output_file" \
+        || die "Could not create NATGateway test ExternalIP B"
+    EXTERNAL_IP_TWO_ID="$(<"${output_file}.id")"
+    external_ip_pool_wait_for_delta 2
+    wait_for_external_ip_ready "$EXTERNAL_IP_TWO_ID"
+    EXTERNAL_IP_TWO_UID="$LAST_EXTERNAL_IP_UID"
+    EXTERNAL_IP_TWO_ADDRESS="$LAST_EXTERNAL_IP_ADDRESS"
+    [[ "$EXTERNAL_IP_ONE_ADDRESS" != "$EXTERNAL_IP_TWO_ADDRESS" ]] \
+        || die "NATGateway test ExternalIPs received the same address"
+
+    FIRST_ENTRY="$(get_state_entry "$FIRST_K8S_UID")"
+    SECOND_ENTRY="$(get_state_entry "$SECOND_K8S_UID")"
+    jq -e --arg uid "$FIRST_K8S_UID" --arg peer "$SECOND_K8S_UID" \
+        'all(.subnets[]; .virtual_network_uid != $uid and .virtual_network_uid != $peer)' \
+        "$CURRENT_STATE_FILE" >/dev/null \
+        || die "NATGateway empty-VirtualNetwork case requires both test VirtualNetworks to have no Subnets"
+    sources_empty='[]'
+    output_file="${TEMP_DIR}/create-natgw-a.out"
+    create_nat_gateway "$NAT_GATEWAY_ONE_NAME" "$FIRST_FULFILLMENT_ID" \
+        "$EXTERNAL_IP_ONE_ID" "$output_file" \
+        || die "Could not create NATGateway A"
+    NAT_GATEWAY_ONE_ID="$(<"${output_file}.id")"
+    nat_gateway_wait_for_ready "$NAT_GATEWAY_ONE_ID" "$FIRST_FULFILLMENT_ID" "$EXTERNAL_IP_ONE_ID"
+    gateway_cr="$(nat_gateway_cr_json "$NAT_GATEWAY_ONE_ID" "$FIRST_FULFILLMENT_ID" "$EXTERNAL_IP_ONE_ID")"
+    NAT_GATEWAY_ONE_UID="$(jq -er '.metadata.uid' <<<"$gateway_cr")"
+    NAT_GATEWAY_ONE_INITIAL_STATE="$(nat_gateway_assert_provider_state \
+        "$NAT_GATEWAY_ONE_ID" "$NAT_GATEWAY_ONE_UID" "$FIRST_K8S_UID" \
+        "$EXTERNAL_IP_ONE_UID" "$EXTERNAL_IP_ONE_ADDRESS" "$sources_empty")"
+    nat_gateway_assert_provider_rules "$NAT_GATEWAY_ONE_ID" "$NAT_GATEWAY_ONE_UID" \
+        "$EXTERNAL_IP_ONE_ADDRESS" "$NAT_GATEWAY_ONE_INITIAL_STATE" "$sources_empty"
+    FIRST_ENTRY="$(get_state_entry "$FIRST_K8S_UID")"
+    FIRST_NAMESPACE_NAME="$(jq -er '.namespace_name' <<<"$FIRST_ENTRY")"
+
+    before_state="$(state_snapshot)" || die "Could not snapshot NATGateway state before negative creates"
+    output_file="${TEMP_DIR}/reject-natgw-duplicate-vn.out"
+    nat_gateway_expect_create_rejected "${NAT_GATEWAY_PREFIX}-duplicate-vn" \
+        "$FIRST_FULFILLMENT_ID" "$EXTERNAL_IP_TWO_ID" "$output_file" "$before_state"
+    output_file="${TEMP_DIR}/reject-natgw-duplicate-eip.out"
+    nat_gateway_expect_create_rejected "${NAT_GATEWAY_PREFIX}-duplicate-eip" \
+        "$SECOND_FULFILLMENT_ID" "$EXTERNAL_IP_ONE_ID" "$output_file" "$before_state"
+
+    output_file="${TEMP_DIR}/create-natgw-peer.out"
+    create_nat_gateway "$NAT_GATEWAY_TWO_NAME" "$SECOND_FULFILLMENT_ID" \
+        "$EXTERNAL_IP_TWO_ID" "$output_file" \
+        || die "Could not create NATGateway peer gateway"
+    NAT_GATEWAY_TWO_ID="$(<"${output_file}.id")"
+    nat_gateway_wait_for_ready "$NAT_GATEWAY_TWO_ID" "$SECOND_FULFILLMENT_ID" "$EXTERNAL_IP_TWO_ID"
+    gateway_cr="$(nat_gateway_cr_json "$NAT_GATEWAY_TWO_ID" "$SECOND_FULFILLMENT_ID" "$EXTERNAL_IP_TWO_ID")"
+    NAT_GATEWAY_TWO_UID="$(jq -er '.metadata.uid' <<<"$gateway_cr")"
+    NAT_GATEWAY_TWO_INITIAL_STATE="$(nat_gateway_assert_provider_state \
+        "$NAT_GATEWAY_TWO_ID" "$NAT_GATEWAY_TWO_UID" "$SECOND_K8S_UID" \
+        "$EXTERNAL_IP_TWO_UID" "$EXTERNAL_IP_TWO_ADDRESS" "$sources_empty")"
+    nat_gateway_assert_provider_rules "$NAT_GATEWAY_TWO_ID" "$NAT_GATEWAY_TWO_UID" \
+        "$EXTERNAL_IP_TWO_ADDRESS" "$NAT_GATEWAY_TWO_INITIAL_STATE" "$sources_empty"
+    assert_private_vn_isolation "$FIRST_FULFILLMENT_ID" "$SECOND_FULFILLMENT_ID"
+
+    nat_gateway_create_subnets
+    source_one="$(jq -cnS --arg uid "$NAT_GATEWAY_SUBNET_ONE_UID" \
+        --arg cidr "$NAT_GATEWAY_SUBNET_ONE_CIDR" '[{subnet_uid:$uid,cidr:$cidr}]')"
+    source_peer="$(jq -cnS --arg uid "$NAT_GATEWAY_PEER_SUBNET_UID" \
+        --arg cidr "$NAT_GATEWAY_SUBNET_ONE_CIDR" '[{subnet_uid:$uid,cidr:$cidr}]')"
+    NAT_GATEWAY_ONE_INITIAL_STATE="$(nat_gateway_wait_for_provider_sources \
+        "$NAT_GATEWAY_ONE_ID" "$FIRST_FULFILLMENT_ID" "$EXTERNAL_IP_ONE_ID" "$source_one")"
+    NAT_GATEWAY_TWO_INITIAL_STATE="$(nat_gateway_wait_for_provider_sources \
+        "$NAT_GATEWAY_TWO_ID" "$SECOND_FULFILLMENT_ID" "$EXTERNAL_IP_TWO_ID" "$source_peer")"
+    peer_entry="$NAT_GATEWAY_TWO_INITIAL_STATE"
+    peer_eip_state_before_a_delete="$(external_ip_state_entry "$EXTERNAL_IP_TWO_UID" "$EXTERNAL_IP_TWO_ID")"
+
+    nat_gateway_attach_client a1 "$NAT_GATEWAY_SUBNET_ONE_ID" "$NAT_GATEWAY_SUBNET_ONE_ENTRY"
+    nat_gateway_attach_client a2 "$NAT_GATEWAY_SUBNET_ONE_ID" "$NAT_GATEWAY_SUBNET_ONE_ENTRY"
+    nat_gateway_attach_client b1 "$NAT_GATEWAY_PEER_SUBNET_ID" "$NAT_GATEWAY_PEER_SUBNET_ENTRY"
+    nat_gateway_assert_client_leases a1 a2 b1
+    assert_same_subnet_l2 a1 a2
+    assert_private_vn_isolation "$FIRST_FULFILLMENT_ID" "$SECOND_FULFILLMENT_ID"
+    add_external_ip_client_route "$EXTERNAL_IP_ONE_ADDRESS" \
+        || die "Could not add the NATGateway A test-only return route"
+    add_external_ip_client_route "$EXTERNAL_IP_TWO_ADDRESS" \
+        || die "Could not add the NATGateway peer test-only return route"
+    wait_for_nat_gateway_source a1 "$EXTERNAL_IP_ONE_ADDRESS"
+    wait_for_nat_gateway_source a2 "$EXTERNAL_IP_ONE_ADDRESS"
+    wait_for_nat_gateway_source b1 "$EXTERNAL_IP_TWO_ADDRESS"
+
+    info "Retrying NATGateway A for the same UID and provider identity..."
+    nat_gateway_retry_and_verify "$NAT_GATEWAY_ONE_ID" "$FIRST_FULFILLMENT_ID" "$EXTERNAL_IP_ONE_ID"
+    NAT_GATEWAY_ONE_INITIAL_STATE="$(nat_gateway_assert_provider_state \
+        "$NAT_GATEWAY_ONE_ID" "$NAT_GATEWAY_ONE_UID" "$FIRST_K8S_UID" \
+        "$EXTERNAL_IP_ONE_UID" "$EXTERNAL_IP_ONE_ADDRESS" "$source_one")"
+    nat_gateway_assert_provider_rules "$NAT_GATEWAY_ONE_ID" "$NAT_GATEWAY_ONE_UID" \
+        "$EXTERNAL_IP_ONE_ADDRESS" "$NAT_GATEWAY_ONE_INITIAL_STATE" "$source_one"
+    wait_for_nat_gateway_source a1 "$EXTERNAL_IP_ONE_ADDRESS"
+    wait_for_nat_gateway_source b1 "$EXTERNAL_IP_TWO_ADDRESS"
+
+    info "Adding a second Subnet under NATGateway A and moving client a2..."
+    output_file="${TEMP_DIR}/create-natgw-subnet-a2.out"
+    create_nat_gateway_subnet "$NAT_GATEWAY_SUBNET_TWO_NAME" "$FIRST_FULFILLMENT_ID" \
+        "$NAT_GATEWAY_SUBNET_TWO_CIDR" "$output_file"
+    NAT_GATEWAY_SUBNET_TWO_ID="$LAST_NAT_GATEWAY_SUBNET_ID"
+    NAT_GATEWAY_SUBNET_TWO_UID="$LAST_NAT_GATEWAY_SUBNET_UID"
+    NAT_GATEWAY_SUBNET_TWO_ENTRY="$(get_subnet_state_entry "$NAT_GATEWAY_SUBNET_TWO_UID")"
+    source_two="$(jq -cnS --arg uid "$NAT_GATEWAY_SUBNET_TWO_UID" \
+        --arg cidr "$NAT_GATEWAY_SUBNET_TWO_CIDR" \
+        '[{subnet_uid:$uid,cidr:$cidr}]')"
+    source_primary_two="$(jq -cnS --argjson first "$source_one" --argjson second "$source_two" \
+        '$first + $second | sort_by(.subnet_uid,.cidr)')"
+    NAT_GATEWAY_ONE_INITIAL_STATE="$(nat_gateway_wait_for_provider_sources \
+        "$NAT_GATEWAY_ONE_ID" "$FIRST_FULFILLMENT_ID" "$EXTERNAL_IP_ONE_ID" \
+        "$source_primary_two")"
+    nat_gateway_attach_client a2 "$NAT_GATEWAY_SUBNET_TWO_ID" "$NAT_GATEWAY_SUBNET_TWO_ENTRY"
+    nat_gateway_assert_client_leases a1 a2 b1
+    wait_for_nat_gateway_source a2 "$EXTERNAL_IP_ONE_ADDRESS"
+    wait_for_nat_gateway_source b1 "$EXTERNAL_IP_TWO_ADDRESS"
+
+    info "Deleting Subnet A2 and verifying its SNAT source is removed before cleanup..."
+    detach_dhcp_client a2
+    delete_subnet_by_id "$NAT_GATEWAY_SUBNET_TWO_ID"
+    assert_uid_subnet_state_absent "$NAT_GATEWAY_SUBNET_TWO_UID" "$FIRST_K8S_UID" \
+        "$FIRST_NAMESPACE_NAME" \
+        "$(jq -er '.vlan_interface' <<<"$NAT_GATEWAY_SUBNET_TWO_ENTRY")" \
+        "$(jq -er '.vlan_id' <<<"$NAT_GATEWAY_SUBNET_TWO_ENTRY")"
+    NAT_GATEWAY_ONE_INITIAL_STATE="$(nat_gateway_wait_for_provider_sources \
+        "$NAT_GATEWAY_ONE_ID" "$FIRST_FULFILLMENT_ID" "$EXTERNAL_IP_ONE_ID" "$source_one")"
+    nat_gateway_assert_client_leases a1 b1
+    wait_for_nat_gateway_source a1 "$EXTERNAL_IP_ONE_ADDRESS"
+    wait_for_nat_gateway_source b1 "$EXTERNAL_IP_TWO_ADDRESS"
+
+    info "Deleting Subnet A1 and verifying the gateway retains its address and route with no sources..."
+    detach_dhcp_client a1
+    delete_subnet_by_id "$NAT_GATEWAY_SUBNET_ONE_ID"
+    assert_uid_subnet_state_absent "$NAT_GATEWAY_SUBNET_ONE_UID" "$FIRST_K8S_UID" \
+        "$FIRST_NAMESPACE_NAME" \
+        "$(jq -er '.vlan_interface' <<<"$NAT_GATEWAY_SUBNET_ONE_ENTRY")" \
+        "$(jq -er '.vlan_id' <<<"$NAT_GATEWAY_SUBNET_ONE_ENTRY")"
+    NAT_GATEWAY_ONE_INITIAL_STATE="$(nat_gateway_wait_for_provider_sources \
+        "$NAT_GATEWAY_ONE_ID" "$FIRST_FULFILLMENT_ID" "$EXTERNAL_IP_ONE_ID" "$sources_empty")"
+    wait_for_nat_gateway_source b1 "$EXTERNAL_IP_TWO_ADDRESS"
+
+    info "Deleting NATGateway A before releasing its ExternalIP..."
+    delete_nat_gateway_and_verify "$NAT_GATEWAY_ONE_ID" "$FIRST_FULFILLMENT_ID" "$EXTERNAL_IP_ONE_ID" \
+        || die "NATGateway A cleanup failed; retaining ExternalIP and network resources"
+    remove_external_ip_client_route "$EXTERNAL_IP_ONE_ADDRESS" \
+        || die "Could not remove the NATGateway A test-only return route"
+    delete_external_ip_and_verify "$EXTERNAL_IP_ONE_ID" "$EXTERNAL_IP_ONE_UID" 1
+    wait_for_nat_gateway_source b1 "$EXTERNAL_IP_TWO_ADDRESS"
+    [[ "$(get_nat_gateway_state_entry "$NAT_GATEWAY_TWO_UID" "$NAT_GATEWAY_TWO_ID")" \
+        == "$peer_entry" ]] \
+        || die "NATGateway A deletion altered the peer NATGateway provider state"
+    [[ "$(external_ip_state_entry "$EXTERNAL_IP_TWO_UID" "$EXTERNAL_IP_TWO_ID")" \
+        == "$peer_eip_state_before_a_delete" ]] \
+        || die "NATGateway A deletion altered the peer ExternalIP state"
+
+    info "Deleting the peer NATGateway while its Subnet still exists..."
+    detach_dhcp_client b1
+    delete_nat_gateway_and_verify "$NAT_GATEWAY_TWO_ID" "$SECOND_FULFILLMENT_ID" "$EXTERNAL_IP_TWO_ID" \
+        || die "Peer NATGateway cleanup failed; retaining its ExternalIP and Subnet"
+    remove_external_ip_client_route "$EXTERNAL_IP_TWO_ADDRESS" \
+        || die "Could not remove the peer NATGateway test-only return route"
+    delete_external_ip_and_verify "$EXTERNAL_IP_TWO_ID" "$EXTERNAL_IP_TWO_UID" 0
+    delete_subnet_by_id "$NAT_GATEWAY_PEER_SUBNET_ID"
+    assert_uid_subnet_state_absent "$NAT_GATEWAY_PEER_SUBNET_UID" "$SECOND_K8S_UID" \
+        "$SECOND_NAMESPACE_NAME" \
+        "$(jq -er '.vlan_interface' <<<"$NAT_GATEWAY_PEER_SUBNET_ENTRY")" \
+        "$(jq -er '.vlan_id' <<<"$NAT_GATEWAY_PEER_SUBNET_ENTRY")"
+    cleanup_nat_gateway_endpoint \
+        || die "Could not remove the NATGateway test endpoint after provider cleanup"
+    external_ip_pool_wait_for_delta 0
+    save_current_state
+    assert_baseline_state_unchanged
+    info "NATGateway SNAT, source observation, retry, Subnet churn, peer isolation, and cleanup passed."
+}
+
+run_nat_gateway_suite() {
+    info "Creating the local NATGateway test pool and overlapping VirtualNetworks..."
+    create_external_ip_pool
+    create_nat_gateway_virtual_networks
+    run_nat_gateway_lifecycle
+    info "Deleting the NATGateway test VirtualNetworks and ExternalIPPool..."
+    delete_virtual_network_by_id "$FIRST_FULFILLMENT_ID"
+    FIRST_DELETE_AAP_JOB_ID="$LAST_DELETE_AAP_JOB_ID"
+    delete_virtual_network_by_id "$SECOND_FULFILLMENT_ID"
+    SECOND_DELETE_AAP_JOB_ID="$LAST_DELETE_AAP_JOB_ID"
+    delete_external_ip_pool
+    save_current_state
+    assert_baseline_state_unchanged
+}
+
 run_full_suite() {
 info "Creating and verifying one shared IPv4 ExternalIPPool through Fulfillment..."
 create_external_ip_pool
@@ -8232,6 +9789,10 @@ if [[ "$SUITE_USES_EXTERNAL_IP_ATTACHMENT" == true ]]; then
     info "Running ExternalIP allocation, retry, ingress, detach, and capacity checks..."
     run_external_ip_lifecycle
     delete_subnet_by_id "$EXTERNAL_IP_ATTACHMENT_SUBNET_ID"
+fi
+if [[ "$SUITE_USES_NAT_GATEWAY" == true ]]; then
+    info "Running local NATGateway SNAT, source observation, retry, and Subnet lifecycle checks..."
+    run_nat_gateway_lifecycle
 fi
 info "Deleting the first test VirtualNetwork and verifying its peer remains provisioned..."
 FIRST_PEER_ENTRY="$(get_state_entry "$SECOND_K8S_UID" | jq -cS '.')"
@@ -8331,7 +9892,7 @@ if [[ "$CLEANUP_MODE" == true ]]; then
         || [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINERLAB_NET_NODE")" != true ]]; then
         die "The existing Containerlab network node is unavailable; cleanup will not deploy the fabric"
     fi
-    if [[ "$SUITE_USES_EXTERNAL_IP_ATTACHMENT" == true ]] \
+    if [[ "$SUITE_USES_EXTERNAL_ROUTING" == true ]] \
         && { ! docker inspect "$CONTAINERLAB_UPSTREAM_ROUTER" >/dev/null 2>&1 \
             || [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINERLAB_UPSTREAM_ROUTER")" != true ]]; }; then
         die "The existing upstream-router test client is unavailable; cleanup will not deploy the fabric"
@@ -8348,6 +9909,10 @@ if [[ "$CLEANUP_MODE" == true ]]; then
             || die "Could not configure AAP Kubernetes authentication for cleanup of interrupted DHCP clients"
     fi
     prepare_aap_networking_instance_group
+    if [[ "$SUITE_USES_NAT_GATEWAY" == true ]]; then
+        configure_nat_gateway_uplink \
+            || die "Could not adopt the guarded NATGateway uplink override for cleanup"
+    fi
 
     if [[ "$SUITE_USES_CLI" == true ]]; then
         info "Building a temporary local Fulfillment CLI for cleanup..."
@@ -8385,7 +9950,8 @@ jq -e '(.schema_version == 0 or .schema_version == 1)
       and (.subnets | type == "array")
       and (.external_ip_pools | type == "array")
       and (.external_ips | type == "array")
-      and (.external_ip_attachments | type == "array")' \
+      and (.external_ip_attachments | type == "array")
+      and (.nat_gateways | type == "array")' \
     "$BASELINE_STATE_FILE" >/dev/null \
     || die "AgentlessNet state must be empty or use the current schema v1 before the test starts"
 
@@ -8396,6 +9962,7 @@ case "$VLAN_E2E_SUITE" in
     subnet-dhcp) run_subnet_dhcp_suite ;;
     external-ip-pool) run_external_ip_pool_suite ;;
     external-ip) run_external_ip_suite ;;
+    nat-gateway) run_nat_gateway_suite ;;
 esac
 
 HOST_IP_FORWARDING_AFTER="$(netnode sysctl -n net.ipv4.ip_forward)"
@@ -8408,7 +9975,7 @@ if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
 fi
 case "$VLAN_E2E_SUITE" in
     full)
-        info "Existing-lab AgentlessNet E2E passed: ExternalIP allocation/retry/release and synthetic-target ExternalIPAttachment ingress, overlapping VirtualNetworks, VN and Subnet retries, internal VLAN exclusion, AAP DHCP attachment and lease lookup for test clients, gateway and same-Subnet L2 traffic across leaves, DHCP service restart, /30 lease, peer-preserving lifecycle, and ordered cleanup."
+        info "Local AgentlessNet VLAN lab E2E passed: ExternalIP allocation/retry/release and synthetic-target ExternalIPAttachment ingress, NATGateway SNAT and observed source address, Subnet source churn, overlapping VirtualNetworks, VN and Subnet retries, internal VLAN exclusion, AAP DHCP attachment and lease lookup for test clients, gateway and same-Subnet L2 traffic across leaves, DHCP service restart, /30 lease, peer-preserving lifecycle, and ordered cleanup. Remote BGP convergence and physical hardware are not covered."
         ;;
     virtual-network)
         info "VirtualNetwork-only E2E passed: one VN was created, verified, deleted, and cleaned up."
@@ -8421,5 +9988,8 @@ case "$VLAN_E2E_SUITE" in
         ;;
     external-ip)
         info "ExternalIP E2E passed: two addresses were allocated, one UID retry reused its reservation, the synthetic DHCP target replied through both ExternalIPs, attachment retry and peer preservation passed, attachments were detached before EIPs and network resources, pool capacity was restored, and test network resources were deleted. The external client uses a test-only static route; upstream BGP advertisement is not exercised."
+        ;;
+    nat-gateway)
+        info "Local NATGateway VLAN lab E2E passed: source Subnets were SNATed to the allocated ExternalIP, source addition/removal followed Subnet lifecycle, retry retained provider identity, the peer NATGateway remained unchanged, and cleanup completed. Remote BGP convergence and physical hardware are not covered."
         ;;
 esac
