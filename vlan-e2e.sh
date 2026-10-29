@@ -4237,11 +4237,16 @@ PY
 
 nat_gateway_assert_transit_exempt() {
     local namespace="$1" host_transit="$2" namespace_transit="$3"
-    local port response_file server_pid observed
+    local port response_file server_pid observed server_script client_script
+    local remote_server_script remote_client_script
     port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
     response_file="${TEMP_DIR}/nat-gateway-transit-probe-${namespace}.txt"
+    server_script="${TEMP_DIR}/nat-gateway-transit-server.py"
+    client_script="${TEMP_DIR}/nat-gateway-transit-client.py"
+    remote_server_script="/tmp/osac-natgw-transit-server-${port}.py"
+    remote_client_script="/tmp/osac-natgw-transit-client-${port}.py"
     : >"$response_file"
-    netnode python3 - "$host_transit" "$port" >"$response_file" 2>&1 <<'PY' &
+    cat >"$server_script" <<'PY'
 import socket
 import sys
 
@@ -4254,16 +4259,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server:
     payload, address = server.recvfrom(128)
     server.sendto(address[0].encode(), address)
 PY
-    server_pid=$!
-    for _ in {1..30}; do
-        grep -Fxq ready "$response_file" && break
-        sleep 1
-    done
-    if ! grep -Fxq ready "$response_file"; then
-        cat "$response_file" >&2
-        die "NATGateway transit exemption responder did not start"
-    fi
-    netnode ip netns exec "$namespace" python3 - "$namespace_transit" "$host_transit" "$port" <<'PY'
+    cat >"$client_script" <<'PY'
 import socket
 import sys
 
@@ -4277,8 +4273,26 @@ with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
     observed, _ = client.recvfrom(128)
     print(observed.decode(), flush=True)
 PY
+    docker cp "$server_script" "${CONTAINERLAB_NET_NODE}:${remote_server_script}" \
+        || die "Could not copy the NATGateway transit responder to the network node"
+    docker cp "$client_script" "${CONTAINERLAB_NET_NODE}:${remote_client_script}" \
+        || die "Could not copy the NATGateway transit client to the network node"
+    netnode python3 "$remote_server_script" "$host_transit" "$port" \
+        >"$response_file" 2>&1 &
+    server_pid=$!
+    for _ in {1..30}; do
+        grep -Fxq ready "$response_file" && break
+        sleep 1
+    done
+    if ! grep -Fxq ready "$response_file"; then
+        cat "$response_file" >&2
+        die "NATGateway transit exemption responder did not start"
+    fi
+    netnode ip netns exec "$namespace" python3 "$remote_client_script" \
+        "$namespace_transit" "$host_transit" "$port"
     kill "$server_pid" >/dev/null 2>&1 || true
     wait "$server_pid" >/dev/null 2>&1 || true
+    netnode rm -f "$remote_server_script" "$remote_client_script" || true
     observed="$(tail -n 1 "$response_file")"
     [[ "$observed" == "${namespace_transit%%/*}" ]] \
         || die "NATGateway transit traffic was translated from ${namespace_transit} to ${observed}"
