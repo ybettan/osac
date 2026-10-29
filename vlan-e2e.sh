@@ -2386,6 +2386,9 @@ deployment_settings() {
           tag: .service.images.service.tag
         }
       },
+      service: {
+        eventPublisherEnabled: (.service.eventPublisher.enabled // false)
+      },
       networking: {
         fabricManager: .global.networking.fabricManager,
         k8sManager: .global.networking.k8sManager,
@@ -6995,7 +6998,7 @@ CLUSTER_DOMAIN="$(oc get ingresses.config/cluster -o jsonpath='{.spec.domain}')"
 OIDC_ISSUER_URL="https://keycloak-keycloak.${CLUSTER_DOMAIN}/realms/osac"
 # This smoke invokes the networking AAP jobs directly; catalog template
 # publication is unrelated and its hook needs a Kubernetes token mount.
-EXTRA_HELM_ARGS="-f ${OVERLAY_FILE} --set-string aap.configAsCode.eeImage=${AAP_IMAGE} --set-string aap.configAsCode.projectGitUri=${AAP_PROJECT_GIT_URI} --set-string aap.configAsCode.projectGitBranch=${AAP_PROJECT_GIT_BRANCH} --set-string operator.image.repository=${OPERATOR_IMAGE_REPOSITORY} --set-string operator.image.tag=${OPERATOR_IMAGE_TAG} --set-string service.images.service.repository=${FULFILLMENT_IMAGE_REPOSITORY} --set-string service.images.service.tag=${FULFILLMENT_IMAGE_TAG} --set service.eventPublisher.enabled=false --set aap.instanceGroups.publishTemplates.enabled=false"
+EXTRA_HELM_ARGS="-f ${OVERLAY_FILE} --set-string aap.configAsCode.eeImage=${AAP_IMAGE} --set-string aap.configAsCode.projectGitUri=${AAP_PROJECT_GIT_URI} --set-string aap.configAsCode.projectGitBranch=${AAP_PROJECT_GIT_BRANCH} --set-string operator.image.repository=${OPERATOR_IMAGE_REPOSITORY} --set-string operator.image.tag=${OPERATOR_IMAGE_TAG} --set-string service.images.service.repository=${FULFILLMENT_IMAGE_REPOSITORY} --set-string service.images.service.tag=${FULFILLMENT_IMAGE_TAG} --set service.eventPublisher.enabled=true --set aap.instanceGroups.publishTemplates.enabled=false"
 EXISTING_OSAC_RELEASE="$(helm list -n "$OSAC_NAMESPACE" --filter '^osac$' --short)"
 PREVIOUS_DEPLOYMENT_SETTINGS="{}"
 EXPECTED_DEPLOYMENT_SETTINGS="$(jq -ncS \
@@ -7009,6 +7012,7 @@ EXPECTED_DEPLOYMENT_SETTINGS="$(jq -ncS \
     '{aap:{eeImage:$ee,projectGitUri:$project_uri,projectGitBranch:$project_branch},
       operator:{image:{repository:$operator_repository,tag:$operator_tag}},
       fulfillment:{image:{repository:$fulfillment_repository,tag:$fulfillment_tag}},
+      service:{eventPublisherEnabled:true},
       networking:{fabricManager:"agentless_net",k8sManager:"",
         networkClassTitle:"AgentlessNet VirtualNetwork and Subnet baseline"}}')"
 OSAC_DEPLOYMENT_NEEDED=true
@@ -7044,7 +7048,7 @@ elif [[ -n "$EXISTING_OSAC_RELEASE" || "$OSAC_INSTALL_MODE" == upgrade ]]; then
         --reset-values \
         --values "$UPGRADE_VALUES_FILE" \
         --set aap.bootstrap.enabled=false \
-        --set service.eventPublisher.enabled=false \
+        --set service.eventPublisher.enabled=true \
         --set aap.instanceGroups.publishTemplates.enabled=false \
         --set-string "aap.configAsCode.eeImage=${AAP_IMAGE}" \
         --set-string "aap.configAsCode.projectGitUri=${AAP_PROJECT_GIT_URI}" \
