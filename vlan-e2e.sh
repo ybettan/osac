@@ -4259,8 +4259,10 @@ PY
         grep -Fxq ready "$response_file" && break
         sleep 1
     done
-    grep -Fxq ready "$response_file" \
-        || die "NATGateway transit exemption responder did not start"
+    if ! grep -Fxq ready "$response_file"; then
+        cat "$response_file" >&2
+        die "NATGateway transit exemption responder did not start"
+    fi
     netnode ip netns exec "$namespace" python3 - "$namespace_transit" "$host_transit" "$port" <<'PY'
 import socket
 import sys
