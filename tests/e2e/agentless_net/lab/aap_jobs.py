@@ -388,7 +388,7 @@ def inspect_nat_gateway_job(args: argparse.Namespace) -> dict[str, Any]:
         or not isinstance(external_ip_id, str)
         or not external_ip_id
         or not isinstance(metadata.get("name"), str)
-        or not metadata["name"].startswith("agentless-natgw-")
+        or not metadata["name"]
         or not isinstance(metadata.get("namespace"), str)
         or not metadata["namespace"]
     ):
