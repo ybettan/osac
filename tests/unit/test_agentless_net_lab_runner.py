@@ -1561,6 +1561,39 @@ def test_runner_stages_are_ordered_and_source_revision_is_pinned():
     assert 'IMAGE_SOURCE_COMMIT="$RUNTIME_SOURCE_COMMIT"' in SOURCE
 
 
+@pytest.mark.parametrize(
+    ("legacy_dns_class", "expected_dns_class"), [("", "dns.noop.dns"), ("dns.route53.dns", "dns.route53.dns")]
+)
+def test_upgrade_values_normalize_empty_legacy_dns_class(
+    tmp_path: Path, legacy_dns_class: str, expected_dns_class: str
+) -> None:
+    helper = function_block("prepare_upgrade_values", "tenant_exists")
+    installer = tmp_path / "installer"
+    profile = installer / "values" / "caas-ci" / "instance.yaml"
+    profile.parent.mkdir(parents=True)
+    profile.write_text("clusterVersions:\n  versions: []\n")
+    previous_values = tmp_path / "previous-values.json"
+    previous_values.write_text(
+        json.dumps({"aap": {"instanceGroups": {"clusterFulfillment": {"config": {"DNS_CLASS": legacy_dns_class}}}}})
+    )
+    script = f"""
+set -euo pipefail
+TEMP_DIR={shlex.quote(str(tmp_path))}
+INSTALLER_DIR={shlex.quote(str(installer))}
+OSAC_NAMESPACE=osac-e2e-ci
+OSAC_PROFILE=caas-ci
+helm() {{ cat {shlex.quote(str(previous_values))}; }}
+die() {{ printf '%s\\n' "$*" >&2; exit 1; }}
+{helper}
+prepare_upgrade_values
+"""
+
+    result = run_bash(tmp_path, script)
+    assert result.returncode == 0, result.stderr
+    upgraded = yaml.safe_load((tmp_path / "previous-helm-values.yaml").read_text())
+    assert upgraded["aap"]["instanceGroups"]["clusterFulfillment"]["config"]["DNS_CLASS"] == expected_dns_class
+
+
 def test_full_suite_runs_attachment_lifecycle_after_creating_its_network_and_client():
     suite = function_block("run_full_suite", "run_virtual_network_suite")
 
@@ -1665,9 +1698,56 @@ def test_nat_gateway_cleanup_precedes_clients_and_all_network_dependencies() -> 
     start = SOURCE.index("on_exit() {")
     end = SOURCE.index("\ntrap on_exit EXIT", start)
     on_exit = SOURCE[start:end]
-    assert on_exit.index("cleanup_created_nat_gateways") < on_exit.index(
-        "cleanup_dhcp_clients_and_attachments"
+    assert on_exit.index("cleanup_created_nat_gateways") < on_exit.index("cleanup_dhcp_clients_and_attachments")
+
+
+def test_nat_gateway_subnet_readiness_waits_for_applied_snat_sources() -> None:
+    create = function_block("create_nat_gateway_subnet", "ensure_nat_gateway_dhcp_client")
+    wait = function_block("nat_gateway_wait_for_provider_sources", "nat_gateway_assert_provider_rules")
+
+    assert (
+        create.index("wait_for_subnet_cr_created")
+        < create.index("nat_gateway_wait_for_provider_sources")
+        < create.index("wait_for_subnet_ready")
     )
+    assert 'subnet_fulfillment_state "$observe_subnet_id"' in wait
+    assert 'nat_gateway_assert_provider_rules "$id" "$uid" "$address"' in wait
+    assert "became READY before its NATGateway SNAT source was applied" in wait
+
+
+def test_nat_gateway_source_withdrawal_precedes_subnet_vlan_teardown() -> None:
+    delete = function_block("delete_subnet_by_id", "create_external_ip_pool")
+    wait = function_block("nat_gateway_wait_for_provider_sources", "nat_gateway_assert_provider_rules")
+
+    assert delete.index('assert_vlan_on_switches "$vlan_id" true') < delete.index('delete subnet "$id"')
+    assert delete.index("nat_gateway_wait_for_provider_sources") < delete.index("wait_for_subnet_deleted")
+    assert 'nat_gateway_vlan_present_on_switches "$observe_vlan_id"' in wait
+    assert "source_set_observed_before_vlan" in wait
+    assert "disappeared before NATGateway SNAT source cleanup" in wait
+
+
+def test_nat_gateway_vlan_observer_checks_all_declared_trunk_ports(tmp_path: Path) -> None:
+    helper = function_block("nat_gateway_vlan_present_on_switches", "snapshot_switch_vlan_state")
+    manifest = tmp_path / "switches.json"
+    manifest.write_text(json.dumps({"switches": [{"name": "leaf-1", "trunk_ports": ["swp1", "swp2"]}]}))
+    vlan_json = json.dumps(
+        [{"ifname": "swp1", "vlans": [{"vlan": 310}]}, {"ifname": "swp2", "vlans": [{"vlan": 300, "vlanEnd": 320}]}]
+    )
+    script = f"""
+set -euo pipefail
+SWITCH_MANIFEST_FILE={shlex.quote(str(manifest))}
+SWITCH_JSON={shlex.quote(vlan_json)}
+switch_exec() {{ printf '%s' "$SWITCH_JSON"; }}
+{helper}
+nat_gateway_vlan_present_on_switches 310
+"""
+
+    present = run_bash(tmp_path, script)
+    assert present.returncode == 0, present.stderr
+
+    absent_script = script.replace('"vlan": 300, "vlanEnd": 320', '"vlan": 400')
+    absent = run_bash(tmp_path, absent_script)
+    assert absent.returncode == 1
 
 
 def test_nat_gateway_cleanup_discovery_scopes_crs_and_provider_identity() -> None:
@@ -1675,10 +1755,146 @@ def test_nat_gateway_cleanup_discovery_scopes_crs_and_provider_identity() -> Non
 
     assert "nat_gateway_filter='this.metadata.name.startsWith(\"agentless-natgw-\")'" in cleanup
     assert 'nat_gateway_cr_json "$nat_gateway_id"' in cleanup
+    nat_gateway_discovery = cleanup[cleanup.index("nat_gateway_items='[]'") : cleanup.index("pool_items='[]'")]
+    assert 'external_ip_cr_json "$nat_gateway_eip_id" ""' in nat_gateway_discovery
+    assert 'EXTERNAL_IP_POOL_ID="$pool_id"' in nat_gateway_discovery
+    assert 'external_ip_pool_validate_cr_identity "$pool_cr" "$pool_id"' in nat_gateway_discovery
+    assert 'external_ip_cr_json "$nat_gateway_eip_id" "$pool_id"' in nat_gateway_discovery
     assert '"osac.openshift.io/natgateway-contract-version"] == "v1"' in SOURCE
     assert ".[0].virtual_network_uid == $vn_uid" in cleanup
     assert ".[0].external_ip_uid == $eip_uid" in cleanup
     assert "test NATGateway provider row without a matching test CR" in cleanup
+
+
+def test_nat_gateway_cleanup_validates_aap_success_when_cr_job_status_lags() -> None:
+    cleanup = function_block("delete_nat_gateway_and_verify", "cleanup_created_nat_gateways")
+
+    assert 'if [[ "$job_state" == Failed || "$job_state" == Canceled ]]' in cleanup
+    assert 'if [[ -n "$job_id" ]]' in cleanup
+    assert 'nat_gateway_aap_job_details "$job_id" nat_gateway.delete' in cleanup
+    assert 'nat_gateway_assert_delete_job "$details" "$gateway_cr"' in cleanup
+    assert '&& "$job_state" == Succeeded' not in cleanup
+
+
+def test_nat_gateway_endpoint_cleanup_matches_docker_resolved_router_id(tmp_path: Path) -> None:
+    cleanup = function_block("cleanup_nat_gateway_endpoint", "assert_external_ip_attachment_provider_absent")
+    events = tmp_path / "endpoint-cleanup.log"
+    script = f"""
+set -euo pipefail
+CLEANUP_MODE=true
+NAT_GATEWAY_ENDPOINT_CREATED_BY_RUN=false
+NAT_GATEWAY_ENDPOINT_CONTAINER=osac-natgw-source-endpoint
+NAT_GATEWAY_RESPONSE_TOKEN=test-token
+CONTAINERLAB_UPSTREAM_ROUTER=clab-agentless-net-lab-upstream-router
+EVENTS={shlex.quote(str(events))}
+docker() {{
+    if [[ "$1" == inspect && "$2" == -f ]]; then
+        case "$4" in
+            "$NAT_GATEWAY_ENDPOINT_CONTAINER")
+                if [[ "$3" == *e2e-owner* ]]; then
+                    printf 'agentless-natgateway'
+                elif [[ "$3" == *NetworkMode* ]]; then
+                    printf 'container:router-container-id'
+                else
+                    return 1
+                fi
+                ;;
+            "$CONTAINERLAB_UPSTREAM_ROUTER") printf 'router-container-id' ;;
+            *) return 1 ;;
+        esac
+    elif [[ "$1" == inspect && "$2" == "$NAT_GATEWAY_ENDPOINT_CONTAINER" ]]; then
+        return 0
+    elif [[ "$1" == rm && "$2" == -f ]]; then
+        printf '%s\\n' "$*" >"$EVENTS"
+    else
+        return 1
+    fi
+}}
+{cleanup}
+cleanup_nat_gateway_endpoint
+[[ "$NAT_GATEWAY_ENDPOINT_CREATED_BY_RUN" == false ]]
+[[ -z "$NAT_GATEWAY_ENDPOINT_CONTAINER" ]]
+[[ -z "$NAT_GATEWAY_RESPONSE_TOKEN" ]]
+"""
+
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert events.read_text().strip() == "rm -f osac-natgw-source-endpoint"
+
+
+def test_external_ip_cr_lookup_can_resolve_pool_during_recovery(tmp_path: Path) -> None:
+    helper = function_block("external_ip_cr_json", "external_ip_attachment_crs_json")
+    external_ip_id = "22222222-2222-4222-8222-222222222222"
+    pool_id = "33333333-3333-4333-8333-333333333333"
+    external_ip = {
+        "items": [
+            {
+                "metadata": {
+                    "name": "externalip-abcd1",
+                    "namespace": "osac-e2e-ci",
+                    "labels": {"osac.openshift.io/externalip-uuid": external_ip_id},
+                    "annotations": {
+                        "osac.openshift.io/tenant": "osac-e2e-ci",
+                        "osac.openshift.io/implementation-strategy": "agentless_net",
+                        "osac.openshift.io/externalip-contract-version": "v1",
+                    },
+                },
+                "spec": {"pool": pool_id},
+            }
+        ]
+    }
+    script = f"""
+set -euo pipefail
+OSAC_TENANT=osac-e2e-ci
+NETWORKING_NAMESPACE=osac-e2e-ci
+EXTERNAL_IP_POOL_ID=
+external_ip_crs_json() {{ printf '%s\\n' "$EXTERNAL_IP_CR_JSON"; }}
+die() {{ printf '%s\\n' "$*" >&2; exit 1; }}
+{helper}
+external_ip_cr_json {external_ip_id} ""
+"""
+
+    result = run_bash(tmp_path, script, {"EXTERNAL_IP_CR_JSON": json.dumps(external_ip)})
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["spec"]["pool"] == pool_id
+
+
+def test_nat_gateway_cr_lookup_accepts_controller_generated_cr_name(tmp_path: Path) -> None:
+    nat_gateway_id = "11111111-1111-4111-8111-111111111111"
+    resource = {
+        "items": [
+            {
+                "metadata": {
+                    "name": "natgateway-hgwmf",
+                    "namespace": "osac-e2e-ci",
+                    "labels": {"osac.openshift.io/natgateway-uuid": nat_gateway_id},
+                    "annotations": {
+                        "osac.openshift.io/tenant": "osac-e2e-ci",
+                        "osac.openshift.io/implementation-strategy": "agentless_net",
+                        "osac.openshift.io/natgateway-contract-version": "v1",
+                    },
+                },
+                "spec": {"virtualNetwork": "vn-id", "externalIP": "eip-id"},
+            }
+        ]
+    }
+    helper = function_block("nat_gateway_cr_json", "baremetal_instance_crs_json")
+    script = f"""
+set -euo pipefail
+OSAC_TENANT=osac-e2e-ci
+NETWORKING_NAMESPACE=osac-e2e-ci
+nat_gateway_crs_json() {{ printf '%s\\n' "$CR_JSON"; }}
+die() {{ printf '%s\\n' "$*" >&2; exit 1; }}
+{helper}
+nat_gateway_cr_json {nat_gateway_id} vn-id eip-id
+"""
+
+    result = run_bash(tmp_path, script, {"CR_JSON": json.dumps(resource)})
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["metadata"]["name"] == "natgateway-hgwmf"
 
 
 def test_nat_gateway_uplink_override_and_restore_are_guarded() -> None:
@@ -1693,6 +1909,130 @@ def test_nat_gateway_uplink_override_and_restore_are_guarded() -> None:
     assert "$backup[0].original_present" in restore
     assert "annotations_empty_after_restore" in restore
     assert "NATGateway uplink override changed; preserving its current ConfigMap value" in restore
+
+
+@pytest.mark.parametrize("original_value", [None, "eth1"])
+def test_nat_gateway_cleanup_recovers_override_after_upgrade_restores_original(
+    tmp_path: Path, original_value: str | None
+) -> None:
+    configure = function_block("configure_nat_gateway_uplink", "restore_nat_gateway_uplink")
+    restore = function_block("restore_nat_gateway_uplink", "remove_netnode_public_key")
+    temp_dir = tmp_path / "uplink-recovery"
+    temp_dir.mkdir()
+    owner_key = "osac.openshift.io/vlan-e2e-natgw-uplink-owner"
+    backup_key = "osac.openshift.io/vlan-e2e-natgw-uplink-original"
+    owner = "vlan-e2e-natgw-old-run"
+    backup = {
+        "owner": owner,
+        "original_present": original_value is not None,
+        "original_value": original_value or "",
+        "original_annotations_present": False,
+    }
+    data = {"OTHER_SETTING": "preserve"}
+    if original_value is not None:
+        data["AGENTLESS_NET_EXTERNAL_INTERFACE"] = original_value
+    initial = json.dumps(
+        {
+            "metadata": {"resourceVersion": "10", "annotations": {owner_key: owner, backup_key: json.dumps(backup)}},
+            "data": data,
+        }
+    )
+    script = f"""
+set -euo pipefail
+SUITE_USES_NAT_GATEWAY=true
+CLEANUP_MODE=true
+DHCP_CLIENT_PREFIX=old-run
+NAT_GATEWAY_UPLINK_OWNER_ANNOTATION={shlex.quote(owner_key)}
+NAT_GATEWAY_UPLINK_BACKUP_ANNOTATION={shlex.quote(backup_key)}
+NAT_GATEWAY_UPLINK_CHANGED_BY_RUN=false
+NAT_GATEWAY_UPLINK_BACKUP=
+NAT_GATEWAY_UPLINK_OWNER=
+NAT_GATEWAY_UPLINK_EXPECTED=
+AAP_NETWORKING_SECRET=network-fulfillment-ig
+OSAC_NAMESPACE=osac-e2e-ci
+TEMP_DIR={shlex.quote(str(temp_dir))}
+PATCH_COUNT=0
+RECOVERY_PATCH_FILE=
+RESTORE_PATCH_FILE=
+die() {{ printf '%s\\n' "$*" >&2; exit 1; }}
+info() {{ :; }}
+oc() {{
+    if [[ "$1" == get ]]; then
+        case "$PATCH_COUNT" in
+            0) jq -c . <<<"$INITIAL_CONFIG_MAP" ;;
+            1) jq -cn --argjson initial "$INITIAL_CONFIG_MAP" '
+                  $initial
+                  | .metadata.resourceVersion = "12"
+                  | .data.AGENTLESS_NET_EXTERNAL_INTERFACE = "eth2"' ;;
+            2) jq -cn --argjson initial "$INITIAL_CONFIG_MAP" '
+                  $initial
+                  | .metadata.resourceVersion = "13"
+                  | del(.metadata.annotations)' ;;
+        esac
+    elif [[ "$1" == patch ]]; then
+        PATCH_COUNT=$((PATCH_COUNT + 1))
+        for argument in "$@"; do
+            case "$argument" in
+                --patch-file=*)
+                    if [[ "$PATCH_COUNT" == 1 ]]; then
+                        RECOVERY_PATCH_FILE="${{argument#*=}}"
+                    else
+                        RESTORE_PATCH_FILE="${{argument#*=}}"
+                    fi
+                    ;;
+            esac
+        done
+    else
+        return 1
+    fi
+}}
+{configure}
+{restore}
+configure_nat_gateway_uplink
+[[ "$NAT_GATEWAY_UPLINK_CHANGED_BY_RUN" == true ]]
+restore_nat_gateway_uplink
+[[ "$NAT_GATEWAY_UPLINK_CHANGED_BY_RUN" == false ]]
+[[ "$PATCH_COUNT" == 2 ]]
+jq -e --arg rv 10 'any(.[]; .op == "test" and .path == "/metadata/resourceVersion" and .value == $rv)' \\
+    "$RECOVERY_PATCH_FILE" >/dev/null
+jq -e --arg owner_key "/metadata/annotations/osac.openshift.io~1vlan-e2e-natgw-uplink-owner" \\
+    --arg owner {shlex.quote(owner)} \\
+    'any(.[]; .op == "test" and .path == $owner_key and .value == $owner)' \\
+    "$RECOVERY_PATCH_FILE" >/dev/null
+jq -e --arg backup_key "/metadata/annotations/osac.openshift.io~1vlan-e2e-natgw-uplink-original" \\
+    --arg backup {shlex.quote(json.dumps(backup))} \\
+    'any(.[]; .op == "test" and .path == $backup_key and .value == $backup)' \\
+    "$RECOVERY_PATCH_FILE" >/dev/null
+jq -e 'any(.[]; .op == "add" and .path == "/data/AGENTLESS_NET_EXTERNAL_INTERFACE" and .value == "eth2")' \\
+    "$RECOVERY_PATCH_FILE" >/dev/null
+jq -e --arg rv 12 'any(.[]; .op == "test" and .path == "/metadata/resourceVersion" and .value == $rv)' \\
+    "$RESTORE_PATCH_FILE" >/dev/null
+"""
+    result = run_bash(tmp_path, script, {"INITIAL_CONFIG_MAP": initial})
+
+    assert result.returncode == 0, result.stderr
+    recovery_patch = json.loads((temp_dir / "nat-gateway-uplink-recovery-patch.json").read_text())
+    if original_value is not None:
+        assert any(
+            operation.get("op") == "test"
+            and operation.get("path") == "/data/AGENTLESS_NET_EXTERNAL_INTERFACE"
+            and operation.get("value") == original_value
+            for operation in recovery_patch
+        )
+    restore_patch = json.loads((temp_dir / "nat-gateway-uplink-restore.json").read_text())
+    assert (
+        any(
+            operation.get("op") == "remove" and operation.get("path") == "/data/AGENTLESS_NET_EXTERNAL_INTERFACE"
+            for operation in restore_patch
+        )
+        if original_value is None
+        else any(
+            operation.get("op") == "replace"
+            and operation.get("path") == "/data/AGENTLESS_NET_EXTERNAL_INTERFACE"
+            and operation.get("value") == original_value
+            for operation in restore_patch
+        )
+    )
 
 
 @pytest.mark.parametrize("original_value", [None, "eth1"])
