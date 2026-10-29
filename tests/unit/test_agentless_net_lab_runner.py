@@ -1701,53 +1701,21 @@ def test_nat_gateway_cleanup_precedes_clients_and_all_network_dependencies() -> 
     assert on_exit.index("cleanup_created_nat_gateways") < on_exit.index("cleanup_dhcp_clients_and_attachments")
 
 
-def test_nat_gateway_subnet_readiness_waits_for_applied_snat_sources() -> None:
+def test_nat_gateway_subnet_readiness_is_independent_of_gateway_state() -> None:
     create = function_block("create_nat_gateway_subnet", "ensure_nat_gateway_dhcp_client")
-    wait = function_block("nat_gateway_wait_for_provider_sources", "nat_gateway_assert_provider_rules")
 
-    assert (
-        create.index("wait_for_subnet_cr_created")
-        < create.index("nat_gateway_wait_for_provider_sources")
-        < create.index("wait_for_subnet_ready")
-    )
-    assert 'subnet_fulfillment_state "$observe_subnet_id"' in wait
-    assert 'nat_gateway_assert_provider_rules "$id" "$uid" "$address"' in wait
-    assert "became READY before its NATGateway SNAT source was applied" in wait
+    assert create.index("wait_for_subnet_cr_created") < create.index("wait_for_subnet_ready")
+    assert "nat_gateway_wait_for_provider_sources" not in create
+    assert "nat_gateway_assert_provider_rules" not in create
 
 
-def test_nat_gateway_source_withdrawal_precedes_subnet_vlan_teardown() -> None:
+def test_nat_gateway_subnet_deletion_is_independent_of_gateway_state() -> None:
     delete = function_block("delete_subnet_by_id", "create_external_ip_pool")
-    wait = function_block("nat_gateway_wait_for_provider_sources", "nat_gateway_assert_provider_rules")
 
-    assert delete.index('assert_vlan_on_switches "$vlan_id" true') < delete.index('delete subnet "$id"')
-    assert delete.index("nat_gateway_wait_for_provider_sources") < delete.index("wait_for_subnet_deleted")
-    assert 'nat_gateway_vlan_present_on_switches "$observe_vlan_id"' in wait
-    assert "source_set_observed_before_vlan" in wait
-    assert "disappeared before NATGateway SNAT source cleanup" in wait
-
-
-def test_nat_gateway_vlan_observer_checks_all_declared_trunk_ports(tmp_path: Path) -> None:
-    helper = function_block("nat_gateway_vlan_present_on_switches", "snapshot_switch_vlan_state")
-    manifest = tmp_path / "switches.json"
-    manifest.write_text(json.dumps({"switches": [{"name": "leaf-1", "trunk_ports": ["swp1", "swp2"]}]}))
-    vlan_json = json.dumps(
-        [{"ifname": "swp1", "vlans": [{"vlan": 310}]}, {"ifname": "swp2", "vlans": [{"vlan": 300, "vlanEnd": 320}]}]
-    )
-    script = f"""
-set -euo pipefail
-SWITCH_MANIFEST_FILE={shlex.quote(str(manifest))}
-SWITCH_JSON={shlex.quote(vlan_json)}
-switch_exec() {{ printf '%s' "$SWITCH_JSON"; }}
-{helper}
-nat_gateway_vlan_present_on_switches 310
-"""
-
-    present = run_bash(tmp_path, script)
-    assert present.returncode == 0, present.stderr
-
-    absent_script = script.replace('"vlan": 300, "vlanEnd": 320', '"vlan": 400')
-    absent = run_bash(tmp_path, absent_script)
-    assert absent.returncode == 1
+    assert 'delete subnet "$id"' in delete
+    assert delete.index('delete subnet "$id"') < delete.index("wait_for_subnet_deleted")
+    assert "nat_gateway_wait_for_provider_sources" not in delete
+    assert "nat_gateway_vlan_present_on_switches" not in delete
 
 
 def test_nat_gateway_cleanup_discovery_scopes_crs_and_provider_identity() -> None:
@@ -2347,7 +2315,7 @@ def test_state_snapshot_includes_attachment_rows_and_accepts_existing_schema_v1(
                     "vn-uid",
                     "198.51.100.22",
                     "ready",
-                    json.dumps({"source_cidrs": [{"subnet_uid": "subnet-uid", "cidr": "10.250.1.0/24"}]}),
+                    json.dumps({"phase": "ready", "provider": {"next_hop": "10.250.0.1/31"}}),
                 ),
             )
         if unknown_table:
@@ -2387,7 +2355,7 @@ def test_state_snapshot_includes_attachment_rows_and_accepts_existing_schema_v1(
             "virtual_network_uid": "vn-uid",
             "external_address": "198.51.100.22",
             "phase": "ready",
-            "payload": {"source_cidrs": [{"subnet_uid": "subnet-uid", "cidr": "10.250.1.0/24"}]},
+            "payload": {"phase": "ready", "provider": {"next_hop": "10.250.0.1/31"}},
         }
     ]
 
