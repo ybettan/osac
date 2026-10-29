@@ -4288,12 +4288,12 @@ PY
         cat "$response_file" >&2
         die "NATGateway transit exemption responder did not start"
     fi
-    netnode ip netns exec "$namespace" python3 "$remote_client_script" \
-        "$namespace_transit" "$host_transit" "$port"
+    observed="$(netnode ip netns exec "$namespace" python3 "$remote_client_script" \
+        "$namespace_transit" "$host_transit" "$port")" \
+        || die "NATGateway transit exemption probe failed"
     kill "$server_pid" >/dev/null 2>&1 || true
     wait "$server_pid" >/dev/null 2>&1 || true
     netnode rm -f "$remote_server_script" "$remote_client_script" || true
-    observed="$(tail -n 1 "$response_file")"
     [[ "$observed" == "${namespace_transit%%/*}" ]] \
         || die "NATGateway transit traffic was translated from ${namespace_transit} to ${observed}"
     info "NATGateway transit exemption preserved source ${observed}."
