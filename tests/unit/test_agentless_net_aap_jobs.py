@@ -66,7 +66,7 @@ class FakeNATGatewayJobController:
                             "apiVersion": "osac.openshift.io/v1alpha1",
                             "kind": "NATGateway",
                             "metadata": {
-                                "name": "agentless-natgw-run-a",
+                                "name": "natgateway-hgwmf",
                                 "namespace": "osac-e2e-ci",
                                 "uid": "10000000-0000-4000-8000-000000000011",
                                 "generation": 4,
@@ -280,6 +280,7 @@ def test_inspect_nat_gateway_job_returns_only_verified_input_and_result(monkeypa
     assert result["job_id"] == 55
     assert result["project_revision"] == REVISION
     assert result["resource"]["metadata"]["generation"] == 4
+    assert result["resource"]["metadata"]["name"] == "natgateway-hgwmf"
     assert result["resource"]["spec"]["externalIP"] == "10000000-0000-4000-8000-000000000006"
     assert result["nat_gateway_context"]["external_ip"]["address"] == "198.51.100.21"
     assert result["artifacts"]["osac_result"]["operation"] == "nat_gateway.ensure"
