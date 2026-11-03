@@ -835,8 +835,9 @@ def test_trunk_initialization_precedes_the_suite_start():
 
 
 def test_dhcp_client_switch_attachment_uses_production_aap_jobs():
-    assert 'run_agentless_net_aap_job move-network-attachment' in SOURCE
-    assert 'run_agentless_net_aap_job query-dhcp-lease' in SOURCE
+    assert 'run_agentless_net_aap_job apply_network_attachment' in SOURCE
+    assert 'run_agentless_net_aap_job query_dhcp_lease' in SOURCE
+    assert 'run_agentless_net_aap_job delete_network_attachment' in SOURCE
     assert 'configure_client_access_port' not in SOURCE
     assert 'nv set interface "$CLIENT_SWITCH_PORT"' not in SOURCE
     assert 'nv unset interface "$CLIENT_SWITCH_PORT"' not in SOURCE
@@ -1034,220 +1035,17 @@ if wait_for_existing_provider_deletions; then exit 1; fi
     assert "existing AgentlessNet provider resources remain in deletion" in result.stderr
 
 
-def test_aap_subnet_reader_uses_scoped_subnet_and_lock_rbac(tmp_path):
-    helper = function_block("configure_aap_subnet_reader", "cleanup_aap_subnet_reader")
-    events = tmp_path / "aap-subnet-reader.log"
-    script = f"""
-set -euo pipefail
-TEMP_DIR={shlex.quote(str(tmp_path))}
-OSAC_NAMESPACE=osac-e2e-ci
-NETWORKING_NAMESPACE=osac-e2e-ci
-SUITE_USES_SUBNET_DHCP=true
-AAP_SUBNET_READER_NAME=vlan-e2e-subnet-reader
-AAP_SUBNET_LOCK_NAME=vlan-e2e-subnet-lock
-AAP_SUBNET_READER_CREDENTIAL_TYPE='OSAC VLAN E2E Kubernetes API'
-AAP_SUBNET_READER_CREDENTIAL=vlan-e2e-subnet-reader
-AAP_PREFIX=osac
-AAP_JOBS_HELPER=/tmp/aap_jobs.py
-AAP_API_CA_FILE=/tmp/aap-ca.pem
-EVENTS={shlex.quote(str(events))}
-info() {{ :; }}
-oc() {{
-    printf '%s\\n' "$*" >>"$EVENTS"
-    case "$*" in
-        'create serviceaccount '*|'create role '*|'create rolebinding '*) printf 'kind: test\\n' ;;
-        'apply -f -') cat >/dev/null ;;
-        'auth can-i list subnets.osac.openshift.io'*) printf 'yes\\n' ;;
-        'auth can-i get leases.coordination.k8s.io'*|'auth can-i create leases.coordination.k8s.io'*|'auth can-i update leases.coordination.k8s.io'*|'auth can-i patch leases.coordination.k8s.io'*) printf 'yes\\n' ;;
-        'create token '*) printf 'service-account-token\\n' ;;
-        'get configmap kube-root-ca.crt '*) printf '{{"data":{{"ca.crt":"test-ca"}}}}' ;;
-        'get route osac-aap '*) printf 'aap.example.test' ;;
-        'exec deployment/osac-operator '*) printf 'operator-api-token' ;;
-        *) return 1 ;;
-    esac
-}}
-python3() {{
-    [[ "$1" == "$AAP_JOBS_HELPER" && "$2" == configure-k8s-credential ]]
-    [[ "$AAP_API_TOKEN" == operator-api-token ]]
-    [[ " $* " == *"--job-template osac-move-network-attachment"* ]]
-    [[ " $* " == *"--job-template osac-query-dhcp-lease"* ]]
-    [[ "$(<"$TEMP_DIR/aap-subnet-reader.token")" == service-account-token ]]
-    [[ "$(<"$TEMP_DIR/aap-subnet-reader-ca.pem")" == test-ca ]]
-    printf '{{"template_ids":[12,13],"credential_id":55,"credential_type_id":44}}\\n'
-}}
-{helper}
-configure_aap_subnet_reader
-[[ "$AAP_SUBNET_READER_SETUP_ATTEMPTED" == true ]]
-[[ ! -e "$TEMP_DIR/aap-subnet-reader.token" && ! -e "$TEMP_DIR/aap-subnet-reader-ca.pem" ]]
-grep -Fq -- '--verb=get,list --resource=subnets.osac.openshift.io' "$EVENTS"
-grep -Fq -- '--verb=get,create,update,patch --resource=leases.coordination.k8s.io' "$EVENTS"
-grep -Fq -- '--serviceaccount=osac-e2e-ci:vlan-e2e-subnet-reader' "$EVENTS"
-grep -Fq -- 'create rolebinding vlan-e2e-subnet-lock -n osac-e2e-ci' "$EVENTS"
-! grep -Fq cluster-admin "$EVENTS"
-"""
-    result = run_bash(tmp_path, script)
-
-    assert result.returncode == 0, result.stderr
-
-
-def test_aap_subnet_reader_cleanup_removes_credential_before_rbac(tmp_path):
-    helper = function_block("cleanup_aap_subnet_reader", "wait_for_existing_provider_deletions")
-    events = tmp_path / "aap-subnet-reader-cleanup.log"
-    script = f"""
-set -euo pipefail
-OSAC_NAMESPACE=osac-e2e-ci
-NETWORKING_NAMESPACE=osac-e2e-ci
-AAP_SUBNET_READER_NAME=vlan-e2e-subnet-reader
-AAP_SUBNET_LOCK_NAME=vlan-e2e-subnet-lock
-AAP_SUBNET_READER_CREDENTIAL_TYPE='OSAC VLAN E2E Kubernetes API'
-AAP_SUBNET_READER_CREDENTIAL=vlan-e2e-subnet-reader
-AAP_SUBNET_READER_SETUP_ATTEMPTED=true
-AAP_PREFIX=osac
-AAP_JOBS_HELPER=/tmp/aap_jobs.py
-AAP_API_CA_FILE=/tmp/aap-ca.pem
-EVENTS={shlex.quote(str(events))}
-info() {{ :; }}
-oc() {{
-    printf '%s\\n' "$*" >>"$EVENTS"
-    case "$*" in
-        'get route osac-aap '*) printf 'aap.example.test' ;;
-        'exec deployment/osac-operator '*) printf 'operator-api-token' ;;
-        'delete rolebinding '*|'delete role '*|'delete serviceaccount '*) return 0 ;;
-        *) return 1 ;;
-    esac
-}}
-python3() {{
-    [[ "$1" == "$AAP_JOBS_HELPER" && "$2" == cleanup-k8s-credential ]]
-    [[ "$AAP_API_TOKEN" == operator-api-token ]]
-    [[ " $* " == *"--job-template osac-move-network-attachment"* ]]
-    [[ " $* " == *"--job-template osac-query-dhcp-lease"* ]]
-    printf 'AAP credential removed\\n' >>"$EVENTS"
-    printf '{{"template_ids":[12,13],"status":"removed"}}\\n'
-}}
-{helper}
-cleanup_aap_subnet_reader
-[[ "$AAP_SUBNET_READER_SETUP_ATTEMPTED" == false ]]
-"""
-    result = run_bash(tmp_path, script)
-
-    assert result.returncode == 0, result.stderr
-    events = events.read_text().splitlines()
-    assert events.index("AAP credential removed") < events.index(
-        "delete rolebinding vlan-e2e-subnet-reader -n osac-e2e-ci --ignore-not-found=true --wait=true"
-    )
-    assert events.index("delete rolebinding vlan-e2e-subnet-reader -n osac-e2e-ci --ignore-not-found=true --wait=true") < events.index(
-        "delete role vlan-e2e-subnet-reader -n osac-e2e-ci --ignore-not-found=true --wait=true"
-    )
-    assert events.index("delete rolebinding vlan-e2e-subnet-lock -n osac-e2e-ci --ignore-not-found=true --wait=true") < events.index(
-        "delete role vlan-e2e-subnet-lock -n osac-e2e-ci --ignore-not-found=true --wait=true"
-    )
-    assert events.index("delete role vlan-e2e-subnet-reader -n osac-e2e-ci --ignore-not-found=true --wait=true") < events.index(
-        "delete serviceaccount vlan-e2e-subnet-reader -n osac-e2e-ci --ignore-not-found=true --wait=true"
-    )
-
-
-def test_aap_subnet_credential_is_retained_until_provider_cleanup_succeeds(tmp_path):
-    start = SOURCE.index("on_exit() {")
-    end = SOURCE.index("\ntrap on_exit EXIT", start)
-    on_exit = SOURCE[start:end]
-
-    def run_cleanup(provider_succeeds: bool, label: str):
-        events = tmp_path / f"{label}.log"
-        provider_result = "return 0" if provider_succeeds else (
-            "PRESERVE_E2E_RECOVERY_ARTIFACTS=true; return 1"
-        )
-        script = f"""
-set -uo pipefail
-CURRENT_STAGE=test
-CLEANUP_MODE=false
-SUITE_USES_SUBNET_DHCP=false
-SUITE_USES_NAT_GATEWAY=false
-SUITE_USES_EXTERNAL_IP_ATTACHMENT=false
-CREATED_NAT_GATEWAY_IDS=()
-VLAN_E2E_DEBUG=false
-PREEXISTING_PROVIDER_CLEANUP_PENDING=false
-PRESERVE_E2E_RECOVERY_ARTIFACTS=false
-AAP_SUBNET_READER_SETUP_ATTEMPTED=true
-RUN_DIR_CREATED=false
-VLAN_E2E_RUN_DIR=
-GENERATED_CLI_CONFIG=false
-GENERATED_CLI_BIN=false
-CLI_CA_FILE=
-CUMULUS_SSH_CONFIG_CREATED_BY_RUN=false
-TEMP_DIR=
-EVENTS={shlex.quote(str(events))}
-cleanup_created_virtual_networks() {{
-    printf 'provider cleanup\\n' >>"$EVENTS"
-    {provider_result}
-}}
-cleanup_aap_subnet_reader() {{ printf 'AAP credential cleanup\\n' >>"$EVENTS"; }}
-write_run_evidence() {{ return 0; }}
-info() {{ :; }}
-{on_exit}
-set +e
-false
-on_exit
-"""
-        return run_bash(tmp_path, script), events
-
-    successful_run, success_events = run_cleanup(True, "provider-cleanup-success")
-    failed_run, failure_events = run_cleanup(False, "provider-cleanup-failure")
-
-    assert successful_run.returncode == 1
-    assert success_events.read_text().splitlines() == [
-        "provider cleanup",
-        "AAP credential cleanup",
-    ]
-    assert failed_run.returncode == 1
-    assert failure_events.read_text().splitlines() == ["provider cleanup"]
-
-
-def test_provider_cleanup_keeps_aap_ca_until_subnet_credential_cleanup(tmp_path: Path) -> None:
-    helper = function_block("cleanup_created_virtual_networks", "export_dhcp_debug_artifacts")
-    temp_dir = tmp_path / "runner-temp"
-    temp_dir.mkdir()
-    ca_file = temp_dir / "aap-api-ca.pem"
-    ca_file.write_text("test CA")
-    script = f"""
-set -euo pipefail
-AAP_SUBNET_READER_SETUP_ATTEMPTED=true
-SUITE_USES_NAT_GATEWAY=false
-CLI_CA_FILE={shlex.quote(str(ca_file))}
-AAP_API_CA_FILE={shlex.quote(str(ca_file))}
-TEMP_DIR={shlex.quote(str(temp_dir))}
-RUN_DIR_CREATED=false
-GENERATED_CLI_CONFIG=false
-GENERATED_CLI_BIN=false
-CLI_CONFIG_DIR=
-CLI_BIN=
-CREATED_IDS=()
-CREATED_SUBNET_IDS=()
-CREATED_EXTERNAL_IP_IDS=()
-CREATED_EXTERNAL_IP_ATTACHMENT_IDS=()
-CREATED_BARE_METAL_INSTANCE_IDS=()
-cleanup_created_external_ip_attachments() {{ return 0; }}
-remove_external_ip_client_routes() {{ return 0; }}
-cleanup_created_external_ips() {{ return 0; }}
-cleanup_created_external_ip_pool() {{ return 0; }}
-cleanup_created_bare_metal_instances() {{ return 0; }}
-cleanup_created_subnets() {{ return 0; }}
-restore_dhcp_supervisor() {{ return 0; }}
-remove_netnode_public_key() {{ return 0; }}
-restore_containerlab_netnode_access() {{ return 0; }}
-remove_containerlab_switch_keys() {{ return 0; }}
-restore_containerlab_switch_access() {{ return 0; }}
-restore_netnode_download_network() {{ return 0; }}
-restore_provider_inventory_config() {{ return 0; }}
-restore_aap_ssh_key() {{ return 0; }}
-info() {{ :; }}
-{helper}
-cleanup_created_virtual_networks 1
-[[ -f "$CLI_CA_FILE" ]]
-"""
-    result = run_bash(tmp_path, script)
-
-    assert result.returncode == 0, result.stderr
-    assert temp_dir.is_dir()
+def test_generic_network_attachment_tasks_need_no_aap_kubernetes_credential() -> None:
+    assert 'run_agentless_net_aap_job apply_network_attachment' in SOURCE
+    assert 'run_agentless_net_aap_job query_dhcp_lease' in SOURCE
+    assert 'run_agentless_net_aap_job delete_network_attachment' in SOURCE
+    assert 'configure_aap_subnet_reader' not in SOURCE
+    assert 'cleanup_aap_subnet_reader' not in SOURCE
+    assert 'vlan-e2e-subnet-reader' not in SOURCE
+    assert 'create serviceaccount' not in SOURCE
+    assert 'network_attachment_macs' not in SOURCE
+    assert '.status.taskInput' in SOURCE
+    assert 'status.jobs' in SOURCE
 
 
 def test_repeated_dhcp_lease_queries_use_distinct_private_result_files(tmp_path: Path) -> None:
@@ -1262,14 +1060,15 @@ AAP_JOB_RESULT_SEQUENCE=0
 CAPTURE={shlex.quote(str(capture))}
 declare -A CLIENT_ATTACHMENT_SUBNET=([a1]=11234567-89ab-cdef-0123-456789abcdef)
 declare -A CLIENT_ATTACHMENT_ACTIVE=([a1]=true)
-write_client_bmi_extra_vars() {{ :; }}
+write_client_network_attachment_extra_vars() {{ :; }}
+assert_network_attachment_state() {{ :; }}
 run_agentless_net_aap_job() {{
-    [[ "$1" == query-dhcp-lease ]]
-    printf '%s\\n' "$3" >>"$CAPTURE"
-    printf '%s\\n' '{{"artifacts":{{"leases":[{{"subnet_ref":"11234567-89ab-cdef-0123-456789abcdef","interface":"eth0","mac_address":"02:00:00:00:00:01","ip_address":"10.0.0.2"}}]}}}}' >"$3"
+    [[ "$1" == query_dhcp_lease ]]
+    printf '%s\n' "$3" >>"$CAPTURE"
+    printf '%s\n' '{{"artifacts":{{"osac_result":{{"dhcp_lease":{{"ip_address":"10.0.0.2","mac_address":"02:00:00:00:00:01"}}}}}}}}' >"$3"
 }}
 info() {{ :; }}
-die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+die() {{ printf 'ERROR: %s\n' "$*" >&2; exit 1; }}
 {helper}
 discover_client_dhcp_lease a1
 discover_client_dhcp_lease a1
@@ -1284,55 +1083,78 @@ result_two="$(sed -n '2p' "$CAPTURE")"
     assert result.returncode == 0, result.stderr
 
 
-def test_bmi_extra_vars_reuse_identity_for_move_and_query_and_mark_offboard(tmp_path):
-    helpers = function_block("write_client_bmi_extra_vars", "attach_client_to_subnet")
+def test_network_attachment_vars_use_stored_subnet_snapshots(tmp_path: Path) -> None:
+    helper = function_block("write_client_network_attachment_extra_vars", "attach_client_to_subnet")
     variables = tmp_path / "client-vars"
+    subnet_id = "11234567-89ab-cdef-0123-456789abcdef"
+    target_id = "01234567-89ab-cdef-0123-456789abcdef"
+    attachment_uid = "21234567-89ab-cdef-0123-456789abcdef"
+    subnet_input = {
+        "resource": {
+            "apiVersion": "osac.openshift.io/v1alpha1",
+            "kind": "Subnet",
+            "id": subnet_id,
+            "metadata": {"name": "subnet-test", "namespace": "osac-e2e-ci", "uid": "31234567-89ab-cdef-0123-456789abcdef", "generation": 1},
+            "spec": {"ipv4Cidr": "10.0.0.0/28"},
+        },
+        "tenant": "osac-e2e-ci",
+        "virtual_network": {
+            "apiVersion": "osac.openshift.io/v1alpha1",
+            "kind": "VirtualNetwork",
+            "id": "41234567-89ab-cdef-0123-456789abcdef",
+            "metadata": {"name": "vn-test", "namespace": "osac-e2e-ci", "uid": "51234567-89ab-cdef-0123-456789abcdef", "generation": 1},
+            "spec": {"ipv4Cidr": "10.0.0.0/16"},
+        },
+        "ipam": {"gateway_ipv4": "10.0.0.1", "overlay_ipv4_cidrs": [], "physical_ipv4_cidrs": ["10.0.0.0/28"], "lb_vip_ipv4_cidrs": []},
+    }
+    subnet_cr = {"status": {"taskInput": subnet_input}}
     script = f"""
 set -euo pipefail
 TEMP_DIR={shlex.quote(str(tmp_path))}
 OSAC_NAMESPACE=osac-e2e-ci
-OSAC_TENANT=osac-e2e-ci
-declare -A CLIENT_BMI_UID=([a1]=01234567-89ab-cdef-0123-456789abcdef)
+declare -A CLIENT_BMI_API_ID=([a1]={target_id})
+declare -A CLIENT_ATTACHMENT_UID=([a1]={attachment_uid})
 declare -A CLIENT_PRESERVED_MAC=([a1]=02:00:00:00:00:01)
-{helpers}
-write_client_bmi_extra_vars a1 11234567-89ab-cdef-0123-456789abcdef {shlex.quote(str(variables / 'attach.json'))} false
-write_client_bmi_extra_vars a1 11234567-89ab-cdef-0123-456789abcdef {shlex.quote(str(variables / 'query.json'))} query
-write_client_bmi_extra_vars a1 11234567-89ab-cdef-0123-456789abcdef {shlex.quote(str(variables / 'offboard.json'))} true
-jq -e '
-  .osac_job_vars.resource.kind == "BareMetalInstance"
-  and .osac_job_vars.resource.metadata.annotations["osac.openshift.io/tenant"] == "osac-e2e-ci"
-  and .osac_job_vars.resource.metadata.annotations["osac.openshift.io/owner-reference"] == "vlan-e2e-run"
-  and .osac_job_vars.resource.metadata.annotations["osac.openshift.io/implementation-strategy"] == "agentless_net"
-  and .osac_job_vars.resource.metadata.uid == "01234567-89ab-cdef-0123-456789abcdef"
-  and .osac_job_vars.resource.spec.externalHostID == "osac-e2e-a1"
-  and .osac_job_vars.resource.spec.networkAttachments == [{{"subnetRef":"11234567-89ab-cdef-0123-456789abcdef","interface":"eth0","primary":true}}]
-' {shlex.quote(str(variables / 'attach.json'))} >/dev/null
-jq -e '.osac_job_vars.network_attachment_macs["11234567-89ab-cdef-0123-456789abcdef"] == "02:00:00:00:00:01"' \
-  {shlex.quote(str(variables / 'query.json'))} >/dev/null
-jq -e '
-  .osac_job_vars.resource.metadata.deletionTimestamp
-  | test("^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}T.*Z$")
-' {shlex.quote(str(variables / 'offboard.json'))} >/dev/null
+SUBNET_CR_JSON={shlex.quote(json.dumps(subnet_cr))}
+subnet_cr_json() {{ printf '%s' "$SUBNET_CR_JSON"; }}
+{helper}
+write_client_network_attachment_extra_vars a1 {subnet_id} apply_network_attachment {shlex.quote(str(variables / 'apply-network-attachment.json'))}
+write_client_network_attachment_extra_vars a1 {subnet_id} query_dhcp_lease {shlex.quote(str(variables / 'query-dhcp-lease.json'))}
+write_client_network_attachment_extra_vars a1 {subnet_id} delete_network_attachment {shlex.quote(str(variables / 'delete-network-attachment.json'))}
+for path in {shlex.quote(str(variables / 'apply-network-attachment.json'))} {shlex.quote(str(variables / 'query-dhcp-lease.json'))} {shlex.quote(str(variables / 'delete-network-attachment.json'))}; do
+  jq -e --arg task "$(basename "$path" .json | tr '-' '_')"     --arg target {target_id} --arg na_uid {attachment_uid} --arg subnet {subnet_id} '
+      .osac_job_vars.task == $task
+      and .osac_job_vars.manager == {{"name":"agentless_net","type":"fabric","ansible_role":"osac.templates.agentless_net"}}
+      and .osac_job_vars.resource.kind == "NetworkAttachment"
+      and .osac_job_vars.resource.id == $target
+      and .osac_job_vars.resource.metadata.uid == $na_uid
+      and .osac_job_vars.target.id == $target
+      and .osac_job_vars.target.host_name == "osac-e2e-a1"
+      and .osac_job_vars.network_attachment.subnet == $subnet
+      and .osac_job_vars.network_attachment.interface == {{"type":"physical","name":"eth0","mac_address":"02:00:00:00:00:01"}}
+      and .osac_job_vars.subnet.id == $subnet
+      and .osac_job_vars.virtual_network.id == "41234567-89ab-cdef-0123-456789abcdef"
+      and .osac_job_vars.ipam.physical_ipv4_cidrs == ["10.0.0.0/28"]
+      and (.osac_job_vars | has("network_attachment_macs") | not)
+    ' "$path" >/dev/null
+done
 """
     variables.mkdir()
     result = run_bash(tmp_path, script)
 
     assert result.returncode == 0, result.stderr
-    assert (variables / "attach.json").stat().st_mode & 0o777 == 0o600
-    assert (variables / "query.json").stat().st_mode & 0o777 == 0o600
-    assert (variables / "offboard.json").stat().st_mode & 0o777 == 0o600
+    for name in ("apply-network-attachment.json", "query-dhcp-lease.json", "delete-network-attachment.json"):
+        assert (variables / name).stat().st_mode & 0o777 == 0o600
 
 
-def test_client_attachment_is_idempotent_and_offboard_reuses_bmi_uid(tmp_path):
+def test_client_attachment_is_idempotent_and_offboard_reuses_api_id(tmp_path: Path) -> None:
     helpers = (
-        function_block("write_client_bmi_extra_vars", "attach_client_to_subnet")
-        + "\n"
-        + function_block("attach_client_to_subnet", "discover_client_dhcp_lease")
+        function_block("attach_client_to_subnet", "discover_client_dhcp_lease")
         + "\n"
         + function_block("offboard_client_from_subnet", "write_agentless_e2e_helpers")
     )
-    mac_file = tmp_path / "client-a1.mac"
-    mac_file.write_text("02:00:00:00:00:01\n")
+    subnet_id = "11234567-89ab-cdef-0123-456789abcdef"
+    (tmp_path / "client-a1.mac").write_text("02:00:00:00:00:01\n")
     script = f"""
 set -euo pipefail
 TEMP_DIR={shlex.quote(str(tmp_path))}
@@ -1342,36 +1164,40 @@ OSAC_TENANT=osac-e2e-ci
 declare -A CLIENT_ATTACHMENT_ACTIVE=()
 declare -A CLIENT_ATTACHMENT_PENDING=()
 declare -A CLIENT_ATTACHMENT_SUBNET=()
-declare -A CLIENT_BMI_UID=()
+declare -A CLIENT_BMI_API_ID=()
+declare -A CLIENT_ATTACHMENT_UID=()
 declare -A CLIENT_PRESERVED_MAC=()
 JOB_CALLS=0
+write_client_network_attachment_extra_vars() {{
+  local client="$1" subnet="$2" task="$3" output="$4"
+  jq -n --arg task "$task" --arg subnet "$subnet" --arg id "${{CLIENT_BMI_API_ID[$client]}}" \
+    '{{osac_job_vars:{{task:$task,resource:{{id:$id}},network_attachment:{{subnet:$subnet}}}}}}' >"$output"
+}}
+assert_network_attachment_state_absent() {{ :; }}
 run_agentless_net_aap_job() {{
-    local suffix="$1" vars="$2" output="$3"
-    [[ "$suffix" == move-network-attachment ]]
-    JOB_CALLS=$((JOB_CALLS + 1))
-    cp "$vars" "$TEMP_DIR/job-$JOB_CALLS.json"
-    printf '%s\\n' "$output" >>"$TEMP_DIR/result-paths.txt"
-    printf '{{"job_id":%d,"status":"successful","artifacts":{{}}}}\\n' "$JOB_CALLS" >"$output"
+  local task="$1" vars="$2" output="$3"
+  jq -e --arg task "$task" '.osac_job_vars.task == $task' "$vars" >/dev/null
+  JOB_CALLS=$((JOB_CALLS + 1))
+  cp "$vars" "$TEMP_DIR/job-$JOB_CALLS.json"
+  printf '%s\n' "$output" >>"$TEMP_DIR/result-paths.txt"
+  printf '{{"job_id":%d,"status":"successful","artifacts":{{}}}}\n' "$JOB_CALLS" >"$output"
 }}
 info() {{ :; }}
-die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+die() {{ printf 'ERROR: %s\n' "$*" >&2; exit 1; }}
 {helpers}
-attach_client_to_subnet a1 11234567-89ab-cdef-0123-456789abcdef
-first_uid="${{CLIENT_BMI_UID[a1]}}"
-attach_client_to_subnet a1 11234567-89ab-cdef-0123-456789abcdef
+attach_client_to_subnet a1 {subnet_id}
+first_id="${{CLIENT_BMI_API_ID[a1]}}"
+attach_client_to_subnet a1 {subnet_id}
 [[ "$JOB_CALLS" == 1 && "${{CLIENT_ATTACHMENT_ACTIVE[a1]}}" == true ]]
 [[ "${{CLIENT_ATTACHMENT_PENDING[a1]}}" == false ]]
 offboard_client_from_subnet a1
 [[ "$JOB_CALLS" == 2 && "${{CLIENT_ATTACHMENT_ACTIVE[a1]}}" == false ]]
-[[ -z "${{CLIENT_BMI_UID[a1]:-}}" && -z "${{CLIENT_ATTACHMENT_SUBNET[a1]:-}}" ]]
-attach_client_to_subnet a1 11234567-89ab-cdef-0123-456789abcdef
+[[ -z "${{CLIENT_BMI_API_ID[a1]:-}}" && -z "${{CLIENT_ATTACHMENT_SUBNET[a1]:-}}" ]]
+attach_client_to_subnet a1 {subnet_id}
 [[ "$JOB_CALLS" == 3 && "${{CLIENT_ATTACHMENT_ACTIVE[a1]}}" == true ]]
-[[ "${{CLIENT_BMI_UID[a1]}}" != "$first_uid" ]]
+[[ "${{CLIENT_BMI_API_ID[a1]}}" != "$first_id" ]]
 [[ "$(sort -u "$TEMP_DIR/result-paths.txt" | wc -l)" == 3 ]]
-jq -e --arg uid "$first_uid" '
-  .osac_job_vars.resource.metadata.uid == $uid
-  and .osac_job_vars.resource.metadata.deletionTimestamp != null
-' "$TEMP_DIR/job-2.json" >/dev/null
+jq -e '.osac_job_vars.task == "delete_network_attachment"' "$TEMP_DIR/job-2.json" >/dev/null
 """
     result = run_bash(tmp_path, script)
 
@@ -1484,7 +1310,7 @@ def test_runtime_source_pins_the_implementation_commit_and_requires_it_as_ancest
     production_file.write_text("fix source\n")
     git("add", "osac-aap/source.py")
     git("commit", "-m", "base")
-    git("checkout", "-b", "osac-6202-natgateway-snat")
+    git("checkout", "-b", "osac-6752-agentless-contract")
     production_file.write_text("implementation source\n")
     git("commit", "-am", "implementation")
     implementation_commit = git("rev-parse", "HEAD")
@@ -1499,26 +1325,86 @@ def test_runtime_source_pins_the_implementation_commit_and_requires_it_as_ancest
     script = f"""
 set -euo pipefail
 {helper}
-resolve_runtime_source {shlex.quote(str(repository))} osac-6202-natgateway-snat
+resolve_runtime_source {shlex.quote(str(repository))} osac-6752-agentless-contract
 """
     result = run_bash(tmp_path, script)
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["osac-6202-natgateway-snat", implementation_commit]
-    assert git("merge-base", "osac-6202-natgateway-snat", "HEAD") == implementation_commit
+    assert result.stdout.splitlines() == ["osac-6752-agentless-contract", implementation_commit]
+    assert git("merge-base", "osac-6752-agentless-contract", "HEAD") == implementation_commit
     assert subprocess.run(
-        ["git", "-C", str(repository), "diff", "--quiet", "osac-6202-natgateway-snat", "HEAD", "--", "osac-aap"]
+        ["git", "-C", str(repository), "diff", "--quiet", "osac-6752-agentless-contract", "HEAD", "--", "osac-aap"]
     ).returncode == 0
 
-    git("checkout", "osac-6202-natgateway-snat")
+    git("checkout", "osac-6752-agentless-contract")
     production_file.write_text("implementation advanced\n")
     git("commit", "-am", "advance implementation")
     git("checkout", "e2e")
     assert subprocess.run(
-        ["git", "-C", str(repository), "diff", "--quiet", "osac-6202-natgateway-snat", "HEAD", "--", "osac-aap"]
+        ["git", "-C", str(repository), "diff", "--quiet", "osac-6752-agentless-contract", "HEAD", "--", "osac-aap"]
     ).returncode == 1
     advanced = run_bash(tmp_path, script)
     assert advanced.returncode != 0
+
+
+def test_runtime_source_check_allows_only_declared_lab_overlays(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    installer = repository / "osac-installer"
+    overlay = installer / "values" / "agentless-net-stub.yaml"
+    chart_source = installer / "charts" / "osac" / "templates" / "deployment.yaml"
+    infra_role = installer / "charts" / "osac-infra" / "templates" / "keycloak" / "resources.yaml"
+    infra_test = installer / "scripts" / "test-service-account-idp-render.py"
+    overlay.parent.mkdir(parents=True)
+    chart_source.parent.mkdir(parents=True)
+    infra_role.parent.mkdir(parents=True)
+    infra_test.parent.mkdir(parents=True)
+    overlay.write_text("base overlay\n")
+    chart_source.write_text("base chart\n")
+    infra_role.write_text("base infra role\n")
+    infra_test.write_text("base infra test\n")
+
+    def git(*arguments: str) -> str:
+        result = subprocess.run(
+            ["git", "-C", str(repository), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    git("init", "--initial-branch=main")
+    git("config", "user.name", "E2E Test")
+    git("config", "user.email", "e2e@example.invalid")
+    git("add", "osac-installer")
+    git("commit", "-m", "base")
+    git("checkout", "-b", "osac-6752-agentless-contract")
+    chart_source.write_text("implementation chart\n")
+    git("commit", "-am", "implementation")
+    source_commit = git("rev-parse", "HEAD")
+    git("checkout", "-b", "e2e")
+    overlay.write_text("lab-specific overlay\n")
+    infra_role.write_text("lab Keycloak role fix\n")
+    infra_test.write_text("lab infra assertion\n")
+
+    helper_start = SOURCE.index("assert_runtime_source_clean() {")
+    helper_end = SOURCE.index("\n}\n", helper_start) + 3
+    helper = SOURCE[helper_start:helper_end]
+    command = (
+        f"set -euo pipefail\n{helper}\n"
+        f"assert_runtime_source_clean {shlex.quote(str(repository))} "
+        f"{shlex.quote(source_commit)} osac-installer\n"
+    )
+    disallowed_without_infra_reuse = run_bash(tmp_path, command)
+    assert disallowed_without_infra_reuse.returncode != 0
+    assert "uncommitted changes" in disallowed_without_infra_reuse.stderr
+
+    allowed_reuse_overlays = run_bash(tmp_path, f"VLAN_E2E_REUSE_INFRA=true\n{command}")
+    assert allowed_reuse_overlays.returncode == 0, allowed_reuse_overlays.stderr
+
+    chart_source.write_text("uncommitted chart change\n")
+    changed_chart = run_bash(tmp_path, f"VLAN_E2E_REUSE_INFRA=true\n{command}")
+    assert changed_chart.returncode != 0
+    assert "uncommitted changes" in changed_chart.stderr
 
 
 def test_runtime_source_rejects_a_missing_implementation_branch(tmp_path: Path) -> None:
@@ -1540,7 +1426,7 @@ def test_runtime_source_rejects_a_missing_implementation_branch(tmp_path: Path) 
         tmp_path,
         f"set -euo pipefail\n{helper}\n"
         f"resolve_runtime_source {shlex.quote(str(repository))} "
-        "osac-6202-natgateway-snat\n",
+        "osac-6752-agentless-contract\n",
     )
     assert result.returncode != 0
 
@@ -1559,6 +1445,92 @@ def test_runner_stages_are_ordered_and_source_revision_is_pinned():
     assert 'AAP_PROJECT_GIT_BRANCH" == "$RUNTIME_SOURCE_BRANCH"' in SOURCE
     assert 'AAP_PROJECT_EXPECTED_REVISION" == "$RUNTIME_SOURCE_COMMIT"' in SOURCE
     assert 'IMAGE_SOURCE_COMMIT="$RUNTIME_SOURCE_COMMIT"' in SOURCE
+    assert 'IMPLEMENTATION_BRANCH_NAME="osac-6752-agentless-contract"' in SOURCE
+    assert 'OSAC_PROFILE="${OSAC_PROFILE:-bmaas-ci}"' in SOURCE
+
+
+def test_agentless_overlay_is_bmaas_only_with_physical_ipam_and_fresh_state() -> None:
+    overlay = yaml.safe_load((REPO_ROOT / "osac-installer/values/agentless-net-stub.yaml").read_text())
+    profile = yaml.safe_load((REPO_ROOT / "osac-installer/values/bmaas-ci/instance.yaml").read_text())
+
+    networking = overlay["global"]["networking"]
+    assert networking["provisioningEnabled"] is True
+    assert networking["fabricManager"] == "agentless_net"
+    assert networking["k8sManager"] == ""
+    assert networking["networkClass"]["addressPlan"] == {"overlay": 0, "fabric": 1, "lbVip": 0}
+    assert overlay["aap"]["instanceGroups"]["networkFulfillment"]["config"] == {
+        "AGENTLESS_NET_STATE_FILE": "/etc/osac/agentless_network_state_osac_6752.sqlite3",
+        "AGENTLESS_NET_EXTERNAL_INTERFACE": "eth2",
+    }
+    assert overlay["operator"]["tenants"] == [{"name": "shared"}]
+    assert overlay["bmf"]["replicaCount"] == 0
+    assert overlay["bmf"]["metal3"]["enabled"] is False
+    assert profile["global"]["services"] == {
+        "caas": {"enabled": False},
+        "vmaas": {"enabled": False},
+        "bmaas": {"enabled": True},
+        "maas": {"enabled": False},
+    }
+
+
+def test_bootstrap_pool_precedes_default_networking_and_keeps_existing_rows() -> None:
+    setup_start = SOURCE.index('step "STEP 4 OF 5: Initializing provider and fabric"')
+    setup_end = SOURCE.index('step "STEP 5 OF 5: Running', setup_start)
+    setup = SOURCE[setup_start:setup_end]
+
+    assert setup.index("ensure_bootstrap_external_ip_pool") < setup.index("ensure_osac_tenant")
+    assert setup.index("ensure_osac_tenant") < setup.index("wait_for_tenant_default_networking")
+    assert "BOOTSTRAP_EXTERNAL_IP_POOL_NAME" in SOURCE
+    assert 'metadata.tenant == "shared"' in function_block("ensure_bootstrap_external_ip_pool", "external_ip_pool_rpc_error_is_not_found")
+    assert "assert_baseline_state_unchanged" in SOURCE
+    assert "assert_legacy_provider_state_unchanged" in SOURCE
+
+
+def test_networking_status_uses_conditions_and_task_jobs_without_resetting_history() -> None:
+    assert ".status.phase" not in SOURCE
+    assert ".status.provisioningJobs" not in SOURCE
+    assert "--subresource=status" not in SOURCE
+    assert 'select(.task == $task and .manager == $manager)' in SOURCE
+    assert '.status.conditions[]? | select(.type == "Ready")' in SOURCE
+
+
+def test_deployment_comparison_uses_only_supported_networkclass_values() -> None:
+    settings = function_block("deployment_settings", "prepare_upgrade_values")
+    expected_start = SOURCE.index("EXPECTED_DEPLOYMENT_SETTINGS=")
+    expected_end = SOURCE.index("OSAC_DEPLOYMENT_NEEDED=", expected_start)
+    expected = SOURCE[expected_start:expected_end]
+
+    assert ".global.networking.networkClass.title" not in settings
+    assert "networkClassTitle" not in expected
+    assert "networkClass.addressPlan" in settings
+    assert "addressPlan:{overlay:0,fabric:1,lbVip:0}" in expected
+
+
+def test_deployment_uses_the_source_pinned_aap_image_for_bootstrap_and_jobs() -> None:
+    settings = function_block("deployment_settings", "prepare_upgrade_values")
+    expected_start = SOURCE.index("EXPECTED_DEPLOYMENT_SETTINGS=")
+    expected_end = SOURCE.index("OSAC_DEPLOYMENT_NEEDED=", expected_start)
+    expected = SOURCE[expected_start:expected_end]
+
+    assert "bootstrapImage: .aap.bootstrap.image" in settings
+    assert "--set-string aap.bootstrap.image=${AAP_IMAGE}" in SOURCE
+    assert '--set-string "aap.bootstrap.image=${AAP_IMAGE}"' in SOURCE
+    assert "bootstrapImage:$ee" in expected
+
+
+def test_runner_can_adopt_osac_crds_for_a_fresh_namespace_reinstall() -> None:
+    assert 'VLAN_E2E_TAKE_OWNERSHIP="${VLAN_E2E_TAKE_OWNERSHIP:-false}"' in SOURCE
+    assert 'EXTRA_HELM_ARGS+=" --take-ownership"' in SOURCE
+    assert 'INFRA_HELM_ARGS="--take-ownership"' in SOURCE
+    assert '"INFRA_HELM_ARGS=${INFRA_HELM_ARGS}"' in SOURCE
+    assert "VLAN_E2E_TAKE_OWNERSHIP must be true or false" in SOURCE
+
+
+def test_runner_can_reinstall_osac_without_upgrading_healthy_infra() -> None:
+    assert 'VLAN_E2E_REUSE_INFRA="${VLAN_E2E_REUSE_INFRA:-false}"' in SOURCE
+    assert '[[ "$VLAN_E2E_REUSE_INFRA" == true ]]' in SOURCE
+    assert "INSTALL_TARGET=install-osac" in SOURCE
+    assert 'make -C "$INSTALLER_DIR" "$INSTALL_TARGET"' in SOURCE
 
 
 @pytest.mark.parametrize(
@@ -1569,7 +1541,7 @@ def test_upgrade_values_normalize_empty_legacy_dns_class(
 ) -> None:
     helper = function_block("prepare_upgrade_values", "tenant_exists")
     installer = tmp_path / "installer"
-    profile = installer / "values" / "caas-ci" / "instance.yaml"
+    profile = installer / "values" / "bmaas-ci" / "instance.yaml"
     profile.parent.mkdir(parents=True)
     profile.write_text("clusterVersions:\n  versions: []\n")
     previous_values = tmp_path / "previous-values.json"
@@ -1581,7 +1553,7 @@ set -euo pipefail
 TEMP_DIR={shlex.quote(str(tmp_path))}
 INSTALLER_DIR={shlex.quote(str(installer))}
 OSAC_NAMESPACE=osac-e2e-ci
-OSAC_PROFILE=caas-ci
+OSAC_PROFILE=bmaas-ci
 helm() {{ cat {shlex.quote(str(previous_values))}; }}
 die() {{ printf '%s\\n' "$*" >&2; exit 1; }}
 {helper}
@@ -1592,6 +1564,80 @@ prepare_upgrade_values
     assert result.returncode == 0, result.stderr
     upgraded = yaml.safe_load((tmp_path / "previous-helm-values.yaml").read_text())
     assert upgraded["aap"]["instanceGroups"]["clusterFulfillment"]["config"]["DNS_CLASS"] == expected_dns_class
+
+
+def test_upgrade_values_translate_legacy_networking_for_the_bmaas_lab(tmp_path: Path) -> None:
+    helper = function_block("prepare_upgrade_values", "tenant_exists")
+    installer = tmp_path / "installer"
+    profile = installer / "values" / "bmaas-ci" / "instance.yaml"
+    profile.parent.mkdir(parents=True)
+    profile.write_text(
+        "global:\n"
+        "  services:\n"
+        "    caas: {enabled: false}\n"
+        "    vmaas: {enabled: false}\n"
+        "    bmaas: {enabled: true}\n"
+        "    maas: {enabled: false}\n"
+        "clusterVersions:\n  versions: []\n"
+    )
+    previous_values = tmp_path / "previous-values.json"
+    previous_values.write_text(
+        json.dumps(
+            {
+                "global": {
+                    "expertOverrides": {"networkClass": True},
+                    "services": {"caas": {"enabled": True}, "bmaas": {"enabled": True}},
+                    "networking": {
+                        "fabricManager": "agentless_net",
+                        "k8sManager": "",
+                        "netris": {"controllerUrl": "https://old.example.invalid"},
+                        "networkClass": {"title": "old title", "description": "old description"},
+                    },
+                },
+                "networkClass": {
+                    "enabled": False,
+                    "isDefault": True,
+                    "defaults": {
+                        "virtualNetworkIPv4Cidr": "10.200.0.0/16",
+                        "subnetIPv4Cidr": "10.200.0.0/20",
+                        "egressRules": [{"protocol": "PROTOCOL_ALL", "ipv4Cidr": "0.0.0.0/0"}],
+                        "enableNatGateway": False,
+                    },
+                },
+                "operator": {"controllers": {"networking": True, "networkingProvisioning": True}},
+            }
+        )
+    )
+    script = f"""
+set -euo pipefail
+TEMP_DIR={shlex.quote(str(tmp_path))}
+INSTALLER_DIR={shlex.quote(str(installer))}
+OSAC_NAMESPACE=osac-e2e-ci
+OSAC_PROFILE=bmaas-ci
+helm() {{ cat {shlex.quote(str(previous_values))}; }}
+die() {{ printf '%s\\n' "$*" >&2; exit 1; }}
+{helper}
+prepare_upgrade_values
+"""
+
+    result = run_bash(tmp_path, script)
+    assert result.returncode == 0, result.stderr
+    upgraded = yaml.safe_load((tmp_path / "previous-helm-values.yaml").read_text())
+    assert "expertOverrides" not in upgraded["global"]
+    assert "netris" not in upgraded["global"]["networking"]
+    network_class = upgraded["global"]["networking"]["networkClass"]
+    assert "title" not in network_class and "description" not in network_class
+    assert network_class["defaults"]["virtualNetworkIPv4Cidr"] == "10.200.0.0/16"
+    assert network_class["defaults"]["subnetIPv4Cidr"] == "10.200.0.0/20"
+    assert "enableNatGateway" not in network_class["defaults"]
+    assert "networkClass" not in upgraded
+    assert upgraded["global"]["services"] == {
+        "caas": {"enabled": False},
+        "vmaas": {"enabled": False},
+        "bmaas": {"enabled": True},
+        "maas": {"enabled": False},
+    }
+    assert "networkingProvisioning" not in upgraded["operator"]["controllers"]
 
 
 def test_full_suite_runs_attachment_lifecycle_after_creating_its_network_and_client():
@@ -1671,10 +1717,10 @@ def test_external_ip_cleanup_orders_detach_before_dependent_resources() -> None:
         cleanup.index("cleanup_created_external_ip_attachments"),
         cleanup.index("remove_external_ip_client_routes"),
         cleanup.index("cleanup_created_external_ips"),
-        cleanup.index("cleanup_created_external_ip_pool"),
         cleanup.index("cleanup_created_bare_metal_instances"),
         cleanup.index("cleanup_created_subnets"),
         cleanup.index('delete virtualnetwork "$id"'),
+        cleanup.index("cleanup_created_external_ip_pool"),
     ]
     assert positions == sorted(positions)
 
@@ -1687,9 +1733,9 @@ def test_nat_gateway_cleanup_precedes_clients_and_all_network_dependencies() -> 
         cleanup.index("cleanup_created_external_ip_attachments"),
         cleanup.index("remove_external_ip_client_routes"),
         cleanup.index("cleanup_created_external_ips"),
-        cleanup.index("cleanup_created_external_ip_pool"),
         cleanup.index("cleanup_created_subnets"),
         cleanup.index('delete virtualnetwork "$id"'),
+        cleanup.index("cleanup_created_external_ip_pool"),
         cleanup.index("restore_nat_gateway_uplink"),
         cleanup.index("restore_provider_inventory_config"),
     ]
@@ -1728,7 +1774,7 @@ def test_nat_gateway_cleanup_discovery_scopes_crs_and_provider_identity() -> Non
     assert 'EXTERNAL_IP_POOL_ID="$pool_id"' in nat_gateway_discovery
     assert 'external_ip_pool_validate_cr_identity "$pool_cr" "$pool_id"' in nat_gateway_discovery
     assert 'external_ip_cr_json "$nat_gateway_eip_id" "$pool_id"' in nat_gateway_discovery
-    assert '"osac.openshift.io/natgateway-contract-version"] == "v1"' in SOURCE
+    assert '"osac.openshift.io/natgateway-contract-version"]' not in SOURCE
     assert ".[0].virtual_network_uid == $vn_uid" in cleanup
     assert ".[0].external_ip_uid == $eip_uid" in cleanup
     assert "test NATGateway provider row without a matching test CR" in cleanup
@@ -1737,11 +1783,11 @@ def test_nat_gateway_cleanup_discovery_scopes_crs_and_provider_identity() -> Non
 def test_nat_gateway_cleanup_validates_aap_success_when_cr_job_status_lags() -> None:
     cleanup = function_block("delete_nat_gateway_and_verify", "cleanup_created_nat_gateways")
 
-    assert 'if [[ "$job_state" == Failed || "$job_state" == Canceled ]]' in cleanup
-    assert 'if [[ -n "$job_id" ]]' in cleanup
-    assert 'nat_gateway_aap_job_details "$job_id" nat_gateway.delete' in cleanup
-    assert 'nat_gateway_assert_delete_job "$details" "$gateway_cr"' in cleanup
-    assert '&& "$job_state" == Succeeded' not in cleanup
+    assert 'network_task_entry "$gateway_cr" delete_nat_gateway' in cleanup
+    assert 'if [[ "$job_state" == Failed || "$job_state" == Cancelled ]]' in cleanup
+    assert '&& "$job_state" == Succeeded' in cleanup
+    assert '.status.taskInput' in cleanup
+    assert 'nat_gateway_aap_job_details' not in cleanup
 
 
 def test_nat_gateway_endpoint_cleanup_matches_docker_resolved_router_id(tmp_path: Path) -> None:
@@ -1804,11 +1850,10 @@ def test_external_ip_cr_lookup_can_resolve_pool_during_recovery(tmp_path: Path) 
                     "labels": {"osac.openshift.io/externalip-uuid": external_ip_id},
                     "annotations": {
                         "osac.openshift.io/tenant": "osac-e2e-ci",
-                        "osac.openshift.io/implementation-strategy": "agentless_net",
-                        "osac.openshift.io/externalip-contract-version": "v1",
                     },
                 },
                 "spec": {"pool": pool_id},
+                "status": {"networkManagers": {"fabric": {"name": "agentless_net"}}},
             }
         ]
     }
@@ -1840,11 +1885,10 @@ def test_nat_gateway_cr_lookup_accepts_controller_generated_cr_name(tmp_path: Pa
                     "labels": {"osac.openshift.io/natgateway-uuid": nat_gateway_id},
                     "annotations": {
                         "osac.openshift.io/tenant": "osac-e2e-ci",
-                        "osac.openshift.io/implementation-strategy": "agentless_net",
-                        "osac.openshift.io/natgateway-contract-version": "v1",
                     },
                 },
                 "spec": {"virtualNetwork": "vn-id", "externalIP": "eip-id"},
+                "status": {"networkManagers": {"fabric": {"name": "agentless_net"}}},
             }
         ]
     }
@@ -2209,9 +2253,11 @@ cleanup_created_external_ip_attachments
 
 
 def test_external_ip_state_snapshot_and_peer_checks_include_attachments() -> None:
-    assert '"external_ip_attachments": attachment_entries' in SOURCE
+    assert '"external_ip_attachments": attachments' in SOURCE
     assert "external_ip_attachments external_ip_attachments" not in SOURCE
-    assert "for collection in virtual_networks subnets external_ip_pools external_ips external_ip_attachments" in SOURCE
+    assert "network_attachment_ports" in SOURCE
+    assert "deleted_resources" in SOURCE
+    assert '"state_contract": metadata[0][1]' in SOURCE
     assert 'peer_state="$(external_ip_attachment_state_entry' in SOURCE
     assert "changed its peer attachment state" in SOURCE
 
@@ -2224,7 +2270,7 @@ def test_external_ip_attachment_uses_a_synthetic_dhcp_client_target() -> None:
     assert 'client="$EXTERNAL_IP_SYNTHETIC_CLIENT"' in setup
     assert 'attach_client_to_subnet "$client" "$EXTERNAL_IP_ATTACHMENT_SUBNET_ID"' in setup
     assert 'discover_client_dhcp_lease "$client"' in setup
-    assert 'EXTERNAL_IP_SYNTHETIC_TARGET_UID="${CLIENT_BMI_UID[$client]:-}"' in setup
+    assert 'EXTERNAL_IP_SYNTHETIC_TARGET_UID="$EXTERNAL_IP_SYNTHETIC_TARGET_ID"' in setup
     assert 'EXTERNAL_IP_SYNTHETIC_TARGET_IP=' in setup
     assert 'create baremetalinstance' not in setup
     assert 'catalog-item' not in setup
@@ -2252,72 +2298,70 @@ def test_attachment_cleanup_discovery_checks_prefix_tenant_and_parent_scope() ->
     assert "references a BMI outside the test name scope" in cleanup
 
 
-def test_state_snapshot_includes_attachment_rows_and_accepts_existing_schema_v1(tmp_path: Path) -> None:
+def test_state_snapshot_enforces_api_id_schema_and_reports_new_tables(tmp_path: Path) -> None:
     helper = function_block("state_snapshot", "save_current_state")
     body_start = helper.index("<<'PY'\n") + len("<<'PY'\n")
     body_end = helper.index("\nPY\n", body_start)
     snapshot_code = helper[body_start:body_end]
 
-    def create_state(
-        path: Path, *, attachments: bool, nat_gateways: bool = False, unknown_table: bool = False
-    ) -> None:
+    def create_state(path: Path, *, marker: str = "network-manager-api-id-v1", unknown_table: bool = False) -> None:
         connection = sqlite3.connect(path)
         connection.executescript(
             """
             CREATE TABLE virtual_networks (uid TEXT, tenant_id TEXT, virtual_network_cidr TEXT,
               namespace_name TEXT, namespace_interface TEXT, host_interface TEXT,
-              transit_cidr TEXT, transit_start TEXT, payload TEXT);
+              transit_cidr TEXT, transit_start INTEGER, payload TEXT);
             CREATE TABLE subnets (uid TEXT, virtual_network_uid TEXT, tenant_id TEXT, vlan_id INTEGER,
               vlan_interface TEXT, ipv4_cidr TEXT, phase TEXT, payload TEXT);
             CREATE TABLE external_ip_pools (uid TEXT, fulfillment_id TEXT, tenant_id TEXT,
               ip_family TEXT, ipv4_cidr TEXT);
             CREATE TABLE external_ips (uid TEXT, fulfillment_id TEXT, tenant_id TEXT,
               pool_uid TEXT, address TEXT);
+            CREATE TABLE attachments (uid TEXT, fulfillment_id TEXT, tenant_id TEXT,
+              external_ip_uid TEXT, virtual_network_uid TEXT, subnet_uid TEXT,
+              external_address TEXT, phase TEXT, payload TEXT);
+            CREATE TABLE nat_gateways (uid TEXT, fulfillment_id TEXT, tenant_id TEXT,
+              external_ip_uid TEXT, virtual_network_uid TEXT, external_address TEXT,
+              phase TEXT, payload TEXT);
+            CREATE TABLE network_attachments (uid TEXT, tenant_id TEXT, virtual_network_uid TEXT,
+              subnet_uid TEXT, host_name TEXT, interface_name TEXT, mac_address TEXT,
+              address TEXT, phase TEXT, payload TEXT);
+            CREATE TABLE network_attachment_ports (switch_name TEXT, port_name TEXT, attachment_uid TEXT);
+            CREATE TABLE deleted_resources (kind TEXT, uid TEXT, tenant_id TEXT);
+            CREATE TABLE state_metadata (key TEXT, value TEXT);
             """
         )
-        if attachments:
-            connection.executescript(
-                """
-                CREATE TABLE attachments (uid TEXT, fulfillment_id TEXT, tenant_id TEXT,
-                  external_ip_uid TEXT, virtual_network_uid TEXT, subnet_uid TEXT,
-                  external_address TEXT, phase TEXT, payload TEXT);
-                """
-            )
-            connection.execute(
-                "INSERT INTO attachments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    "attachment-uid",
-                    "attachment-id",
-                    "test-tenant",
-                    "eip-uid",
-                    "vn-uid",
-                    "subnet-uid",
-                    "198.51.100.21",
-                    "ready",
-                    json.dumps({"context": {"target": {"ip_address": "10.250.1.5"}}}),
-                ),
-            )
-        if nat_gateways:
-            connection.executescript(
-                """
-                CREATE TABLE nat_gateways (uid TEXT, fulfillment_id TEXT, tenant_id TEXT,
-                  external_ip_uid TEXT, virtual_network_uid TEXT, external_address TEXT,
-                  phase TEXT, payload TEXT);
-                """
-            )
-            connection.execute(
-                "INSERT INTO nat_gateways VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    "nat-gateway-uid",
-                    "nat-gateway-id",
-                    "test-tenant",
-                    "eip-uid",
-                    "vn-uid",
-                    "198.51.100.22",
-                    "ready",
-                    json.dumps({"phase": "ready", "provider": {"next_hop": "10.250.0.1/31"}}),
-                ),
-            )
+        connection.execute("INSERT INTO state_metadata VALUES ('contract', ?)", (marker,))
+        attachment = {
+            "uid": "attachment-id",
+            "tenant_id": "test-tenant",
+            "virtual_network_uid": "vn-api-id",
+            "subnet_uid": "subnet-api-id",
+            "host_name": "osac-e2e-a1",
+            "interface_name": "eth0",
+            "mac_address": "02:00:00:00:00:01",
+            "address": "10.0.1.2",
+            "phase": "ready",
+            "ports": [{"switch_name": "leaf-1", "port_name": "swp2", "selected": True, "fabric": True}],
+        }
+        connection.execute(
+            "INSERT INTO network_attachments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (attachment["uid"], attachment["tenant_id"], attachment["virtual_network_uid"],
+             attachment["subnet_uid"], attachment["host_name"], attachment["interface_name"],
+             attachment["mac_address"], attachment["address"], attachment["phase"], json.dumps(attachment)),
+        )
+        connection.execute("INSERT INTO network_attachment_ports VALUES (?, ?, ?)", ("leaf-1", "swp2", "attachment-id"))
+        connection.execute("INSERT INTO deleted_resources VALUES (?, ?, ?)", ("Subnet", "deleted-subnet-id", "test-tenant"))
+        connection.execute(
+            "INSERT INTO attachments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("eia-api-id", "eia-api-id", "test-tenant", "eip-api-id", "vn-api-id", "subnet-api-id",
+             "198.51.100.21", "ready", json.dumps({"context": {"destination": {"address": "10.0.1.2"}}})),
+        )
+        connection.execute(
+            "INSERT INTO nat_gateways VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("nat-api-id", "nat-api-id", "test-tenant", "eip-api-id", "vn-api-id",
+             "198.51.100.22", "ready", json.dumps({"phase": "ready"})),
+        )
         if unknown_table:
             connection.execute("CREATE TABLE unexpected (value TEXT)")
         connection.execute("PRAGMA user_version=1")
@@ -2331,53 +2375,40 @@ def test_state_snapshot_includes_attachment_rows_and_accepts_existing_schema_v1(
         return json.loads(result.stdout)
 
     current_schema = tmp_path / "current.sqlite3"
-    create_state(current_schema, attachments=True, nat_gateways=True)
+    create_state(current_schema)
     snapshot = read_state(current_schema)
-    assert snapshot["external_ip_attachments"] == [
-        {
-            "uid": "attachment-uid",
-            "fulfillment_id": "attachment-id",
-            "tenant_id": "test-tenant",
-            "external_ip_uid": "eip-uid",
-            "virtual_network_uid": "vn-uid",
-            "subnet_uid": "subnet-uid",
-            "external_address": "198.51.100.21",
-            "phase": "ready",
-            "payload": {"context": {"target": {"ip_address": "10.250.1.5"}}},
-        }
+    assert snapshot["state_contract"] == "network-manager-api-id-v1"
+    assert snapshot["identity_semantics"] == "api-id"
+    assert snapshot["network_attachments"][0]["api_id"] == "attachment-id"
+    assert snapshot["network_attachment_ports"] == [
+        {"switch_name": "leaf-1", "port_name": "swp2", "attachment_uid": "attachment-id", "attachment_api_id": "attachment-id"}
     ]
-    assert snapshot["nat_gateways"] == [
-        {
-            "uid": "nat-gateway-uid",
-            "fulfillment_id": "nat-gateway-id",
-            "tenant_id": "test-tenant",
-            "external_ip_uid": "eip-uid",
-            "virtual_network_uid": "vn-uid",
-            "external_address": "198.51.100.22",
-            "phase": "ready",
-            "payload": {"phase": "ready", "provider": {"next_hop": "10.250.0.1/31"}},
-        }
+    assert snapshot["deleted_resources"] == [
+        {"kind": "Subnet", "uid": "deleted-subnet-id", "api_id": "deleted-subnet-id", "tenant_id": "test-tenant"}
     ]
+    assert snapshot["external_ip_attachments"][0]["api_id"] == "eia-api-id"
+    assert snapshot["nat_gateways"][0]["api_id"] == "nat-api-id"
 
-    attachment_schema = tmp_path / "attachment-schema.sqlite3"
-    create_state(attachment_schema, attachments=True)
-    assert read_state(attachment_schema)["nat_gateways"] == []
+    missing = read_state(tmp_path / "missing.sqlite3")
+    assert missing["schema_version"] == 0
+    assert missing["network_attachments"] == []
+    assert missing["deleted_resources"] == []
 
-    previous_schema = tmp_path / "previous.sqlite3"
-    create_state(previous_schema, attachments=False)
-    assert read_state(previous_schema)["external_ip_attachments"] == []
-    assert read_state(previous_schema)["nat_gateways"] == []
-
-    unknown_schema = tmp_path / "unknown-schema.sqlite3"
-    create_state(unknown_schema, attachments=False, unknown_table=True)
+    bad_marker = tmp_path / "bad-marker.sqlite3"
+    create_state(bad_marker, marker="legacy-uid-v1")
     result = subprocess.run(
-        [sys.executable, "-", str(unknown_schema)],
-        input=snapshot_code,
-        capture_output=True,
-        text=True,
-        check=False,
+        [sys.executable, "-", str(bad_marker)], input=snapshot_code, capture_output=True, text=True, check=False
     )
     assert result.returncode != 0
+    assert "contract marker" in result.stderr
+
+    unknown_schema = tmp_path / "unknown-schema.sqlite3"
+    create_state(unknown_schema, unknown_table=True)
+    result = subprocess.run(
+        [sys.executable, "-", str(unknown_schema)], input=snapshot_code, capture_output=True, text=True, check=False
+    )
+    assert result.returncode != 0
+    assert "tables do not match" in result.stderr
 
 
 def test_suite_flags_select_the_same_scope_for_run_and_cleanup(tmp_path):
@@ -2514,9 +2545,10 @@ def test_cleanup_provider_verifier_resolves_dynamic_state_collections():
         "verify_suite_cleanup_provider_state", "cleanup_created_virtual_networks"
     )
 
-    assert "baseline_uids=\"$(jq -r --arg collection \"$collection\"" in verifier
-    assert "if (.[$collection] | type) != \"array\" then error" in verifier
-    assert '".[$collection][].uid"' not in verifier
+    assert "deleted_resources" in verifier
+    assert "assert_baseline_state_unchanged || return 1" in verifier
+    assert '.kind != "VirtualNetwork"' in verifier
+    assert '.kind != "Subnet"' in verifier
 
 
 def test_cleanup_supervisor_verifier_treats_no_such_process_as_absent(tmp_path):
@@ -2546,7 +2578,9 @@ def test_standalone_subnet_cleanup_offboards_saved_test_bmis_before_removing_cli
 
     assert helper.index("CLEANUP_CLIENTS_COMPLETE=false") < helper.index("offboard_client_from_subnet")
     assert helper.index("offboard_client_from_subnet") < helper.index('docker rm -f "$container"')
-    assert "osac.openshift.io/owner-reference\"] == \"vlan-e2e-run\"" in helper
+    assert '.task == "apply_network_attachment" or .task == "delete_network_attachment"' in helper
+    assert '.target.host_name == ("osac-e2e-" + $client)' in helper
+    assert '.network_attachment.interface.mac_address' in helper
     assert 'candidate_subnet" == "$subnet_ref"' in helper
     assert 'switch_exec "$CLIENT_SWITCH" bridge -j vlan show dev "$CLIENT_SWITCH_PORT"' in helper
     assert 'index("Egress Untagged") != null' in helper

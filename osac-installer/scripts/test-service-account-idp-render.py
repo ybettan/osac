@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import subprocess
 import textwrap
+import yaml
 
 INSTALLER = Path(__file__).resolve().parents[1]
 SERVICE = INSTALLER.parent / "fulfillment-service/charts/service"
@@ -44,6 +45,17 @@ def check():
             assert flag in document, (name, flag)
     assert consumers == {"fulfillment-controller"}, consumers
     documents = render(INSTALLER / "charts/osac-infra", "--set", "keycloak.devFixtures.enabled=true")
+    keycloak_service_role = next(
+        yaml.safe_load(d)
+        for d in documents
+        if "kind: Role\n" in d and "  name: keycloak-service\n" in d
+    )
+    assert any(
+        rule.get("resources") == ["secrets"]
+        and rule.get("resourceNames") == ["keycloak-client-secrets"]
+        and {"get", "patch"}.issubset(set(rule.get("verbs", [])))
+        for rule in keycloak_service_role["rules"]
+    )
     realm_documents = [d for d in documents if "kind: ConfigMap\n" in d and "  name: keycloak-realm\n" in d]
     assert len(realm_documents) == 1
     realm = json.loads(textwrap.dedent(realm_documents[0].split("  realm.json: |\n", 1)[1]))
