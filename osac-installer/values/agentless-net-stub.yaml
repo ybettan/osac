@@ -6,7 +6,21 @@ global:
     provisioningEnabled: true
     fabricManager: agentless_net
     k8sManager: ""
+    networkClass:
+      addressPlan:
+        overlay: 0
+        fabric: 1
+        lbVip: 0
 aap:
   instanceGroups:
     networkFulfillment:
-      enabled: true
+      config:
+        AGENTLESS_NET_STATE_FILE: /etc/osac/agentless_network_state_osac_6752.sqlite3
+        AGENTLESS_NET_EXTERNAL_INTERFACE: eth2
+operator:
+  tenants:
+  - name: shared
+bmf:
+  replicaCount: 0
+  metal3:
+    enabled: false
