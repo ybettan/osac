@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# OSAC-5528/OSAC-5530/OSAC-6202/OSAC-6306/OSAC-6307 AgentlessNet development lab:
+# OSAC-5528/OSAC-6752/OSAC-6202/OSAC-6306/OSAC-6307 AgentlessNet development lab:
 #   1. Boot or reuse the SNO with cluster-tool.
 #   2. Build and push runtime images when source inputs changed, or reuse their tags.
 #   3. Install or upgrade OSAC with those custom images.
@@ -23,7 +23,7 @@ Suites:
   subnet-dhcp       Create a parent VirtualNetwork and run the Subnet/DHCP E2E.
   external-ip-pool  Create, verify, and delete one ExternalIPPool.
   external-ip       Verify ExternalIP allocation and ExternalIPAttachment ingress.
-  nat-gateway       Verify NATGateway v1 VN-wide SNAT, Subnet independence, retry, and cleanup.
+  nat-gateway       Verify generic NATGateway tasks, VN-wide SNAT, and cleanup.
 
 All suites boot or reuse the SNO, deploy or reuse OSAC and the Containerlab
 fabric, initialize the declared trunks, and run the selected checks. Set
@@ -33,6 +33,10 @@ local lab key path; VLAN_E2E_RUN_DIR optionally retains sanitized run evidence.
 Use --cleanup with --suite SUITE (or a suite shorthand) as a standalone command
 to remove only test-named resources for that suite through Fulfillment. It
 uses the existing lab and exits without deploying or initializing it.
+Set VLAN_E2E_TAKE_OWNERSHIP=true only when reinstalling into a fresh namespace
+that reuses OSAC-owned cluster-scoped CRDs from the prior E2E release.
+Set VLAN_E2E_REUSE_INFRA=true when the existing OSAC infrastructure release is
+healthy and should be reused without reinstalling operators or MetalLB.
 The runner requires a compatible AgentlessNet schema V1 database and preserves
 any incompatible existing state. Keep the AgentlessNet state schema at V1 until
 OSAC-5528 is complete.
@@ -188,9 +192,9 @@ MGMT_VM_NAME="test-infra-cluster-${MGMT_CLONE_NAME}-master-0"
 MGMT_LIBVIRT_NET="test-infra-net-${MGMT_CLONE_NAME}"
 SNO_FLAVOR="${SNO_FLAVOR:-sno-4-22}"
 SNO_IMAGE="${SNO_IMAGE:-quay.io/osac-project/cluster-flavors:sno-4-22}"
-PULL_SECRET="${PULL_SECRET:-${OSAC_PULL_SECRET_PATH:-${INSTALLER_DIR}/values/caas-ci/pull-secret.json}}"
-AAP_LICENSE_FILE="${AAP_LICENSE_FILE:-${INSTALLER_DIR}/values/caas-ci/license.zip}"
-OSAC_PROFILE="${OSAC_PROFILE:-caas-ci}"
+OSAC_PROFILE="${OSAC_PROFILE:-bmaas-ci}"
+PULL_SECRET="${PULL_SECRET:-${OSAC_PULL_SECRET_PATH:-${INSTALLER_DIR}/values/${OSAC_PROFILE}/pull-secret.json}}"
+AAP_LICENSE_FILE="${AAP_LICENSE_FILE:-${INSTALLER_DIR}/values/${OSAC_PROFILE}/license.zip}"
 OSAC_INSTALL_MODE="${OSAC_INSTALL_MODE:-auto}"
 KUBECONFIG="${KUBECONFIG:-${HOME}/.kube/${MGMT_CLONE_NAME}.kubeconfig}"
 export KUBECONFIG
@@ -211,8 +215,10 @@ REUSE_PREBUILT_OSAC_IMAGES="${REUSE_PREBUILT_OSAC_IMAGES:-auto}"
 CLIENT_IMAGE="${CLIENT_IMAGE:-busybox:1.36.1}"
 VLAN_E2E_DEBUG="${VLAN_E2E_DEBUG:-false}"
 VLAN_E2E_ARTIFACT_DIR="${VLAN_E2E_ARTIFACT_DIR:-}"
-DHCP_CLIENT_PREFIX="${DHCP_CLIENT_PREFIX:-osac5530-$(date -u +%Y%m%d%H%M%S)}"
-IMPLEMENTATION_BRANCH_NAME="osac-6202-natgateway-snat"
+VLAN_E2E_TAKE_OWNERSHIP="${VLAN_E2E_TAKE_OWNERSHIP:-false}"
+VLAN_E2E_REUSE_INFRA="${VLAN_E2E_REUSE_INFRA:-false}"
+DHCP_CLIENT_PREFIX="${DHCP_CLIENT_PREFIX:-osac6752-$(date -u +%Y%m%d%H%M%S)}"
+IMPLEMENTATION_BRANCH_NAME="osac-6752-agentless-contract"
 CURRENT_BRANCH="$(git -C "$REPO_ROOT" branch --show-current)"
 if [[ "$CURRENT_BRANCH" != e2e ]]; then
     printf 'ERROR: run vlan-e2e.sh from the e2e branch; current branch is %s\n' "$CURRENT_BRANCH" >&2
@@ -228,6 +234,37 @@ resolve_runtime_source() {
     printf '%s\n%s\n' "$source_branch" "$source_commit"
 }
 
+assert_runtime_source_clean() {
+    local repo="$1" source_commit="$2" runtime_path="$3"
+    local -a pathspecs=("$runtime_path")
+    if [[ "$runtime_path" == osac-installer ]]; then
+        # The lab overlay is E2E configuration consumed by Helm; runtime images
+        # and the installer chart still come from the pinned implementation.
+        pathspecs+=(":(exclude)osac-installer/values/agentless-net-stub.yaml")
+        if [[ "${VLAN_E2E_REUSE_INFRA:-false}" == true ]]; then
+            # Reusing the shared lab infrastructure can need a local repair to
+            # its Keycloak pull-secret RBAC. The OSAC release itself still
+            # comes from the pinned installer chart.
+            pathspecs+=(":(exclude)osac-installer/charts/osac-infra/templates/keycloak/resources.yaml")
+            pathspecs+=(":(exclude)osac-installer/scripts/test-service-account-idp-render.py")
+        fi
+    fi
+    if ! git -C "$repo" diff --quiet "$source_commit" HEAD -- "${pathspecs[@]}"; then
+        printf 'production source under %s differs from the selected runtime branch\n' \
+            "$runtime_path" >&2
+        return 1
+    fi
+    if [[ -n "$(git -C "$repo" ls-files --others --exclude-standard -- "${pathspecs[@]}")" ]]; then
+        printf 'untracked production source exists under %s\n' "$runtime_path" >&2
+        return 1
+    fi
+    if ! git -C "$repo" diff --quiet HEAD -- "${pathspecs[@]}" \
+        || ! git -C "$repo" diff --cached --quiet HEAD -- "${pathspecs[@]}"; then
+        printf 'production source under %s has uncommitted changes\n' "$runtime_path" >&2
+        return 1
+    fi
+}
+
 if ! RUNTIME_SOURCE_INFO="$(resolve_runtime_source "$REPO_ROOT" "$IMPLEMENTATION_BRANCH_NAME")"; then
     printf 'ERROR: e2e must include local implementation branch %s\n' \
         "$IMPLEMENTATION_BRANCH_NAME" >&2
@@ -239,26 +276,16 @@ RUNTIME_SOURCE_COMMIT="${RUNTIME_SOURCE_FIELDS[1]}"
 # When the base branch advances, require its production source to remain exactly
 # represented in e2e before using that branch for images and the AAP project.
 for runtime_path in osac-aap osac-operator fulfillment-service proto osac-installer bare-metal-fulfillment-operator; do
-    if ! git -C "$REPO_ROOT" diff --quiet "$RUNTIME_SOURCE_COMMIT" HEAD -- "$runtime_path"; then
-        printf 'ERROR: production source under %s differs from the selected runtime branch\n' \
-            "$runtime_path" >&2
-        exit 1
-    fi
-    if [[ -n "$(git -C "$REPO_ROOT" ls-files --others --exclude-standard -- "$runtime_path")" ]]; then
-        printf 'ERROR: untracked production source exists under %s\n' "$runtime_path" >&2
-        exit 1
-    fi
-    if ! git -C "$REPO_ROOT" diff --quiet HEAD -- "$runtime_path" \
-        || ! git -C "$REPO_ROOT" diff --cached --quiet HEAD -- "$runtime_path"; then
-        printf 'ERROR: production source under %s has uncommitted changes\n' "$runtime_path" >&2
+    if ! assert_runtime_source_clean "$REPO_ROOT" "$RUNTIME_SOURCE_COMMIT" "$runtime_path"; then
+        printf 'ERROR: refusing to test an unpinned runtime source tree\n' >&2
         exit 1
     fi
 done
 IMAGE_SOURCE_COMMIT="$RUNTIME_SOURCE_COMMIT"
 IMAGE_SOURCE_SHORT="${IMAGE_SOURCE_COMMIT:0:12}"
-AAP_IMAGE="${AAP_IMAGE:-quay.io/ybettan/osac-aap:osac-5530-${IMAGE_SOURCE_SHORT}}"
-OPERATOR_IMAGE="${OPERATOR_IMAGE:-quay.io/ybettan/osac-operator:osac-5530-${IMAGE_SOURCE_SHORT}}"
-FULFILLMENT_IMAGE="${FULFILLMENT_IMAGE:-quay.io/ybettan/fulfillment-service:osac-6307-${IMAGE_SOURCE_SHORT}}"
+AAP_IMAGE="${AAP_IMAGE:-quay.io/ybettan/osac-aap:osac-6752-${IMAGE_SOURCE_SHORT}}"
+OPERATOR_IMAGE="${OPERATOR_IMAGE:-quay.io/ybettan/osac-operator:osac-6752-${IMAGE_SOURCE_SHORT}}"
+FULFILLMENT_IMAGE="${FULFILLMENT_IMAGE:-quay.io/ybettan/fulfillment-service:osac-6752-${IMAGE_SOURCE_SHORT}}"
 OPERATOR_IMAGE_REPOSITORY="${OPERATOR_IMAGE%:*}"
 OPERATOR_IMAGE_TAG="${OPERATOR_IMAGE##*:}"
 FULFILLMENT_IMAGE_REPOSITORY="${FULFILLMENT_IMAGE%:*}"
@@ -276,7 +303,11 @@ OSAC_TENANT="${OSAC_TENANT:-osac-e2e-ci}"
 OSAC_SERVICE_ACCOUNT="${OSAC_SERVICE_ACCOUNT:-osac-operator}"
 OSAC_BMAAS_NAMESPACE="${OSAC_BMAAS_NAMESPACE:-osac-baremetalinstance}"
 NETWORKING_NAMESPACE="${OSAC_NETWORKING_NAMESPACE:-${OSAC_NAMESPACE}}"
-AGENTLESS_NET_STATE_FILE="${AGENTLESS_NET_STATE_FILE:-/etc/osac/agentless_network_state.sqlite3}"
+AGENTLESS_NET_STATE_FILE="${AGENTLESS_NET_STATE_FILE:-/etc/osac/agentless_network_state_osac_6752.sqlite3}"
+LEGACY_AGENTLESS_NET_STATE_FILE="/etc/osac/agentless_network_state.sqlite3"
+LEGACY_AGENTLESS_STATE_CAPTURED=false
+LEGACY_AGENTLESS_STATE_PRESENT=false
+LEGACY_AGENTLESS_STATE_SHA256=""
 AGENTLESS_NET_HOST=""
 AGENTLESS_NET_USER=""
 MGMT_BRIDGE=""
@@ -290,18 +321,13 @@ AAP_JOB_TIMEOUT="${AAP_JOB_TIMEOUT:-1800}"
 AAP_JOB_RESULT_SEQUENCE=0
 AAP_SSH_KEY_SECRET_KEY="AGENTLESS_NET_SSH_PRIVATE_KEY"
 AAP_SSH_KEY_SECRET_ANNOTATION="osac.openshift.io/agentless-vn-ssh"
-AAP_SUBNET_READER_NAME="vlan-e2e-subnet-reader"
-AAP_SUBNET_LOCK_NAME="vlan-e2e-subnet-lock"
-AAP_SUBNET_READER_CREDENTIAL_TYPE="OSAC VLAN E2E Kubernetes API"
-AAP_SUBNET_READER_CREDENTIAL="vlan-e2e-subnet-reader"
-AAP_SUBNET_READER_SETUP_ATTEMPTED=false
 VIRTUAL_NETWORK_NAME_INPUT="${VIRTUAL_NETWORK_NAME:-}"
 VIRTUAL_NETWORK_NAME="${VIRTUAL_NETWORK_NAME:-agentless-smoke-vn-$(date -u +%Y%m%d%H%M%S)}"
 PEER_VIRTUAL_NETWORK_NAME="${PEER_VIRTUAL_NETWORK_NAME:-${VIRTUAL_NETWORK_NAME}-peer}"
 VIRTUAL_NETWORK_IPV4_CIDR="${VIRTUAL_NETWORK_IPV4_CIDR:-10.250.0.0/16}"
 SUBNET_ONE_NAME="${SUBNET_ONE_NAME:-${VIRTUAL_NETWORK_NAME}-subnet-a}"
 SUBNET_TWO_NAME="${SUBNET_TWO_NAME:-${VIRTUAL_NETWORK_NAME}-subnet-b}"
-SUBNET_THREE_NAME="${SUBNET_THREE_NAME:-${VIRTUAL_NETWORK_NAME}-subnet-30}"
+SUBNET_THREE_NAME="${SUBNET_THREE_NAME:-${VIRTUAL_NETWORK_NAME}-subnet-28}"
 EXTERNAL_IP_ATTACHMENT_SUBNET_NAME="${VIRTUAL_NETWORK_NAME}-eip-subnet"
 EXTERNAL_IP_ATTACHMENT_SUBNET_CIDR="${OSAC_EIA_SUBNET_IPV4_CIDR:-}"
 SUBNET_ONE_IPV4_CIDR_EXPLICIT=false
@@ -322,6 +348,11 @@ fi
 EXTERNAL_IP_POOL_NAME="agentless-e2e-pool-$(date -u +%Y%m%d%H%M%S)-$$"
 EXTERNAL_IP_POOL_CIDR="${EXTERNAL_IP_POOL_CIDR:-198.51.100.0/24}"
 EXTERNAL_IP_POOL_CIDR_RESOLVED=false
+BOOTSTRAP_EXTERNAL_IP_POOL_NAME="${AGENTLESS_NET_BOOTSTRAP_POOL_NAME:-agentless-network-bootstrap}"
+BOOTSTRAP_EXTERNAL_IP_POOL_ID=""
+BOOTSTRAP_EXTERNAL_IP_POOL_CIDR=""
+BOOTSTRAP_EXTERNAL_IP_POOL_UID=""
+EXTERNAL_IP_POOL_ALLOW_ALLOCATED=false
 EXTERNAL_IP_PREFIX="agentless-eip-$(date -u +%Y%m%d%H%M%S)-$$"
 EXTERNAL_IP_ONE_NAME="${EXTERNAL_IP_PREFIX}-a"
 EXTERNAL_IP_TWO_NAME="${EXTERNAL_IP_PREFIX}-b"
@@ -406,6 +437,7 @@ CLEANUP_POOL_UIDS=()
 CLEANUP_POOL_IDS=()
 CLEANUP_POOL_CIDRS=()
 CLEANUP_POOL_EIP_IDS_JSON=()
+CLEANUP_POOL_INITIAL_ENTRIES=()
 CLEANUP_EIP_UIDS=()
 CLEANUP_EIP_IDS=()
 CLEANUP_PENDING_POOL_IDS=()
@@ -414,7 +446,7 @@ CLEANUP_DISCOVERY_COMPLETE=false
 CLEANUP_CLIENTS_COMPLETE=true
 STALE_RECOVERY_DIRS=()
 EXTERNAL_IP_POOL_ID=""
-EXTERNAL_IP_POOL_K8S_UID=""
+EXTERNAL_IP_POOL_API_ID=""
 EXTERNAL_IP_POOL_INITIAL_ENTRY=""
 EXTERNAL_IP_POOL_CREATE_AAP_JOB_ID=""
 EXTERNAL_IP_POOL_DELETE_AAP_JOB_ID=""
@@ -455,7 +487,8 @@ DEBUG_ARTIFACT_DIR=""
 DEBUG_ARTIFACT_DIR_GENERATED=false
 declare -A SWITCH_NVUE_KEY_INSTALLED_BY_RUN=()
 declare -A SWITCH_SUDOERS_CREATED_BY_RUN=()
-declare -A CLIENT_BMI_UID=()
+declare -A CLIENT_BMI_API_ID=()
+declare -A CLIENT_ATTACHMENT_UID=()
 declare -A CLIENT_ATTACHMENT_ACTIVE=()
 declare -A CLIENT_ATTACHMENT_PENDING=()
 declare -A CLIENT_ATTACHMENT_SUBNET=()
@@ -497,6 +530,7 @@ except (OSError, SyntaxError) as error:
     raise SystemExit(f"could not read the AgentlessNet state source: {error}") from error
 
 versions = []
+contracts = []
 for node in tree.body:
     if not isinstance(node, ast.Assign):
         continue
@@ -505,10 +539,50 @@ for node in tree.body:
             versions.append(ast.literal_eval(node.value))
         except (TypeError, ValueError) as error:
             raise SystemExit("AgentlessNet SCHEMA_VERSION must be a literal integer") from error
+    if any(isinstance(target, ast.Name) and target.id == "STATE_CONTRACT" for target in node.targets):
+        try:
+            contracts.append(ast.literal_eval(node.value))
+        except (TypeError, ValueError) as error:
+            raise SystemExit("AgentlessNet STATE_CONTRACT must be a literal string") from error
 
-if versions != [1]:
-    raise SystemExit(f"AgentlessNet SCHEMA_VERSION must remain 1 until OSAC-5528 is complete; found {versions!r}")
+if versions != [1] or contracts != ["network-manager-api-id-v1"]:
+    raise SystemExit(
+        f"AgentlessNet state must use the API-ID schema-v1 contract; "
+        f"found versions={versions!r}, contracts={contracts!r}"
+    )
 PY
+}
+
+capture_legacy_provider_state() {
+    local checksum
+    [[ "$AGENTLESS_NET_STATE_FILE" != "$LEGACY_AGENTLESS_NET_STATE_FILE" ]] \
+        || die "AGENTLESS_NET_STATE_FILE must not use the legacy UID-owned database path"
+    if docker exec "$CONTAINERLAB_NET_NODE" test -f "$LEGACY_AGENTLESS_NET_STATE_FILE"; then
+        checksum="$(docker exec "$CONTAINERLAB_NET_NODE" sha256sum "$LEGACY_AGENTLESS_NET_STATE_FILE")" \
+            || die "Could not fingerprint the legacy AgentlessNet database"
+        LEGACY_AGENTLESS_STATE_PRESENT=true
+        LEGACY_AGENTLESS_STATE_SHA256="${checksum%% *}"
+    else
+        LEGACY_AGENTLESS_STATE_PRESENT=false
+        LEGACY_AGENTLESS_STATE_SHA256=""
+    fi
+    LEGACY_AGENTLESS_STATE_CAPTURED=true
+}
+
+assert_legacy_provider_state_unchanged() {
+    [[ "$LEGACY_AGENTLESS_STATE_CAPTURED" == true ]] || return 0
+    if [[ "$LEGACY_AGENTLESS_STATE_PRESENT" == true ]]; then
+        local checksum
+        docker exec "$CONTAINERLAB_NET_NODE" test -f "$LEGACY_AGENTLESS_NET_STATE_FILE" \
+            || { printf 'The pre-existing legacy AgentlessNet database disappeared\n' >&2; return 1; }
+        checksum="$(docker exec "$CONTAINERLAB_NET_NODE" sha256sum "$LEGACY_AGENTLESS_NET_STATE_FILE")" \
+            || { printf 'Could not recheck the legacy AgentlessNet database\n' >&2; return 1; }
+        [[ "${checksum%% *}" == "$LEGACY_AGENTLESS_STATE_SHA256" ]] \
+            || { printf 'The pre-existing legacy AgentlessNet database changed during the E2E run\n' >&2; return 1; }
+    else
+        ! docker exec "$CONTAINERLAB_NET_NODE" test -e "$LEGACY_AGENTLESS_NET_STATE_FILE" \
+            || { printf 'The E2E run created the legacy AgentlessNet database\n' >&2; return 1; }
+    fi
 }
 
 resolve_mgmt_network() {
@@ -1003,7 +1077,7 @@ SH
 prepare_containerlab_dhcp_supervisor() {
     if docker exec "$CONTAINERLAB_NET_NODE" test -f /etc/agentless-net/supervisord.conf; then
         if docker exec "$CONTAINERLAB_NET_NODE" grep -Fxq \
-            '# OSAC-5530 temporary DHCP supervisor configuration' /etc/agentless-net/supervisord.conf; then
+            '# OSAC-6752 temporary DHCP supervisor configuration' /etc/agentless-net/supervisord.conf; then
             SUPERVISOR_CONFIG_CREATED_BY_RUN=true
         elif ! docker exec "$CONTAINERLAB_NET_NODE" grep -Fxq \
             'files = /etc/agentless-net/supervisor.d/*.ini' /etc/agentless-net/supervisord.conf; then
@@ -1015,7 +1089,7 @@ set -eu
 mkdir -p /etc/agentless-net/supervisor.d /run/agentless-net /var/log/agentless-net
 chmod 0700 /etc/agentless-net /etc/agentless-net/supervisor.d /run/agentless-net /var/log/agentless-net
 cat >/etc/agentless-net/supervisord.conf <<'CONF'
-# OSAC-5530 temporary DHCP supervisor configuration
+# OSAC-6752 temporary DHCP supervisor configuration
 [unix_http_server]
 file=/run/agentless-net/supervisor.sock
 chmod=0600
@@ -1255,7 +1329,7 @@ prepare_containerlab_switches() {
         switch_admin_user_exec "$switch" sudo -n true \
             || die "Cumulus switch $switch does not allow the required sudo -n provider operations"
         if switch_admin_exec "$switch" test -f /etc/sudoers.d/osac-agentless-net; then
-            if switch_admin_exec "$switch" grep -Fxq '# OSAC-5530 temporary provider access' \
+            if switch_admin_exec "$switch" grep -Fxq '# OSAC-6752 temporary provider access' \
                 /etc/sudoers.d/osac-agentless-net || switch_admin_exec "$switch" grep -Fxq \
                 '# OSAC-5529 temporary provider access' /etc/sudoers.d/osac-agentless-net; then
                 SWITCH_SUDOERS_CREATED_BY_RUN["$switch"]=true
@@ -1517,7 +1591,7 @@ PY
     INVENTORY_CONFIGMAP_EXPECTED="$expected_inventory"
     configmap_json="$(oc get configmap "$AAP_NETWORKING_SECRET" -n "$OSAC_NAMESPACE" -o json)" \
         || die "The existing network-fulfillment-ig ConfigMap is missing"
-    configured_state_file="$(jq -r '.data.AGENTLESS_NET_STATE_FILE // "/etc/osac/agentless_network_state.sqlite3"' <<<"$configmap_json")"
+    configured_state_file="$(jq -r '.data.AGENTLESS_NET_STATE_FILE // "/etc/osac/agentless_network_state_osac_6752.sqlite3"' <<<"$configmap_json")"
     [[ "$configured_state_file" == "$AGENTLESS_NET_STATE_FILE" ]] \
         || die "AGENTLESS_NET_STATE_FILE differs from the value configured in network-fulfillment-ig"
     existing_inventory="$(jq -r '.data.AGENTLESS_NET_VN_INVENTORY // ""' <<<"$configmap_json")"
@@ -1780,150 +1854,6 @@ PY
 
 prepare_aap_networking_instance_group() {
     info "Using the existing network worker Pod configuration and network-fulfillment-ig envFrom for the net-node and switches."
-}
-
-configure_aap_subnet_reader() {
-    [[ "$SUITE_USES_SUBNET_DHCP" == true ]] || return 0
-
-    local token_file="${TEMP_DIR}/aap-subnet-reader.token"
-    local ca_file="${TEMP_DIR}/aap-subnet-reader-ca.pem"
-    local route token result can_list verb can
-    local role_name="$AAP_SUBNET_READER_NAME"
-    AAP_SUBNET_READER_SETUP_ATTEMPTED=true
-
-    oc create serviceaccount "$AAP_SUBNET_READER_NAME" -n "$OSAC_NAMESPACE" \
-        --dry-run=client -o yaml \
-        | oc apply -f - >/dev/null \
-        || { printf 'ERROR: could not ensure the Subnet reader ServiceAccount\n' >&2; return 1; }
-    oc create role "$role_name" -n "$NETWORKING_NAMESPACE" \
-        --verb=get,list --resource=subnets.osac.openshift.io \
-        --dry-run=client -o yaml \
-        | oc apply -f - >/dev/null \
-        || { printf 'ERROR: could not ensure the Subnet reader Role\n' >&2; return 1; }
-    oc create rolebinding "$role_name" -n "$NETWORKING_NAMESPACE" \
-        --role="$role_name" \
-        --serviceaccount="${OSAC_NAMESPACE}:${AAP_SUBNET_READER_NAME}" \
-        --dry-run=client -o yaml \
-        | oc apply -f - >/dev/null \
-        || { printf 'ERROR: could not ensure the Subnet reader RoleBinding\n' >&2; return 1; }
-    oc create role "$AAP_SUBNET_LOCK_NAME" -n "$OSAC_NAMESPACE" \
-        --verb=get,create,update,patch --resource=leases.coordination.k8s.io \
-        --dry-run=client -o yaml \
-        | oc apply -f - >/dev/null \
-        || { printf 'ERROR: could not ensure the Subnet lock Role\n' >&2; return 1; }
-    oc create rolebinding "$AAP_SUBNET_LOCK_NAME" -n "$OSAC_NAMESPACE" \
-        --role="$AAP_SUBNET_LOCK_NAME" \
-        --serviceaccount="${OSAC_NAMESPACE}:${AAP_SUBNET_READER_NAME}" \
-        --dry-run=client -o yaml \
-        | oc apply -f - >/dev/null \
-        || { printf 'ERROR: could not ensure the Subnet lock RoleBinding\n' >&2; return 1; }
-
-    if ! can_list="$(oc auth can-i list subnets.osac.openshift.io \
-        --as="system:serviceaccount:${OSAC_NAMESPACE}:${AAP_SUBNET_READER_NAME}" \
-        -n "$NETWORKING_NAMESPACE")" || [[ "$can_list" != yes ]]; then
-        printf 'ERROR: the temporary AAP ServiceAccount cannot list Subnets in %s\n' \
-            "$NETWORKING_NAMESPACE" >&2
-        return 1
-    fi
-    for verb in get create update patch; do
-        if ! can="$(oc auth can-i "$verb" leases.coordination.k8s.io \
-            --as="system:serviceaccount:${OSAC_NAMESPACE}:${AAP_SUBNET_READER_NAME}" \
-            -n "$OSAC_NAMESPACE")" || [[ "$can" != yes ]]; then
-            printf 'ERROR: the temporary AAP ServiceAccount cannot %s V-Net lock Leases\n' \
-                "$verb" >&2
-            return 1
-        fi
-    done
-
-    if ! oc create token "$AAP_SUBNET_READER_NAME" -n "$OSAC_NAMESPACE" \
-        --duration=24h >"$token_file"; then
-        printf 'ERROR: could not mint the temporary AAP Subnet reader token\n' >&2
-        return 1
-    fi
-    chmod 0600 "$token_file"
-    if ! oc get configmap kube-root-ca.crt -n "$NETWORKING_NAMESPACE" -o json \
-        | jq -er '.data["ca.crt"] | select(type == "string" and length > 0)' >"$ca_file"; then
-        rm -f -- "$token_file"
-        printf 'ERROR: could not read the Kubernetes API CA bundle\n' >&2
-        return 1
-    fi
-    chmod 0600 "$ca_file"
-
-    route="$(oc get route osac-aap -n "$OSAC_NAMESPACE" -o jsonpath='{.spec.host}')" \
-        || { rm -f -- "$token_file" "$ca_file"; printf 'ERROR: could not read the AAP Controller route\n' >&2; return 1; }
-    token="$(oc exec deployment/osac-operator -n "$OSAC_NAMESPACE" -- \
-        sh -c 'printf %s "$OSAC_AAP_TOKEN"' 2>/dev/null)" \
-        || { rm -f -- "$token_file" "$ca_file"; printf 'ERROR: could not obtain the AAP API token\n' >&2; return 1; }
-    if [[ -z "$route" || -z "$token" ]]; then
-        unset token
-        rm -f -- "$token_file" "$ca_file"
-        printf 'ERROR: AAP Controller route or API token is unavailable\n' >&2
-        return 1
-    fi
-    if ! result="$(AAP_API_ROUTE="https://${route}" AAP_API_TOKEN="$token" \
-        AAP_API_CA_FILE="$AAP_API_CA_FILE" \
-        python3 "$AAP_JOBS_HELPER" configure-k8s-credential \
-            --job-template "${AAP_PREFIX}-move-network-attachment" \
-            --job-template "${AAP_PREFIX}-query-dhcp-lease" \
-            --credential-name "$AAP_SUBNET_READER_CREDENTIAL" \
-            --credential-type-name "$AAP_SUBNET_READER_CREDENTIAL_TYPE" \
-            --api-host https://kubernetes.default.svc \
-            --token-file "$token_file" --ca-file "$ca_file")"; then
-        unset token
-        rm -f -- "$token_file" "$ca_file"
-        printf 'ERROR: could not attach the temporary Subnet and lock credential to the AAP move job\n' >&2
-        return 1
-    fi
-    unset token
-    rm -f -- "$token_file" "$ca_file"
-    jq -e '.credential_id and .credential_type_id and (.template_ids | length == 2)' \
-        <<<"$result" >/dev/null \
-        || { printf 'ERROR: AAP did not confirm the Subnet credential association\n' >&2; return 1; }
-    info "Configured temporary Subnet and V-Net lock credentials for the move and DHCP lease query jobs."
-}
-
-cleanup_aap_subnet_reader() {
-    [[ "$AAP_SUBNET_READER_SETUP_ATTEMPTED" == true ]] || return 0
-
-    local route token
-    route="$(oc get route osac-aap -n "$OSAC_NAMESPACE" -o jsonpath='{.spec.host}')" \
-        || { printf 'ERROR: could not read the AAP route while removing the Subnet credential\n' >&2; return 1; }
-    token="$(oc exec deployment/osac-operator -n "$OSAC_NAMESPACE" -- \
-        sh -c 'printf %s "$OSAC_AAP_TOKEN"' 2>/dev/null)" \
-        || { printf 'ERROR: could not obtain the AAP API token for credential cleanup\n' >&2; return 1; }
-    if [[ -z "$route" || -z "$token" ]]; then
-        unset token
-        printf 'ERROR: AAP Controller route or API token is unavailable for credential cleanup\n' >&2
-        return 1
-    fi
-    if ! AAP_API_ROUTE="https://${route}" AAP_API_TOKEN="$token" \
-        AAP_API_CA_FILE="$AAP_API_CA_FILE" \
-        python3 "$AAP_JOBS_HELPER" cleanup-k8s-credential \
-            --job-template "${AAP_PREFIX}-move-network-attachment" \
-            --job-template "${AAP_PREFIX}-query-dhcp-lease" \
-            --credential-name "$AAP_SUBNET_READER_CREDENTIAL" \
-            --credential-type-name "$AAP_SUBNET_READER_CREDENTIAL_TYPE"; then
-        unset token
-        printf 'ERROR: could not detach and remove the temporary AAP Subnet credential\n' >&2
-        return 1
-    fi
-    unset token
-
-    if ! oc delete rolebinding "$AAP_SUBNET_READER_NAME" -n "$NETWORKING_NAMESPACE" \
-        --ignore-not-found=true --wait=true >/dev/null \
-        || ! oc delete rolebinding "$AAP_SUBNET_LOCK_NAME" -n "$OSAC_NAMESPACE" \
-            --ignore-not-found=true --wait=true >/dev/null \
-        || ! oc delete role "$AAP_SUBNET_READER_NAME" -n "$NETWORKING_NAMESPACE" \
-            --ignore-not-found=true --wait=true >/dev/null \
-        || ! oc delete role "$AAP_SUBNET_LOCK_NAME" -n "$OSAC_NAMESPACE" \
-            --ignore-not-found=true --wait=true >/dev/null \
-        || ! oc delete serviceaccount "$AAP_SUBNET_READER_NAME" -n "$OSAC_NAMESPACE" \
-            --ignore-not-found=true --wait=true >/dev/null; then
-        printf 'ERROR: could not remove the temporary Subnet and lock RBAC resources\n' >&2
-        return 1
-    fi
-    AAP_SUBNET_READER_SETUP_ATTEMPTED=false
-    info "Removed the temporary AAP credential and Subnet/lock ServiceAccount roles."
 }
 
 wait_for_existing_provider_deletions() {
@@ -2278,7 +2208,7 @@ restore_containerlab_switch_access() {
         [[ -n "$switch" ]] || continue
         if [[ "${SWITCH_SUDOERS_CREATED_BY_RUN[$switch]:-false}" == true ]]; then
             switch_admin_exec "$switch" sh -c '
-                if grep -Fxq "# OSAC-5530 temporary provider access" /etc/sudoers.d/osac-agentless-net \
+                if grep -Fxq "# OSAC-6752 temporary provider access" /etc/sudoers.d/osac-agentless-net \
                     || grep -Fxq "# OSAC-5529 temporary provider access" /etc/sudoers.d/osac-agentless-net; then
                     rm -f /etc/sudoers.d/osac-agentless-net
                 fi
@@ -2313,7 +2243,7 @@ restore_dhcp_supervisor() {
             && return 1
     fi
     docker exec "$CONTAINERLAB_NET_NODE" sh -c '
-        if grep -Fxq "# OSAC-5530 temporary DHCP supervisor configuration" /etc/agentless-net/supervisord.conf; then
+        if grep -Fxq "# OSAC-6752 temporary DHCP supervisor configuration" /etc/agentless-net/supervisord.conf; then
             rm -f /etc/agentless-net/supervisord.conf
         fi
     ' || return 1
@@ -2370,9 +2300,11 @@ PY
 deployment_settings() {
     helm get values osac -n "$OSAC_NAMESPACE" --all -o json | jq -ce '{
       aap: {
+        bootstrapImage: .aap.bootstrap.image,
         eeImage: .aap.configAsCode.eeImage,
         projectGitUri: .aap.configAsCode.projectGitUri,
-        projectGitBranch: .aap.configAsCode.projectGitBranch
+        projectGitBranch: .aap.configAsCode.projectGitBranch,
+        stateFile: .aap.instanceGroups.networkFulfillment.config.AGENTLESS_NET_STATE_FILE
       },
       operator: {
         image: {
@@ -2387,12 +2319,15 @@ deployment_settings() {
         }
       },
       service: {
-        eventPublisherEnabled: (.service.eventPublisher.enabled // false)
+        eventPublisherEnabled: (.service.eventPublisher.enabled // false),
+        caasEnabled: .global.services.caas.enabled,
+        vmaasEnabled: .global.services.vmaas.enabled,
+        bmaasEnabled: .global.services.bmaas.enabled
       },
       networking: {
         fabricManager: .global.networking.fabricManager,
         k8sManager: .global.networking.k8sManager,
-        networkClassTitle: .global.networking.networkClass.title
+        addressPlan: .global.networking.networkClass.addressPlan
       }
     }'
 }
@@ -2425,6 +2360,39 @@ values.pop("csiDriver", None)
 
 # The long-lived lab release can contain fields removed from this checkout's
 # chart schema. Drop only those known legacy fields before validating upgrades.
+legacy_network_class = values.pop("networkClass", None)
+global_values = values.get("global")
+if isinstance(global_values, dict):
+    global_values.pop("expertOverrides", None)
+    networking = global_values.get("networking")
+    if isinstance(networking, dict):
+        networking.pop("netris", None)
+        network_class = networking.get("networkClass")
+        if not isinstance(network_class, dict):
+            network_class = {}
+            networking["networkClass"] = network_class
+        network_class.pop("title", None)
+        network_class.pop("description", None)
+        if isinstance(legacy_network_class, dict):
+            legacy_defaults = legacy_network_class.get("defaults")
+            if isinstance(legacy_defaults, dict):
+                network_class.setdefault("defaults", legacy_defaults)
+        defaults = network_class.get("defaults")
+        if isinstance(defaults, dict):
+            defaults.pop("enableNatGateway", None)
+    profile_global = profile_values.get("global")
+    profile_services = profile_global.get("services") if isinstance(profile_global, dict) else None
+    if isinstance(profile_services, dict):
+        global_values["services"] = profile_services
+
+# These fields have moved into the shared Global Networking contract and the
+# fulfillment service now owns whether manager provisioning is enabled.
+operator = values.get("operator")
+if isinstance(operator, dict):
+    controllers = operator.get("controllers")
+    if isinstance(controllers, dict):
+        controllers.pop("networkingProvisioning", None)
+
 aap = values.get("aap")
 if isinstance(aap, dict):
     aap.pop("importAgents", None)
@@ -2461,7 +2429,6 @@ if isinstance(aap, dict):
                 if config.get("DNS_CLASS") == "":
                     config["DNS_CLASS"] = "dns.noop.dns"
 
-operator = values.get("operator")
 if isinstance(operator, dict):
     stall = operator.get("stall")
     if isinstance(stall, dict):
@@ -2572,6 +2539,36 @@ ensure_osac_tenant() (
         info "Tenant ${OSAC_TENANT} was committed; continuing after the API reported an onboarding error."
     fi
 )
+
+wait_for_tenant_default_networking() {
+    local tenant_json status reason message
+    info "Waiting for tenant ${OSAC_TENANT} DefaultNetworkingReady..."
+    for ((attempt = 1; attempt <= 720; attempt++)); do
+        tenant_json="$("$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" \
+            tenant --output json)" \
+            || die "Fulfillment API failed while reading tenant ${OSAC_TENANT} readiness"
+        if jq -e '
+          any(.status.conditions[]?;
+            .type == "TENANT_CONDITION_TYPE_DEFAULT_NETWORKING_READY"
+            and .status == "CONDITION_STATUS_TRUE")' <<<"$tenant_json" >/dev/null; then
+            info "Tenant ${OSAC_TENANT} DefaultNetworkingReady is True."
+            return 0
+        fi
+        reason="$(jq -r '[.status.conditions[]? | select(.type == "TENANT_CONDITION_TYPE_DEFAULT_NETWORKING_READY") | .reason] | last // ""' <<<"$tenant_json")"
+        message="$(jq -r '[.status.conditions[]? | select(.type == "TENANT_CONDITION_TYPE_DEFAULT_NETWORKING_READY") | .message] | last // ""' <<<"$tenant_json")"
+        status="$(jq -r '.status.state // ""' <<<"$tenant_json")"
+        if [[ "$reason" == ResourceFailed || "$status" == TENANT_STATE_FAILED ]]; then
+            printf '%s\n' "$tenant_json" >&2
+            die "Tenant ${OSAC_TENANT} default networking failed: ${message:-${status}}"
+        fi
+        if ((attempt % 12 == 0)); then
+            info "Tenant ${OSAC_TENANT} default networking is pending: ${message:-${reason:-unknown}}"
+        fi
+        sleep 5
+    done
+    printf '%s\n' "$tenant_json" >&2
+    die "Timed out waiting for tenant ${OSAC_TENANT} DefaultNetworkingReady"
+}
 
 # Calls one private Fulfillment RPC. A fresh token and short-lived port-forward
 # are used for each call so the token cannot expire during the long VLAN run.
@@ -2758,6 +2755,109 @@ PY
     info "Selected non-overlapping ExternalIPPool test CIDR ${EXTERNAL_IP_POOL_CIDR}."
 }
 
+ensure_bootstrap_external_ip_pool() {
+    local list_request="${TEMP_DIR}/bootstrap-pool-list.request.json"
+    local list_response="${TEMP_DIR}/bootstrap-pool-list.response.json"
+    local list_error="${TEMP_DIR}/bootstrap-pool-list.error.json"
+    local create_request="${TEMP_DIR}/bootstrap-pool-create.request.json"
+    local create_response="${TEMP_DIR}/bootstrap-pool-create.response.json"
+    local create_error="${TEMP_DIR}/bootstrap-pool-create.error.json"
+    local pool_items matches count old_cidr old_id old_uid old_job old_pending
+    jq -n --arg name "$BOOTSTRAP_EXTERNAL_IP_POOL_NAME" \
+        '{filter:("this.metadata.name == \"" + $name + "\" && this.metadata.tenant == \"shared\"")}' \
+        >"$list_request" || die "Could not write bootstrap ExternalIPPool lookup request"
+    if ! external_ip_pool_rpc List "$list_request" "$list_response" "$list_error"; then
+        cat "$list_error" >&2
+        die "Could not look up the persistent shared bootstrap ExternalIPPool"
+    fi
+    pool_items="$(external_ip_pool_list_items "$list_response")" \
+        || die "Bootstrap ExternalIPPool lookup returned an invalid response"
+    matches="$(jq -ce --arg name "$BOOTSTRAP_EXTERNAL_IP_POOL_NAME" \
+        '[.[] | select(.metadata.name == $name and .metadata.tenant == "shared")]' \
+        <<<"$pool_items")" \
+        || die "Could not parse the persistent bootstrap ExternalIPPool lookup"
+    count="$(jq -er 'length' <<<"$matches")"
+    if [[ "$count" == 1 ]]; then
+        BOOTSTRAP_EXTERNAL_IP_POOL_ID="$(jq -er '.[0].id' <<<"$matches")"
+        BOOTSTRAP_EXTERNAL_IP_POOL_CIDR="$(jq -er '.[0].spec.cidrs | select(length == 1) | .[0]' <<<"$matches")"
+        jq -e '.[0].spec.ipFamily == "IP_FAMILY_IPV4"' <<<"$matches" >/dev/null \
+            || die "Existing bootstrap ExternalIPPool is not IPv4"
+    elif [[ "$count" == 0 ]]; then
+        local all_pool_cidrs candidate
+        all_pool_cidrs="$(jq -ce '[.[] | {name:(.metadata.name // "unknown"),cidrs:.spec.cidrs}]' \
+            <<<"$pool_items")" \
+            || die "Could not read existing shared ExternalIPPool CIDRs"
+        if ! candidate="$(EXTERNAL_POOL_LIST_JSON="$all_pool_cidrs" \
+            python3 - "$EXTERNAL_IP_POOL_CIDR_EXPLICIT" "$EXTERNAL_IP_POOL_CIDR" <<'PY'
+import ipaddress
+import json
+import os
+import sys
+
+explicit, requested_test_cidr = sys.argv[1:]
+reserved = []
+for pool in json.loads(os.environ["EXTERNAL_POOL_LIST_JSON"]):
+    cidrs = pool.get("cidrs")
+    if not isinstance(cidrs, list):
+        raise SystemExit(f"shared pool {pool.get('name', 'unknown')} has no CIDR list")
+    for value in cidrs:
+        try:
+            reserved.append(ipaddress.ip_network(value, strict=True))
+        except (TypeError, ValueError) as error:
+            raise SystemExit(f"shared pool has invalid CIDR {value!r}") from error
+if explicit == "true":
+    reserved.append(ipaddress.ip_network(requested_test_cidr, strict=True))
+for option in ipaddress.ip_network("198.18.0.0/15").subnets(new_prefix=24):
+    if not any(option.overlaps(network) for network in reserved):
+        print(option)
+        break
+else:
+    raise SystemExit("No free /24 remains for the persistent bootstrap ExternalIPPool")
+PY
+        )"; then
+            die "Could not select an unused bootstrap ExternalIPPool CIDR"
+        fi
+        BOOTSTRAP_EXTERNAL_IP_POOL_CIDR="$candidate"
+        jq -n --arg name "$BOOTSTRAP_EXTERNAL_IP_POOL_NAME" --arg cidr "$candidate" \
+            '{object:{metadata:{name:$name,tenant:"shared"},spec:{cidrs:[$cidr],ipFamily:"IP_FAMILY_IPV4"}}}' \
+            >"$create_request" || die "Could not write bootstrap ExternalIPPool Create request"
+        if ! external_ip_pool_rpc Create "$create_request" "$create_response" "$create_error"; then
+            cat "$create_error" >&2
+            die "Could not create the persistent shared bootstrap ExternalIPPool"
+        fi
+        BOOTSTRAP_EXTERNAL_IP_POOL_ID="$(jq -er --arg name "$BOOTSTRAP_EXTERNAL_IP_POOL_NAME" \
+            --arg cidr "$BOOTSTRAP_EXTERNAL_IP_POOL_CIDR" '
+          .object as $pool
+          | select($pool.metadata.name == $name and $pool.metadata.tenant == "shared"
+              and $pool.spec.ipFamily == "IP_FAMILY_IPV4" and $pool.spec.cidrs == [$cidr])
+          | $pool.id
+          | select(type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))' \
+            "$create_response")" \
+            || die "Bootstrap ExternalIPPool Create returned an invalid ID"
+    else
+        die "Expected at most one shared bootstrap ExternalIPPool named ${BOOTSTRAP_EXTERNAL_IP_POOL_NAME}"
+    fi
+
+    old_cidr="$EXTERNAL_IP_POOL_CIDR"
+    old_id="$EXTERNAL_IP_POOL_ID"
+    old_uid="$EXTERNAL_IP_POOL_API_ID"
+    old_job="$EXTERNAL_IP_POOL_CREATE_AAP_JOB_ID"
+    old_pending="$EXTERNAL_IP_POOL_PENDING_CLEANUP"
+    EXTERNAL_IP_POOL_CIDR="$BOOTSTRAP_EXTERNAL_IP_POOL_CIDR"
+    EXTERNAL_IP_POOL_ID="$BOOTSTRAP_EXTERNAL_IP_POOL_ID"
+    EXTERNAL_IP_POOL_API_ID=""
+    EXTERNAL_IP_POOL_CREATE_AAP_JOB_ID=""
+    EXTERNAL_IP_POOL_PENDING_CLEANUP=false
+    wait_for_external_ip_pool_ready "$BOOTSTRAP_EXTERNAL_IP_POOL_ID" true
+    BOOTSTRAP_EXTERNAL_IP_POOL_UID="$EXTERNAL_IP_POOL_API_ID"
+    EXTERNAL_IP_POOL_CIDR="$old_cidr"
+    EXTERNAL_IP_POOL_ID="$old_id"
+    EXTERNAL_IP_POOL_API_ID="$old_uid"
+    EXTERNAL_IP_POOL_CREATE_AAP_JOB_ID="$old_job"
+    EXTERNAL_IP_POOL_PENDING_CLEANUP="$old_pending"
+    info "Persistent bootstrap ExternalIPPool ${BOOTSTRAP_EXTERNAL_IP_POOL_ID} is Ready at ${BOOTSTRAP_EXTERNAL_IP_POOL_CIDR}."
+}
+
 external_ip_pool_rpc_error_is_not_found() {
     local response_file
     for response_file in "$@"; do
@@ -2806,12 +2906,35 @@ subnet_cr_json() {
             error("Subnet UUID label does not match the requested resource")
           elif $s.metadata.annotations["osac.openshift.io/tenant"] != $tenant then
             error("Subnet tenant annotation does not match the requested tenant")
-          elif $s.spec.virtualNetwork != $parent then
+          elif $parent != "" and $s.spec.virtualNetwork != $parent then
             error("Subnet parent reference does not match its VirtualNetwork")
           elif $s.metadata.namespace != $namespace then
             error("Subnet CR is outside the configured networking namespace")
           else $s end
       end' <<<"$json"
+}
+
+network_task_entry() {
+    local cr_json="$1" task="$2" manager="${3:-fabric}"
+    jq -ce --arg task "$task" --arg manager "$manager" '
+      [.status.jobs[]? | select(.task == $task and .manager == $manager)]
+      | last // {}' <<<"$cr_json"
+}
+
+network_task_job_id() {
+    network_task_entry "$1" "$2" "${3:-fabric}" | jq -r '.jobID // ""'
+}
+
+network_task_state() {
+    network_task_entry "$1" "$2" "${3:-fabric}" | jq -r '.state // ""'
+}
+
+network_ready_condition_status() {
+    jq -r '[.status.conditions[]? | select(.type == "Ready") | .status] | last // ""' <<<"$1"
+}
+
+network_ready_condition_reason() {
+    jq -r '[.status.conditions[]? | select(.type == "Ready") | .reason] | last // ""' <<<"$1"
 }
 
 external_ip_pool_crs_json() {
@@ -2837,7 +2960,7 @@ external_ip_pool_validate_cr_identity() {
       and (.metadata.annotations["osac.openshift.io/tenant"] == "shared")
       and (.metadata.uid | type == "string"
            and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))
-      and (.metadata.uid != $id)
+      and (.status.networkManagers.fabric.name == "agentless_net")
       and (.spec.ipFamily == "IPv4")
       and (.spec.cidrs == [$cidr])' <<<"$cr_json" >/dev/null
 }
@@ -2863,6 +2986,11 @@ wait_for_virtual_network_ready() {
         fi
         if [[ "$state" == READY ]]; then
             printf '%s\n' "$description"
+            local cr_json ready
+            cr_json="$(virtual_network_cr_json "$id")"
+            ready="$(network_ready_condition_status "$cr_json")"
+            [[ "$ready" == True ]] \
+                || die "VirtualNetwork ${id} Fulfillment state is READY but its Ready condition is ${ready:-missing}"
             return 0
         fi
         sleep 5
@@ -2904,7 +3032,11 @@ wait_for_subnet_ready() {
         fi
         if [[ "$state" == READY ]]; then
             printf '%s\n' "$description"
-            subnet_cr_json "$id" "$parent_id" >/dev/null
+            local cr_json ready
+            cr_json="$(subnet_cr_json "$id" "$parent_id")"
+            ready="$(network_ready_condition_status "$cr_json")"
+            [[ "$ready" == True ]] \
+                || die "Subnet ${id} Fulfillment state is READY but its Ready condition is ${ready:-missing}"
             return 0
         fi
         sleep 5
@@ -2946,15 +3078,13 @@ wait_for_subnet_aap_provision_success() {
     local id="$1" parent_id="$2" job_id="$3" cr_json job_state
     for ((attempt = 1; attempt <= 120; attempt++)); do
         cr_json="$(subnet_cr_json "$id" "$parent_id")"
-        job_state="$(jq -r --arg id "$job_id" \
-            '[.status.provisioningJobs[]? | select(.jobID == $id) | .state] | last // ""' \
-            <<<"$cr_json")"
+        job_state="$(network_task_state "$cr_json" create_subnet)"
         case "$job_state" in
             Succeeded)
                 assert_provider_key_survived "AAP Subnet job ${job_id}"
                 return 0
                 ;;
-            Failed|Canceled)
+            Failed|Cancelled)
                 die "AAP provision job ${job_id} ended in ${job_state} for test Subnet ${id}"
                 ;;
         esac
@@ -2963,34 +3093,8 @@ wait_for_subnet_aap_provision_success() {
     die "Timed out waiting for AAP provision job ${job_id} to succeed for Subnet ${id}"
 }
 
-wait_for_subnet_retry_success() {
-    local id="$1" parent_id="$2" previous_job="$3" cr_json job_id job_state phase
-    for ((attempt = 1; attempt <= 120; attempt++)); do
-        cr_json="$(subnet_cr_json "$id" "$parent_id")"
-        phase="$(jq -r '.status.phase // ""' <<<"$cr_json")"
-        job_id="$(jq -r '.status.provisioningJobs | map(.jobID // empty) | last // ""' <<<"$cr_json")"
-        job_state="$(jq -r --arg id "$job_id" \
-            '[.status.provisioningJobs[]? | select(.jobID == $id) | .state] | last // ""' \
-            <<<"$cr_json")"
-        [[ "$phase" != Failed ]] || die "Subnet ${id} failed during its retry"
-        if [[ -n "$job_id" && "$job_id" != "$previous_job" ]]; then
-            case "$job_state" in
-                Succeeded)
-                    RETRIED_SUBNET_AAP_JOB_ID="$job_id"
-                    return 0
-                    ;;
-                Failed|Canceled)
-                    die "AAP retry job ${job_id} ended in ${job_state} for Subnet ${id}"
-                    ;;
-            esac
-        fi
-        sleep 2
-    done
-    die "Timed out waiting for a new successful AAP retry job for Subnet ${id}"
-}
-
 wait_for_subnet_deleted() {
-    local id="$1" selector current count job_id job_state
+    local id="$1" selector current count job_id job_state subnet_cr
     selector="$(subnet_label_selector "$id")"
     for ((attempt = 1; attempt <= 120; attempt++)); do
         current="$(oc get subnets -n "$NETWORKING_NAMESPACE" -l "$selector" -o json)" \
@@ -2999,9 +3103,10 @@ wait_for_subnet_deleted() {
         if [[ "$count" == 0 ]]; then
             return 0
         fi
-        job_id="$(jq -r '[.items[0].status.provisioningJobs[]? | select(.type == "deprovision") | .jobID] | last // ""' <<<"$current")"
-        job_state="$(jq -r '[.items[0].status.provisioningJobs[]? | select(.type == "deprovision") | .state] | last // ""' <<<"$current")"
-        [[ "$job_state" != Failed && "$job_state" != Canceled ]] \
+        subnet_cr="$(jq -c '.items[0]' <<<"$current")"
+        job_id="$(network_task_job_id "$subnet_cr" delete_subnet)"
+        job_state="$(network_task_state "$subnet_cr" delete_subnet)"
+        [[ "$job_state" != Failed && "$job_state" != Cancelled ]] \
             || die "AAP deprovision job failed while deleting test Subnet UUID ${id}"
         [[ -z "$job_id" ]] || LAST_SUBNET_DELETE_AAP_JOB_ID="$job_id"
         sleep 2
@@ -3010,8 +3115,8 @@ wait_for_subnet_deleted() {
 }
 
 wait_for_external_ip_pool_ready() {
-    local id="$1" deadline=$((SECONDS + 600))
-    local pool_crs pool_cr pool_count phase provision_job provision_job_id provision_state
+    local id="$1" allow_allocated="${2:-false}" deadline=$((SECONDS + 600))
+    local pool_crs pool_cr pool_count ready provision_job provision_job_id provision_state
     local get_request get_response get_error pool_state
     get_request="${TEMP_DIR}/external-ip-pool-get.request.json"
     get_response="${TEMP_DIR}/external-ip-pool-get.response.json"
@@ -3033,26 +3138,20 @@ wait_for_external_ip_pool_ready() {
             pool_cr="$(jq -c '.items[0]' <<<"$pool_crs")"
             external_ip_pool_validate_cr_identity "$pool_cr" "$id" \
                 || die "ExternalIPPool CR identity or spec does not match Fulfillment UUID ${id}"
-            EXTERNAL_IP_POOL_K8S_UID="$(jq -er '.metadata.uid' <<<"$pool_cr")" \
-                || die "ExternalIPPool CR has no Kubernetes UID"
-            phase="$(jq -r '.status.phase // ""' <<<"$pool_cr")"
-            provision_job="$(jq -c '
-              [.status.provisioningJobs[]? | select(.type == "provision")]
-              | last // {}' <<<"$pool_cr")"
+            EXTERNAL_IP_POOL_API_ID="$id"
+            ready="$(network_ready_condition_status "$pool_cr")"
+            provision_job="$(network_task_entry "$pool_cr" create_external_ip_pool)"
             provision_job_id="$(jq -r '.jobID // ""' <<<"$provision_job")"
             provision_state="$(jq -r '.state // ""' <<<"$provision_job")"
             [[ -z "$provision_job_id" ]] \
                 || EXTERNAL_IP_POOL_CREATE_AAP_JOB_ID="$provision_job_id"
-            [[ "$phase" != Failed ]] \
-                || die "ExternalIPPool ${id} entered Failed phase"
-            [[ "$provision_state" != Failed && "$provision_state" != Canceled ]] \
-                || die "AAP provision job ${provision_job_id} ended in ${provision_state} for ExternalIPPool ${id}"
+            [[ "$(jq -r '.status.networkManagers.fabric.name // ""' <<<"$pool_cr")" == agentless_net ]] \
+                || die "ExternalIPPool ${id} is not assigned to the AgentlessNet Fabric Manager"
+            [[ "$provision_state" != Failed && "$provision_state" != Cancelled ]] \
+                || die "AAP create_external_ip_pool job ${provision_job_id} ended in ${provision_state} for ExternalIPPool ${id}"
 
-            if [[ "$phase" == Ready && "$provision_state" == Succeeded \
+            if [[ "$ready" == True && "$provision_state" == Succeeded \
                 && -n "$provision_job_id" ]]; then
-                jq -e '.metadata.annotations["osac.openshift.io/implementation-strategy"] == "agentless_net"' \
-                    <<<"$pool_cr" >/dev/null \
-                    || die "ExternalIPPool ${id} did not resolve to the AgentlessNet implementation"
                 if ! external_ip_pool_rpc Get "$get_request" "$get_response" "$get_error"; then
                     cat "$get_error" >&2
                     die "Fulfillment API failed while reading ExternalIPPool ${id} status"
@@ -3067,9 +3166,11 @@ wait_for_external_ip_pool_ready() {
                 pool_state="$(jq -r '.object.status.state // ""' "$get_response")"
                 case "$pool_state" in
                     EXTERNAL_IP_POOL_STATE_READY)
-                        jq -e '((.object.status.allocated // 0 | tonumber) == 0)' \
-                            "$get_response" >/dev/null \
-                            || die "ExternalIPPool ${id} unexpectedly has allocated addresses"
+                        if [[ "$allow_allocated" != true ]]; then
+                            jq -e '((.object.status.allocated // 0 | tonumber) == 0)' \
+                                "$get_response" >/dev/null \
+                                || die "ExternalIPPool ${id} unexpectedly has allocated addresses"
+                        fi
                         return 0
                         ;;
                     EXTERNAL_IP_POOL_STATE_FAILED|EXTERNAL_IP_POOL_STATE_DELETE_FAILED)
@@ -3090,8 +3191,9 @@ external_ip_pool_state_is_absent() {
         return 1
     fi
     jq -e --arg uid "$uid" --arg id "$id" '
-      .schema_version == 1
-      and all(.external_ip_pools[]; .uid != $uid and .fulfillment_id != $id)' \
+      .schema_version == 1 and .state_contract == "network-manager-api-id-v1"
+      and all(.external_ip_pools[]; .uid != $uid and .fulfillment_id != $id)
+      and any(.deleted_resources[]; .kind == "ExternalIPPool" and .api_id == $id)' \
         <<<"$snapshot" >/dev/null 2>&1
 }
 
@@ -3124,14 +3226,12 @@ wait_for_external_ip_pool_removed() {
                 printf 'ExternalIPPool CR identity changed during deletion of UUID %s\n' "$id" >&2
                 return 1
             fi
-            deprovision_job="$(jq -c '
-              [.status.provisioningJobs[]? | select(.type == "deprovision")]
-              | last // {}' <<<"$pool_cr")"
+            deprovision_job="$(network_task_entry "$pool_cr" delete_external_ip_pool)"
             deprovision_job_id="$(jq -r '.jobID // ""' <<<"$deprovision_job")"
             deprovision_state="$(jq -r '.state // ""' <<<"$deprovision_job")"
             [[ -z "$deprovision_job_id" ]] \
                 || EXTERNAL_IP_POOL_DELETE_AAP_JOB_ID="$deprovision_job_id"
-            if [[ "$deprovision_state" == Failed || "$deprovision_state" == Canceled ]]; then
+            if [[ "$deprovision_state" == Failed || "$deprovision_state" == Cancelled ]]; then
                 printf 'AAP deprovision job %s ended in %s for ExternalIPPool %s\n' \
                     "$deprovision_job_id" "$deprovision_state" "$id" >&2
                 return 1
@@ -3158,15 +3258,13 @@ wait_for_aap_provision_success() {
     local fulfillment_id="$1" job_id="$2" cr_json job_state
     for ((attempt = 1; attempt <= 180; attempt++)); do
         cr_json="$(virtual_network_cr_json "$fulfillment_id")"
-        job_state="$(jq -r --arg id "$job_id" \
-            '[.status.provisioningJobs[]? | select(.jobID == $id) | .state] | last // ""' \
-            <<<"$cr_json")"
+        job_state="$(network_task_state "$cr_json" create_virtual_network)"
         case "$job_state" in
             Succeeded)
                 assert_provider_key_survived "AAP VirtualNetwork job ${job_id}"
                 return 0
                 ;;
-            Failed|Canceled)
+            Failed|Cancelled)
                 die "AAP provision job ${job_id} ended in ${job_state} for test resource ${fulfillment_id}"
                 ;;
         esac
@@ -3196,10 +3294,8 @@ external_ip_cr_json() {
             error("ExternalIP UUID label does not match the requested resource")
           elif $ip.metadata.annotations["osac.openshift.io/tenant"] != $tenant then
             error("ExternalIP tenant annotation does not match the test tenant")
-          elif $ip.metadata.annotations["osac.openshift.io/implementation-strategy"] != "agentless_net" then
-            error("ExternalIP did not resolve to AgentlessNet")
-          elif $ip.metadata.annotations["osac.openshift.io/externalip-contract-version"] != "v1" then
-            error("ExternalIP is not using the v1 contract")
+          elif $ip.status.networkManagers.fabric.name != "agentless_net" then
+            error("ExternalIP is not assigned to the AgentlessNet Fabric Manager")
           elif $ip.metadata.namespace != $namespace or ($pool != "" and $ip.spec.pool != $pool) then
             error("ExternalIP namespace or pool does not match the test request")
           else $ip end
@@ -3227,10 +3323,8 @@ external_ip_attachment_cr_json() {
             error("ExternalIPAttachment UUID label does not match the requested resource")
           elif $attachment.metadata.annotations["osac.openshift.io/tenant"] != $tenant then
             error("ExternalIPAttachment tenant annotation does not match the test tenant")
-          elif $attachment.metadata.annotations["osac.openshift.io/implementation-strategy"] != "agentless_net" then
-            error("ExternalIPAttachment did not resolve to AgentlessNet")
-          elif $attachment.metadata.annotations["osac.openshift.io/externalipattachment-contract-version"] != "v1" then
-            error("ExternalIPAttachment is not using the v1 contract")
+          elif $attachment.status.networkManagers.fabric.name != "agentless_net" then
+            error("ExternalIPAttachment is not assigned to the AgentlessNet Fabric Manager")
           elif $attachment.metadata.namespace != $namespace then
             error("ExternalIPAttachment is in an unexpected namespace")
           elif ($attachment.metadata.name | startswith("agentless-eip-attach-") | not) then
@@ -3262,10 +3356,8 @@ nat_gateway_cr_json() {
             error("NATGateway UUID label does not match the requested resource")
           elif $gateway.metadata.annotations["osac.openshift.io/tenant"] != $tenant then
             error("NATGateway tenant annotation does not match the test tenant")
-          elif $gateway.metadata.annotations["osac.openshift.io/implementation-strategy"] != "agentless_net" then
-            error("NATGateway did not resolve to AgentlessNet")
-          elif $gateway.metadata.annotations["osac.openshift.io/natgateway-contract-version"] != "v1" then
-            error("NATGateway is not using the v1 contract")
+          elif $gateway.status.networkManagers.fabric.name != "agentless_net" then
+            error("NATGateway is not assigned to the AgentlessNet Fabric Manager")
           elif $gateway.metadata.namespace != $namespace then
             error("NATGateway is in an unexpected namespace")
           elif $gateway.spec.virtualNetwork != $virtual_network
@@ -3300,18 +3392,6 @@ baremetal_instance_cr_json() {
       end' <<<"$json"
 }
 
-external_ip_attachment_assert_result() {
-    local artifacts="$1" operation="$2" uid="$3" generation="$4"
-    jq -e --arg operation "$operation" --arg uid "$uid" \
-        --argjson generation "$generation" '
-      .osac_result as $result
-      | $result.schemaVersion == "v1"
-        and $result.operation == $operation
-        and $result.resourceUID == $uid
-        and $result.observedGeneration == $generation
-        and $result.data == {}' <<<"$artifacts" >/dev/null
-}
-
 external_ip_attachment_state_entry() {
     local uid="$1" fulfillment_id="$2"
     save_current_state
@@ -3328,190 +3408,81 @@ write_synthetic_external_ip_attachment_attach_vars() {
     local virtual_network_id="${12}" virtual_network_uid="${13}" virtual_network_name="${14}"
     local tenant="${15}" namespace="${16}" target_id="${17}" target_uid="${18}"
     local target_name="${19}" target_namespace="${20}" target_ip="${21}" output_file="${22}"
-    local external_interface="${23}"
-    python3 - "$attachment_id" "$attachment_uid" "$attachment_name" \
-        "$external_ip_id" "$external_ip_uid" "$external_ip_name" "$external_address" \
-        "$subnet_id" "$subnet_uid" "$subnet_name" "$subnet_cidr" \
-        "$virtual_network_id" "$virtual_network_uid" "$virtual_network_name" \
-        "$tenant" "$namespace" "$target_id" "$target_uid" "$target_name" \
-        "$target_namespace" "$target_ip" "$output_file" "$external_interface" <<'PY'
-import json
-import pathlib
-import sys
-
-(
-    attachment_id, attachment_uid, attachment_name,
-    external_ip_id, external_ip_uid, external_ip_name, external_address,
-    subnet_id, subnet_uid, subnet_name, subnet_cidr,
-    virtual_network_id, virtual_network_uid, virtual_network_name,
-    tenant, namespace, target_id, target_uid, target_name,
-    target_namespace, target_ip, output_path, external_interface,
-) = sys.argv[1:]
-
-attachment = {
-    "apiVersion": "osac.openshift.io/v1alpha1",
-    "kind": "ExternalIPAttachment",
-    "metadata": {
-        "name": attachment_name,
-        "namespace": namespace,
-        "uid": attachment_uid,
-        "generation": 1,
-        "labels": {"osac.openshift.io/externalipattachment-uuid": attachment_id},
-        "annotations": {
-            "osac.openshift.io/tenant": tenant,
-            "osac.openshift.io/owner-reference": "vlan-e2e-run",
-            "osac.openshift.io/implementation-strategy": "agentless_net",
-            "osac.openshift.io/externalipattachment-contract-version": "v1",
-        },
-    },
-    "spec": {
-        "externalIP": external_ip_id,
-        "baremetalInstance": target_id,
-    },
-}
-context = {
-    "external_ip": {
-        "name": external_ip_name,
-        "namespace": namespace,
-        "fulfillment_id": external_ip_id,
-        "kubernetes_uid": external_ip_uid,
-        "tenant_id": tenant,
-        "address": external_address,
-        "state": "Allocated",
-        "phase": "Ready",
-    },
-    "target": {
-        "kind": "BareMetalInstance",
-        "name": target_name,
-        "namespace": target_namespace,
-        "fulfillment_id": target_id,
-        "kubernetes_uid": target_uid,
-        "tenant_id": tenant,
-        "ip_address": target_ip,
-        "ready": True,
-    },
-    "subnet": {
-        "name": subnet_name,
-        "namespace": namespace,
-        "fulfillment_id": subnet_id,
-        "kubernetes_uid": subnet_uid,
-        "tenant_id": tenant,
-        "ipv4_cidr": subnet_cidr,
-        "virtual_network_id": virtual_network_id,
-        "phase": "Ready",
-    },
-    "virtual_network": {
-        "name": virtual_network_name,
-        "namespace": namespace,
-        "fulfillment_id": virtual_network_id,
-        "kubernetes_uid": virtual_network_uid,
-        "tenant_id": tenant,
-        "phase": "Ready",
-    },
-}
-output = pathlib.Path(output_path)
-output.write_text(json.dumps({
-    "agentless_net_external_interface": external_interface,
-    "osac_job_vars": {
-        "resource": attachment,
-        "external_ip_attachment_context": context,
-    },
-}, separators=(",", ":")) + "\n")
-output.chmod(0o600)
-PY
+    local external_interface="${23}" eip_cr manager_name manager_role
+    eip_cr="$(external_ip_cr_json "$external_ip_id")" || return 1
+    manager_name="$(jq -er '.status.networkManagers.fabric.name' <<<"$eip_cr")" || return 1
+    manager_role="$(jq -er '.status.networkManagers.fabric.ansibleRole' <<<"$eip_cr")" || return 1
+    jq -n --arg id "$attachment_id" --arg uid "$attachment_uid" --arg name "$attachment_name" \
+        --arg namespace "$namespace" --arg tenant "$tenant" \
+        --arg manager "$manager_name" --arg role "$manager_role" \
+        --arg eip_id "$external_ip_id" --arg eip_address "$external_address" \
+        --arg subnet_id "$subnet_id" --arg vn_id "$virtual_network_id" \
+        --arg target_ip "$target_ip" '
+      {osac_job_vars:{
+        task:"attach_external_ip",
+        manager:{name:$manager,type:"fabric",ansible_role:$role},
+        resource:{apiVersion:"osac.openshift.io/v1alpha1",kind:"ExternalIPAttachment",id:$id,
+          metadata:{name:$name,namespace:$namespace,uid:$uid,generation:1},spec:{}},
+        tenant:$tenant,
+        external_ip:{id:$eip_id,address:$eip_address},
+        destination:{address:$target_ip,routing_domain:{type:"tenant_virtual_network",
+          virtual_network_id:$vn_id,subnet_id:$subnet_id}}
+      }}' >"$output_file" || return 1
+    chmod 0600 "$output_file"
 }
 
 write_synthetic_external_ip_attachment_detach_vars() {
-    local entry="$1" output_file="$2"
-    python3 - "$entry" "$output_file" <<'PY'
-import datetime
-import json
-import pathlib
-import sys
-
-entry = json.loads(sys.argv[1])
-context = entry["payload"]["context"]
-external_ip = context["external_ip"]
-target = context["target"]
-tenant = entry["tenant_id"]
-resource = {
-    "apiVersion": "osac.openshift.io/v1alpha1",
-    "kind": "ExternalIPAttachment",
-    "metadata": {
-        "name": f"agentless-eip-attach-{entry['fulfillment_id'][:8]}",
-        "namespace": external_ip["namespace"],
-        "uid": entry["uid"],
-        "generation": 1,
-        "deletionTimestamp": datetime.datetime.now(datetime.timezone.utc)
-        .replace(microsecond=0).isoformat().replace("+00:00", "Z"),
-        "labels": {
-            "osac.openshift.io/externalipattachment-uuid": entry["fulfillment_id"],
-        },
-        "annotations": {
-            "osac.openshift.io/tenant": tenant,
-            "osac.openshift.io/owner-reference": "vlan-e2e-run",
-            "osac.openshift.io/implementation-strategy": "agentless_net",
-            "osac.openshift.io/externalipattachment-contract-version": "v1",
-        },
-    },
-    "spec": {
-        "externalIP": external_ip["fulfillment_id"],
-        "baremetalInstance": target["fulfillment_id"],
-    },
-}
-output = pathlib.Path(sys.argv[2])
-output.write_text(json.dumps({"osac_job_vars": {"resource": resource}}, separators=(",", ":")) + "\n")
-output.chmod(0o600)
-PY
+    local entry="$1" output_file="$2" external_ip_id manager_name manager_role
+    external_ip_id="$(jq -er '.payload.context.external_ip.id' <<<"$entry")" || return 1
+    manager_name="agentless_net"
+    manager_role="osac.templates.agentless_net"
+    jq -n --argjson entry "$entry" --arg role "$manager_role" --arg manager "$manager_name" '
+      {osac_job_vars:{
+        task:"detach_external_ip",
+        manager:{name:$manager,type:"fabric",ansible_role:$role},
+        resource:{apiVersion:"osac.openshift.io/v1alpha1",kind:"ExternalIPAttachment",
+          id:$entry.fulfillment_id,
+          metadata:{name:("agentless-eip-attach-" + ($entry.fulfillment_id[0:8])),
+            namespace:$entry.payload.provider.namespace_name,uid:$entry.uid,generation:1},spec:{}},
+        tenant:$entry.tenant_id,
+        external_ip:$entry.payload.context.external_ip,
+        destination:$entry.payload.context.destination
+      }}' >"$output_file" || return 1
+    chmod 0600 "$output_file"
 }
 
 run_synthetic_external_ip_attachment_attach_job() {
     local attachment_id="$1" attachment_uid="$2" attachment_name="$3"
     local external_ip_id="$4" external_ip_uid="$5" external_ip_name="$6" external_address="$7"
-    local output_file="$8" extra_vars result_file job_id artifacts
+    local output_file="$8" extra_vars result_file job_id
     extra_vars="${output_file}.extra-vars.json"
     AAP_JOB_RESULT_SEQUENCE=$((AAP_JOB_RESULT_SEQUENCE + 1))
     result_file="${output_file}.result-${AAP_JOB_RESULT_SEQUENCE}.json"
     write_synthetic_external_ip_attachment_attach_vars \
         "$attachment_id" "$attachment_uid" "$attachment_name" \
         "$external_ip_id" "$external_ip_uid" "$external_ip_name" "$external_address" \
-        "$EXTERNAL_IP_ATTACHMENT_SUBNET_ID" "$EXTERNAL_IP_ATTACHMENT_SUBNET_UID" \
+        "$EXTERNAL_IP_ATTACHMENT_SUBNET_ID" "$EXTERNAL_IP_ATTACHMENT_SUBNET_API_ID" \
         "$EXTERNAL_IP_ATTACHMENT_SUBNET_NAME" "$EXTERNAL_IP_ATTACHMENT_SUBNET_CIDR" \
-        "$FIRST_FULFILLMENT_ID" "$FIRST_K8S_UID" "$FIRST_CR_NAME" \
+        "$FIRST_FULFILLMENT_ID" "$FIRST_API_ID" "$FIRST_CR_NAME" \
         "$OSAC_TENANT" "$NETWORKING_NAMESPACE" \
         "$EXTERNAL_IP_SYNTHETIC_TARGET_ID" "$EXTERNAL_IP_SYNTHETIC_TARGET_UID" \
         "$EXTERNAL_IP_SYNTHETIC_TARGET_NAME" "$OSAC_BMAAS_NAMESPACE" \
         "$EXTERNAL_IP_SYNTHETIC_TARGET_IP" "$extra_vars" \
-        "$EXTERNAL_IP_UPLINK_INTERFACE" \
-        || return 1
-    run_agentless_net_aap_job attach-external-ip "$extra_vars" "$result_file" \
-        || return 1
+        "$EXTERNAL_IP_UPLINK_INTERFACE" || return 1
+    run_agentless_net_aap_job attach_external_ip "$extra_vars" "$result_file" || return 1
     job_id="$(jq -er '.job_id' "$result_file")" || return 1
-    artifacts="$(external_ip_aap_job_artifacts "$job_id")" || return 1
-    external_ip_attachment_assert_result \
-        "$artifacts" external_ip_attachment.attach "$attachment_uid" 1 \
-        || return 1
     LAST_EXTERNAL_IP_ATTACHMENT_JOB_ID="$job_id"
     LAST_EXTERNAL_IP_ATTACHMENT_PROVISION_JOB_ID="$job_id"
 }
 
 run_synthetic_external_ip_attachment_detach_job() {
-    local entry="$1" output_file="$2" extra_vars result_file job_id artifacts
-    local uid generation
-    uid="$(jq -er '.uid' <<<"$entry")" || return 1
-    generation="${3:-1}"
+    local entry="$1" output_file="$2" extra_vars result_file job_id
     extra_vars="${output_file}.extra-vars.json"
     AAP_JOB_RESULT_SEQUENCE=$((AAP_JOB_RESULT_SEQUENCE + 1))
     result_file="${output_file}.result-${AAP_JOB_RESULT_SEQUENCE}.json"
-    write_synthetic_external_ip_attachment_detach_vars "$entry" "$extra_vars" \
-        || return 1
-    run_agentless_net_aap_job detach-external-ip "$extra_vars" "$result_file" \
-        || return 1
+    write_synthetic_external_ip_attachment_detach_vars "$entry" "$extra_vars" || return 1
+    run_agentless_net_aap_job detach_external_ip "$extra_vars" "$result_file" || return 1
     job_id="$(jq -er '.job_id' "$result_file")" || return 1
-    artifacts="$(external_ip_aap_job_artifacts "$job_id")" || return 1
-    external_ip_attachment_assert_result \
-        "$artifacts" external_ip_attachment.detach "$uid" "$generation" \
-        || return 1
     LAST_EXTERNAL_IP_ATTACHMENT_JOB_ID="$job_id"
 }
 
@@ -3528,7 +3499,7 @@ synthetic_external_ip_attachment_remove_created_id() {
 attach_synthetic_external_ip_attachment() {
     local attachment_id attachment_uid attachment_name output_file entry
     attachment_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
-    attachment_uid="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+    attachment_uid="$attachment_id"
     attachment_name="agentless-eip-attach-${attachment_id:0:8}"
     output_file="${TEMP_DIR}/${attachment_name}-attach"
     CREATED_SYNTHETIC_EXTERNAL_IP_ATTACHMENT_IDS+=("$attachment_id")
@@ -3539,25 +3510,21 @@ attach_synthetic_external_ip_attachment() {
         || die "AAP could not attach synthetic target to ExternalIP $1"
     entry="$(external_ip_attachment_state_entry "$attachment_uid" "$attachment_id")" \
         || die "AAP attach job did not persist synthetic ExternalIPAttachment state"
-    jq -e --arg uid "$attachment_uid" --arg id "$attachment_id" \
-        --arg tenant "$OSAC_TENANT" --arg eip_uid "$2" --arg address "$4" \
-        --arg vn_uid "$FIRST_K8S_UID" --arg subnet_uid "$EXTERNAL_IP_ATTACHMENT_SUBNET_UID" \
-        --arg target_id "$EXTERNAL_IP_SYNTHETIC_TARGET_ID" \
-        --arg target_uid "$EXTERNAL_IP_SYNTHETIC_TARGET_UID" \
-        --arg target_ip "$EXTERNAL_IP_SYNTHETIC_TARGET_IP" \
-        --arg target_name "$EXTERNAL_IP_SYNTHETIC_TARGET_NAME" '
-      .uid == $uid and .fulfillment_id == $id and .tenant_id == $tenant
-      and .external_ip_uid == $eip_uid and .external_address == $address
-      and .virtual_network_uid == $vn_uid and .subnet_uid == $subnet_uid
+    jq -e --arg id "$attachment_id" --arg tenant "$OSAC_TENANT" \
+        --arg eip_id "$1" --arg address "$4" \
+        --arg vn_id "$FIRST_FULFILLMENT_ID" --arg subnet_id "$EXTERNAL_IP_ATTACHMENT_SUBNET_ID" \
+        --arg target_ip "$EXTERNAL_IP_SYNTHETIC_TARGET_IP" '
+      .uid == $id and .fulfillment_id == $id and .tenant_id == $tenant
+      and .external_ip_uid == $eip_id and .external_address == $address
+      and .virtual_network_uid == $vn_id and .subnet_uid == $subnet_id
       and .phase == "ready"
+      and .payload.context.external_ip.id == $eip_id
       and .payload.context.external_ip.address == $address
-      and .payload.context.target.kind == "BareMetalInstance"
-      and .payload.context.target.fulfillment_id == $target_id
-      and .payload.context.target.kubernetes_uid == $target_uid
-      and .payload.context.target.name == $target_name
-      and .payload.context.target.ip_address == $target_ip
+      and .payload.context.destination.address == $target_ip
+      and .payload.context.destination.routing_domain.virtual_network_id == $vn_id
+      and .payload.context.destination.routing_domain.subnet_id == $subnet_id
     ' <<<"$entry" >/dev/null \
-        || die "Synthetic ExternalIPAttachment provider state does not match the AAP input"
+        || die "Synthetic ExternalIPAttachment provider state does not match the generic task input"
     LAST_EXTERNAL_IP_ATTACHMENT_ID="$attachment_id"
     LAST_EXTERNAL_IP_ATTACHMENT_UID="$attachment_uid"
     LAST_EXTERNAL_IP_ATTACHMENT_GENERATION=1
@@ -3569,8 +3536,8 @@ detach_synthetic_external_ip_attachment() {
     local id="$1" uid="$2" address="$3" entry namespace output_file
     entry="$(external_ip_attachment_state_entry "$uid" "$id")" \
         || die "Synthetic ExternalIPAttachment state is missing before detach"
-    jq -e --arg tenant "$OSAC_TENANT" --arg target "$EXTERNAL_IP_SYNTHETIC_TARGET_NAME" \
-        '.tenant_id == $tenant and .payload.context.target.name == $target' \
+    jq -e --arg tenant "$OSAC_TENANT" --arg target_ip "$EXTERNAL_IP_SYNTHETIC_TARGET_IP" \
+        '.tenant_id == $tenant and .payload.context.destination.address == $target_ip' \
         <<<"$entry" >/dev/null \
         || die "Refusing to detach provider state outside the synthetic test target"
     namespace="$(jq -er '.payload.provider.namespace_name' <<<"$entry")" \
@@ -3629,26 +3596,21 @@ delete_external_ip_attachment_and_verify() {
             return 1
         }
         cr="$(jq -c '.items[0]' <<<"$crs")"
-        job="$(jq -c '[.status.provisioningJobs[]? | select(.type == "deprovision")] | last // {}' <<<"$cr")"
+        job="$(network_task_entry "$cr" detach_external_ip)"
         job_id="$(jq -r '.jobID // ""' <<<"$job")"
         job_state="$(jq -r '.state // ""' <<<"$job")"
-        if [[ -n "$job_id" && ( "$job_state" == Failed || "$job_state" == Canceled ) ]]; then
+        if [[ -n "$job_id" && ( "$job_state" == Failed || "$job_state" == Cancelled ) ]]; then
             printf 'AAP detach job %s ended in %s for ExternalIPAttachment %s; retaining ExternalIP, target, Subnet, and route\n' \
                 "$job_id" "$job_state" "$id" >&2
             return 1
         fi
-        if [[ -n "$job_id" ]] \
+        if [[ -n "$job_id" && "$job_state" == Succeeded ]] \
             && jq -e --arg hold "$hold_finalizer" --arg operator "$operator_finalizer" '
                 (.metadata.finalizers // []) as $values
                 | ($values | index($hold) != null)
                   and ($values | index($operator) == null)' <<<"$cr" >/dev/null; then
-            artifacts="$(external_ip_aap_job_artifacts "$job_id" 2>/dev/null || true)"
-            if [[ -n "$artifacts" ]] \
-                && external_ip_attachment_assert_result "$artifacts" \
-                    external_ip_attachment.detach "$uid" "$generation"; then
-                validated=true
-                break
-            fi
+            validated=true
+            break
         fi
         sleep 2
     done
@@ -3889,12 +3851,14 @@ cleanup_nat_gateway_endpoint() {
 }
 
 assert_external_ip_attachment_provider_absent() {
-    local uid="$1" address="$2" namespace="$3" state routes nat forwarding conntrack
+    local api_id="$1" address="$2" namespace="$3" state routes nat forwarding conntrack
     state="$(state_snapshot)" || return 1
-    if jq -e --arg uid "$uid" 'any(.external_ip_attachments[]; .uid == $uid)' <<<"$state" >/dev/null; then
-        printf 'ExternalIPAttachment provider row remains for UID %s\n' "$uid" >&2
+    if jq -e --arg id "$api_id" 'any(.external_ip_attachments[]; .uid == $id)' <<<"$state" >/dev/null; then
+        printf 'ExternalIPAttachment provider row remains for API ID %s\n' "$api_id" >&2
         return 1
     fi
+    jq -e --arg id "$api_id" 'any(.deleted_resources[]; .kind == "ExternalIPAttachment" and .api_id == $id)' \
+        <<<"$state" >/dev/null || { printf 'ExternalIPAttachment delete tombstone is missing for API ID %s\n' "$api_id" >&2; return 1; }
     routes="$(netnode vtysh -c "show ip route ${address}/32" 2>&1 || true)"
     if grep -Fq "${address}/32" <<<"$routes"; then
         printf 'ExternalIP route %s remains on the network node after detach\n' "$address" >&2
@@ -3909,8 +3873,8 @@ assert_external_ip_attachment_provider_absent() {
         conntrack="$(netnode ip netns exec "$namespace" conntrack -L -f ipv4 2>&1)" \
             || return 1
     fi
-    if grep -Fq "osac-eia:${uid}:" <<<"$nat$forwarding"; then
-        printf 'ExternalIPAttachment %s still owns a forwarding or DNAT rule\n' "$uid" >&2
+    if grep -Fq "osac-eia:${api_id}:" <<<"$nat$forwarding"; then
+        printf 'ExternalIPAttachment %s still owns a forwarding or DNAT rule\n' "$api_id" >&2
         return 1
     fi
     if [[ -n "$namespace" ]] && grep -E "(^| )(src|dst)=${address}([[:space:]]|$)" <<<"$conntrack"; then
@@ -3978,10 +3942,11 @@ external_ip_assert_state() {
 }
 
 external_ip_assert_state_absent() {
-    local uid="$1" fulfillment_id="$2"
+    local api_id="$1" fulfillment_id="$2"
     save_current_state
-    jq -e --arg uid "$uid" --arg id "$fulfillment_id" '
-      all(.external_ips[]; .uid != $uid and .fulfillment_id != $id)' \
+    jq -e --arg id "$fulfillment_id" '
+      all(.external_ips[]; .uid != $id and .fulfillment_id != $id)
+      and any(.deleted_resources[]; .kind == "ExternalIP" and .api_id == $id)' \
         "$CURRENT_STATE_FILE" >/dev/null \
         || die "Released ExternalIP ${fulfillment_id} remains in provider state"
 }
@@ -4022,144 +3987,26 @@ sys.stdout.write(json.dumps(artifacts, sort_keys=True))
 PY
 )
 
-nat_gateway_aap_job_details() (
-    local job_id="$1" operation="$2" route token
-    route="$(oc get route osac-aap -n "$OSAC_NAMESPACE" -o jsonpath='{.spec.host}')" \
-        || return 1
-    token="$(oc exec deployment/osac-operator -n "$OSAC_NAMESPACE" -- \
-        sh -c 'printf %s "$OSAC_AAP_TOKEN"' 2>/dev/null)" \
-        || return 1
-    [[ -n "$route" && -n "$token" ]] || return 1
-    AAP_API_ROUTE="https://${route}" AAP_API_TOKEN="$token" \
-        AAP_API_CA_FILE="$AAP_API_CA_FILE" \
-        python3 "$AAP_JOBS_HELPER" inspect-nat-gateway-job \
-            --job-id "$job_id" \
-            --operation "$operation" \
-            --project-name "$AAP_PROJECT_NAME" \
-            --project-revision "$RUNTIME_SOURCE_COMMIT" \
-            --ee-name "$AAP_EXECUTION_ENVIRONMENT_NAME" \
-            --ee-image "$AAP_IMAGE"
-)
-
-external_ip_assert_result() {
-    local artifacts="$1" operation="$2" uid="$3" generation="$4" address="${5:-}"
-    jq -e --arg operation "$operation" --arg uid "$uid" \
-        --argjson generation "$generation" --arg address "$address" '
-      .osac_result as $result
-      | $result.schemaVersion == "v1"
-        and $result.operation == $operation
-        and $result.resourceUID == $uid
-        and $result.observedGeneration == $generation
-        and (if $operation == "external_ip.allocate"
-             then ($result.data.address == $address and $address != "")
-             else $result.data == {} end)' <<<"$artifacts" >/dev/null
-}
-
-nat_gateway_assert_result() {
-    local result="$1" operation="$2" uid="$3" generation="$4"
-    jq -e --arg operation "$operation" --arg uid "$uid" \
-        --argjson generation "$generation" '
-      .schemaVersion == "v1"
-      and .operation == $operation
-      and .resourceUID == $uid
-      and .observedGeneration == $generation
-      and .data == {}' <<<"$result" >/dev/null
-}
-
-nat_gateway_assert_ensure_job() {
-    local job="$1" gateway_cr="$2" external_ip_cr="$3" virtual_network_cr="$4"
-    local expected_context expected_uid expected_generation
-    expected_uid="$(jq -er '.metadata.uid' <<<"$gateway_cr")" \
-        || die "NATGateway CR has no Kubernetes UID"
-    expected_generation="$(jq -er '.metadata.generation' <<<"$gateway_cr")" \
-        || die "NATGateway CR has no generation"
-    expected_context="$(jq -ncS --argjson ip "$external_ip_cr" --argjson vn "$virtual_network_cr" '
-      {
-        external_ip: {
-          name: $ip.metadata.name,
-          namespace: $ip.metadata.namespace,
-          fulfillment_id: $ip.metadata.labels["osac.openshift.io/externalip-uuid"],
-          kubernetes_uid: $ip.metadata.uid,
-          tenant_id: $ip.metadata.annotations["osac.openshift.io/tenant"],
-          address: $ip.status.address,
-          state: $ip.status.state,
-          phase: $ip.status.phase
-        },
-        virtual_network: {
-          name: $vn.metadata.name,
-          namespace: $vn.metadata.namespace,
-          fulfillment_id: $vn.metadata.labels["osac.openshift.io/virtualnetwork-uuid"],
-          kubernetes_uid: $vn.metadata.uid,
-          tenant_id: $vn.metadata.annotations["osac.openshift.io/tenant"],
-          ipv4_cidr: $vn.spec.ipv4Cidr,
-          phase: $vn.status.phase
-        }
-      }')" || die "Could not construct the expected NATGateway job context"
-    jq -e --arg uid "$expected_uid" --argjson generation "$expected_generation" \
-        --argjson gateway "$gateway_cr" --argjson context "$expected_context" '
-      .status == "successful"
-      and .resource.metadata.uid == $uid
-      and .resource.metadata.generation == $generation
-      and .resource.metadata.labels["osac.openshift.io/natgateway-uuid"]
-          == $gateway.metadata.labels["osac.openshift.io/natgateway-uuid"]
-      and .resource.metadata.annotations["osac.openshift.io/tenant"]
-          == $gateway.metadata.annotations["osac.openshift.io/tenant"]
-      and .resource.metadata.annotations["osac.openshift.io/implementation-strategy"] == "agentless_net"
-      and .resource.metadata.annotations["osac.openshift.io/natgateway-contract-version"] == "v1"
-      and .resource.spec.virtualNetwork == $gateway.spec.virtualNetwork
-      and .resource.spec.externalIP == $gateway.spec.externalIP
-      and .nat_gateway_context == $context' <<<"$job" >/dev/null \
-        || die "AAP ensure job input does not match the current NATGateway and dependencies"
-    nat_gateway_assert_result "$(jq -c '.artifacts.osac_result' <<<"$job")" \
-        nat_gateway.ensure "$expected_uid" "$expected_generation" \
-        || die "AAP ensure artifact does not match NATGateway ${expected_uid}"
-}
-
-nat_gateway_assert_delete_job() {
-    local job="$1" gateway_cr="$2" expected_uid expected_generation
-    expected_uid="$(jq -er '.metadata.uid' <<<"$gateway_cr")" \
-        || die "Deleting NATGateway has no Kubernetes UID"
-    expected_generation="$(jq -er '.metadata.generation' <<<"$gateway_cr")" \
-        || die "Deleting NATGateway has no generation"
-    jq -e --arg uid "$expected_uid" --argjson generation "$expected_generation" \
-        --argjson gateway "$gateway_cr" '
-      .status == "successful"
-      and .resource.metadata.uid == $uid
-      and .resource.metadata.generation == $generation
-      and .resource.metadata.labels["osac.openshift.io/natgateway-uuid"]
-          == $gateway.metadata.labels["osac.openshift.io/natgateway-uuid"]
-      and .resource.metadata.annotations["osac.openshift.io/tenant"]
-          == $gateway.metadata.annotations["osac.openshift.io/tenant"]
-      and .resource.metadata.annotations["osac.openshift.io/implementation-strategy"] == "agentless_net"
-      and .resource.metadata.annotations["osac.openshift.io/natgateway-contract-version"] == "v1"
-      and .resource.spec.virtualNetwork == $gateway.spec.virtualNetwork
-      and .resource.spec.externalIP == $gateway.spec.externalIP' <<<"$job" >/dev/null \
-        || die "AAP delete job input does not match deleting NATGateway ${expected_uid}"
-    nat_gateway_assert_result "$(jq -c '.artifacts.osac_result' <<<"$job")" \
-        nat_gateway.delete "$expected_uid" "$expected_generation" \
-        || die "AAP delete artifact does not match NATGateway ${expected_uid}"
-}
-
 nat_gateway_assert_provider_state() {
-    local id="$1" uid="$2" virtual_network_uid="$3" external_ip_uid="$4"
+    local id="$1" api_id="$2" virtual_network_api_id="$3" external_ip_api_id="$4"
     local address="$5" entry
-    entry="$(get_nat_gateway_state_entry "$uid" "$id")" \
+    entry="$(get_nat_gateway_state_entry "$api_id" "$id")" \
         || die "NATGateway ${id} has no unique saved provider row"
-    jq -e --arg id "$id" --arg uid "$uid" --arg tenant "$OSAC_TENANT" \
-        --arg vn_uid "$virtual_network_uid" --arg eip_uid "$external_ip_uid" \
+    jq -e --arg id "$id" --arg api_id "$api_id" --arg tenant "$OSAC_TENANT" \
+        --arg vn_id "$virtual_network_api_id" --arg eip_id "$external_ip_api_id" \
         --arg address "$address" '
-      .uid == $uid
+      .uid == $api_id
       and .fulfillment_id == $id
       and .tenant_id == $tenant
-      and .external_ip_uid == $eip_uid
-      and .virtual_network_uid == $vn_uid
+      and .external_ip_uid == $eip_id
+      and .virtual_network_uid == $vn_id
       and .external_address == $address
       and .phase == "ready"
       and .payload.phase == "ready"
       and (.payload | keys | sort) == ["context", "external_address", "external_ip_uid", "fulfillment_id", "phase", "provider", "tenant_id", "uid", "virtual_network_uid"]
-      and .payload.context.external_ip.kubernetes_uid == $eip_uid
+      and .payload.context.external_ip.fulfillment_id == $eip_id
       and .payload.context.external_ip.address == $address
-      and .payload.context.virtual_network.kubernetes_uid == $vn_uid
+      and .payload.context.virtual_network.fulfillment_id == $vn_id
       and .payload.provider.external_interface == "eth2"
       and (.payload.provider.next_hop | type == "string" and length > 0)' \
         <<<"$entry" >/dev/null \
@@ -4300,17 +4147,19 @@ PY
 }
 
 nat_gateway_assert_provider_absent() {
-    local uid="$1" address="$2" namespace="$3" state nat_rules forward_rules bypass_rules route conntrack
+    local api_id="$1" address="$2" namespace="$3" state nat_rules forward_rules bypass_rules route conntrack
     state="$(state_snapshot)" || return 1
-    if jq -e --arg uid "$uid" 'any(.nat_gateways[]; .uid == $uid)' <<<"$state" >/dev/null; then
-        printf 'NATGateway provider row remains for UID %s\n' "$uid" >&2
+    if jq -e --arg id "$api_id" 'any(.nat_gateways[]; .uid == $id)' <<<"$state" >/dev/null; then
+        printf 'NATGateway provider row remains for API ID %s\n' "$api_id" >&2
         return 1
     fi
+    jq -e --arg id "$api_id" 'any(.deleted_resources[]; .kind == "NATGateway" and .api_id == $id)' \
+        <<<"$state" >/dev/null || { printf 'NATGateway delete tombstone is missing for API ID %s\n' "$api_id" >&2; return 1; }
     nat_rules="$(netnode ip netns exec "$namespace" iptables -w -t nat -S POSTROUTING 2>&1 || true)"
     forward_rules="$(netnode iptables -w -t filter -S OSAC-SNAT-FORWARD 2>&1 || true)"
     bypass_rules="$(netnode iptables -w -t nat -S OSAC-SNAT-BYPASS 2>&1 || true)"
-    if grep -Fq -- "osac-ngw:${uid}:" <<<"$nat_rules$forward_rules$bypass_rules"; then
-        printf 'NATGateway rules remain for UID %s\n' "$uid" >&2
+    if grep -Fq -- "osac-ngw:${api_id}:" <<<"$nat_rules$forward_rules$bypass_rules"; then
+        printf 'NATGateway rules remain for API ID %s\n' "$api_id" >&2
         return 1
     fi
     route="$(netnode vtysh -c "show ip route ${address}/32" 2>&1 || true)"
@@ -4361,7 +4210,7 @@ create_external_ip() {
 
 wait_for_external_ip_ready() {
     local id="$1" deadline=$((SECONDS + 600))
-    local crs count cr phase state provision_job job_id job_state address uid generation artifacts entry
+    local crs count cr ready provision_job job_id job_state address artifacts entry
     info "Waiting for ExternalIP ${id} to become Ready..."
     while ((SECONDS < deadline)); do
         if ! crs="$(external_ip_crs_json "$id")"; then
@@ -4375,33 +4224,28 @@ wait_for_external_ip_ready() {
         fi
         [[ "$count" == 1 ]] || die "Expected one ExternalIP CR for UUID ${id}; found ${count}"
         cr="$(external_ip_cr_json "$id")"
-        phase="$(jq -r '.status.phase // ""' <<<"$cr")"
-        state="$(jq -r '.status.state // ""' <<<"$cr")"
-        provision_job="$(jq -c '[.status.provisioningJobs[]? | select(.type == "provision")] | last // {}' <<<"$cr")"
+        ready="$(network_ready_condition_status "$cr")"
+        provision_job="$(network_task_entry "$cr" create_external_ip)"
         job_id="$(jq -r '.jobID // ""' <<<"$provision_job")"
         job_state="$(jq -r '.state // ""' <<<"$provision_job")"
-        if [[ "$phase" == Failed || "$state" == Failed || "$job_state" == Failed || "$job_state" == Canceled ]]; then
+        if [[ "$(network_ready_condition_reason "$cr")" == Failed \
+            || "$job_state" == Failed || "$job_state" == Cancelled ]]; then
             printf '%s\n' "$cr" >&2
             die "ExternalIP ${id} failed allocation"
         fi
-        if [[ "$phase" == Ready && "$state" == Allocated && "$job_state" == Succeeded && -n "$job_id" ]]; then
-            uid="$(jq -er '.metadata.uid' <<<"$cr")"
-            generation="$(jq -er '.metadata.generation' <<<"$cr")"
+        if [[ "$ready" == True && "$job_state" == Succeeded && -n "$job_id" ]]; then
             address="$(jq -er '.status.address' <<<"$cr")"
-            jq -e '(.metadata.annotations // {}) | has("osac.openshift.io/allocated-address") | not' \
-                <<<"$cr" >/dev/null \
-                || die "ExternalIP ${id} contains the obsolete allocated-address annotation"
             if ! artifacts="$(external_ip_aap_job_artifacts "$job_id")"; then
                 die "Could not retrieve allocation artifacts for AAP job ${job_id}"
             fi
-            external_ip_assert_result "$artifacts" external_ip.allocate "$uid" "$generation" "$address" \
+            external_ip_assert_result "$artifacts" external_ip.allocate "$id" 0 "$address" \
                 || die "AAP allocation artifact does not match ExternalIP ${id}"
             external_ip_validate_address "$address" \
                 || die "ExternalIP ${id} has an invalid address"
-            entry="$(external_ip_state_entry "$uid" "$id")"
-            external_ip_assert_state "$entry" "$uid" "$id" "$OSAC_TENANT" \
-                "$EXTERNAL_IP_POOL_K8S_UID" "$address"
-            LAST_EXTERNAL_IP_UID="$uid"
+            entry="$(external_ip_state_entry "$id" "$id")"
+            external_ip_assert_state "$entry" "$id" "$id" "$OSAC_TENANT" \
+                "$EXTERNAL_IP_POOL_ID" "$address"
+            LAST_EXTERNAL_IP_UID="$id"
             LAST_EXTERNAL_IP_ADDRESS="$address"
             LAST_EXTERNAL_IP_PROVISION_JOB_ID="$job_id"
             info "ExternalIP ${id} is Ready at ${address}; AAP job ${job_id}"
@@ -4434,10 +4278,29 @@ create_nat_gateway() {
     return 0
 }
 
+nat_gateway_assert_task_input() {
+    local gateway_cr="$1" external_ip_cr="$2" virtual_network_cr="$3"
+    local id="$4" external_ip_id="$5" virtual_network_id="$6" address
+    address="$(jq -er '.status.address' <<<"$external_ip_cr")" \
+        || die "ExternalIP ${external_ip_id} has no accepted address"
+    jq -e --arg id "$id" --arg eip "$external_ip_id" --arg vn "$virtual_network_id" \
+        --arg address "$address" --argjson network "$virtual_network_cr" '
+      .status.taskInput.resource.kind == "NATGateway"
+      and .status.taskInput.resource.id == $id
+      and .status.taskInput.resource.spec.virtualNetwork == $vn
+      and .status.taskInput.resource.spec.externalIP == $eip
+      and .status.taskInput.nat_gateway_context.external_ip.fulfillment_id == $eip
+      and .status.taskInput.nat_gateway_context.external_ip.address == $address
+      and .status.taskInput.nat_gateway_context.virtual_network.fulfillment_id == $vn
+      and .status.taskInput.nat_gateway_context.virtual_network.ipv4_cidr == $network.spec.ipv4Cidr' \
+        <<<"$gateway_cr" >/dev/null \
+        || die "NATGateway ${id} stored task input does not match its API-ID dependencies"
+}
+
 nat_gateway_wait_for_ready() {
     local id="$1" virtual_network_id="$2" external_ip_id="$3"
     local deadline=$((SECONDS + AAP_JOB_TIMEOUT + 300))
-    local crs count cr phase job job_id job_state uid generation ready details ip_cr vn_cr
+    local crs count cr ready job job_id job_state reason ip_cr vn_cr
     LAST_NAT_GATEWAY_JOB_ID=""
     LAST_NAT_GATEWAY_STATE=""
     while ((SECONDS < deadline)); do
@@ -4452,25 +4315,21 @@ nat_gateway_wait_for_ready() {
         fi
         [[ "$count" == 1 ]] || die "Expected one NATGateway CR for UUID ${id}; found ${count}"
         cr="$(nat_gateway_cr_json "$id" "$virtual_network_id" "$external_ip_id")"
-        phase="$(jq -r '.status.phase // ""' <<<"$cr")"
-        job="$(jq -c '[.status.provisioningJobs[]? | select(.type == "provision")] | last // {}' <<<"$cr")"
+        ready="$(network_ready_condition_status "$cr")"
+        reason="$(network_ready_condition_reason "$cr")"
+        job="$(network_task_entry "$cr" create_nat_gateway)"
         job_id="$(jq -r '.jobID // ""' <<<"$job")"
         job_state="$(jq -r '.state // ""' <<<"$job")"
-        LAST_NAT_GATEWAY_STATE="$phase"
-        if [[ "$phase" == Failed || "$job_state" == Failed || "$job_state" == Canceled ]]; then
+        LAST_NAT_GATEWAY_STATE="$reason"
+        if [[ "$reason" == Failed || "$job_state" == Failed || "$job_state" == Cancelled ]]; then
             printf '%s\n' "$cr" >&2
             die "NATGateway ${id} failed provisioning"
         fi
-        ready="$(jq -r 'any(.status.conditions[]?; .type == "Ready" and .status == "True")' <<<"$cr")"
-        if [[ "$phase" == Ready && "$ready" == true && "$job_state" == Succeeded && -n "$job_id" ]]; then
-            uid="$(jq -er '.metadata.uid' <<<"$cr")"
-            generation="$(jq -er '.metadata.generation' <<<"$cr")"
+        if [[ "$ready" == True && "$job_state" == Succeeded && -n "$job_id" ]]; then
             ip_cr="$(external_ip_cr_json "$external_ip_id")"
             vn_cr="$(virtual_network_cr_json "$virtual_network_id")"
-            if ! details="$(nat_gateway_aap_job_details "$job_id" nat_gateway.ensure)"; then
-                die "Could not inspect successful NATGateway ensure job ${job_id}"
-            fi
-            nat_gateway_assert_ensure_job "$details" "$cr" "$ip_cr" "$vn_cr"
+            nat_gateway_assert_task_input "$cr" "$ip_cr" "$vn_cr" "$id" \
+                "$external_ip_id" "$virtual_network_id"
             LAST_NAT_GATEWAY_JOB_ID="$job_id"
             return 0
         fi
@@ -4479,30 +4338,27 @@ nat_gateway_wait_for_ready() {
     die "Timed out waiting for NATGateway ${id} to become Ready"
 }
 
-nat_gateway_retry_and_verify() {
+nat_gateway_replay_and_verify() {
     local id="$1" virtual_network_id="$2" external_ip_id="$3"
-    local cr cr_name uid generation original_job before_state after_state ip_address
+    local cr before_state after_state input_before jobs_before ip_address replay_job_id
     cr="$(nat_gateway_cr_json "$id" "$virtual_network_id" "$external_ip_id")"
-    uid="$(jq -er '.metadata.uid' <<<"$cr")"
-    generation="$(jq -er '.metadata.generation' <<<"$cr")"
-    original_job="$(jq -er '[.status.provisioningJobs[]? | select(.type == "provision") | .jobID] | last' <<<"$cr")"
-    before_state="$(get_nat_gateway_state_entry "$uid" "$id")"
+    input_before="$(jq -cS '.status.taskInput' <<<"$cr")"
+    jobs_before="$(jq -cS '.status.jobs' <<<"$cr")"
+    before_state="$(get_nat_gateway_state_entry "$id" "$id")"
     ip_address="$(jq -er '.status.address' <<<"$(external_ip_cr_json "$external_ip_id")")"
-    cr_name="$(jq -er '.metadata.name' <<<"$cr")"
-    oc patch natgateway "$cr_name" -n "$NETWORKING_NAMESPACE" --subresource=status \
-        --type=merge -p '{"status":{"phase":"Progressing","conditions":[],"provisioningJobs":[]}}' >/dev/null \
-        || die "Could not reset NATGateway ${id} status to exercise controller retry"
-    nat_gateway_wait_for_ready "$id" "$virtual_network_id" "$external_ip_id"
-    [[ "$LAST_NAT_GATEWAY_JOB_ID" != "$original_job" ]] \
-        || die "NATGateway retry did not create a new AAP job"
+    replay_network_task_input "$cr" create_nat_gateway \
+        || die "AAP could not replay the stored NATGateway task input"
+    replay_job_id="$(jq -er '.job_id' "$LAST_REPLAYED_AAP_RESULT_FILE")"
     cr="$(nat_gateway_cr_json "$id" "$virtual_network_id" "$external_ip_id")"
-    [[ "$(jq -er '.metadata.uid' <<<"$cr")" == "$uid" \
-        && "$(jq -er '.metadata.generation' <<<"$cr")" == "$generation" \
+    [[ "$(jq -cS '.status.taskInput' <<<"$cr")" == "$input_before" \
+        && "$(jq -cS '.status.jobs' <<<"$cr")" == "$jobs_before" \
+        && "$(network_ready_condition_status "$cr")" == True \
         && "$(jq -er '.status.address' <<<"$(external_ip_cr_json "$external_ip_id")")" == "$ip_address" ]] \
-        || die "NATGateway retry changed resource identity, generation, or ExternalIP"
-    after_state="$(get_nat_gateway_state_entry "$uid" "$id")"
+        || die "NATGateway task-input replay changed status, job history, readiness, or ExternalIP"
+    after_state="$(get_nat_gateway_state_entry "$id" "$id")"
     jq -e --argjson before "$before_state" '. == $before' <<<"$after_state" >/dev/null \
-        || die "NATGateway retry changed its complete saved provider payload"
+        || die "NATGateway task-input replay changed its complete saved provider payload"
+    LAST_NAT_GATEWAY_REPLAY_JOB_ID="$replay_job_id"
 }
 
 nat_gateway_add_hold_finalizer() {
@@ -4551,33 +4407,20 @@ nat_gateway_remove_hold_finalizer() {
 
 delete_nat_gateway_and_verify() {
     local id="$1" virtual_network_id="$2" external_ip_id="$3"
-    local gateway_cr name uid generation address vn_cr vn_uid entry namespace state provider_rows
-    local output_file crs count job job_id job_state finalizers deadline details
+    local gateway_cr name k8s_uid address entry namespace crs count job job_id job_state finalizers deadline task_input
     local operator_finalizer='osac.openshift.io/natgateway-finalizer'
     local hold_finalizer='osac.openshift.io/e2e-hold-natgateway'
     gateway_cr="$(nat_gateway_cr_json "$id" "$virtual_network_id" "$external_ip_id")" \
         || return 1
     name="$(jq -er '.metadata.name' <<<"$gateway_cr")" || return 1
-    uid="$(jq -er '.metadata.uid' <<<"$gateway_cr")" || return 1
-    generation="$(jq -er '.metadata.generation' <<<"$gateway_cr")" || return 1
+    k8s_uid="$(jq -er '.metadata.uid' <<<"$gateway_cr")" || return 1
     address="$(jq -er '.status.address' <<<"$(external_ip_cr_json "$external_ip_id")")" || return 1
-    vn_cr="$(virtual_network_cr_json "$virtual_network_id")" || return 1
-    vn_uid="$(jq -er '.metadata.uid' <<<"$vn_cr")" || return 1
-    state="$(state_snapshot)" || return 1
-    provider_rows="$(jq -ce --arg uid "$uid" \
-        '[.nat_gateways[] | select(.uid == $uid)]' <<<"$state")" || return 1
-    [[ "$(jq -er 'length' <<<"$provider_rows")" -le 1 ]] || return 1
-    entry="$(jq -c '.[0] // empty' <<<"$provider_rows")"
-    if [[ -n "$entry" ]]; then
-        namespace="$(jq -er '.payload.provider.namespace_name' <<<"$entry")" || return 1
-    else
-        local vn_entry
-        vn_entry="$(get_state_entry "$vn_uid")" || return 1
-        namespace="$(jq -er '.namespace_name' <<<"$vn_entry")" || return 1
-    fi
+    task_input="$(jq -cS '.status.taskInput' <<<"$gateway_cr")"
+    entry="$(get_nat_gateway_state_entry "$id" "$id")" || return 1
+    namespace="$(jq -er '.payload.provider.namespace_name' <<<"$entry")" || return 1
     if [[ -z "$(jq -r '.metadata.deletionTimestamp // ""' <<<"$gateway_cr")" ]]; then
-        nat_gateway_add_hold_finalizer "$gateway_cr" "$name" "$uid" || return 1
-        output_file="${TEMP_DIR}/delete-nat-gateway-${id}.out"
+        nat_gateway_add_hold_finalizer "$gateway_cr" "$name" "$k8s_uid" || return 1
+        local output_file="${TEMP_DIR}/delete-nat-gateway-${id}.out"
         if ! "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" \
             delete natgateway "$id" >"$output_file" 2>&1; then
             cat "$output_file" >&2
@@ -4592,26 +4435,23 @@ delete_nat_gateway_and_verify() {
             return 1
         fi
         count="$(jq -er '.items | length' <<<"$crs")" || return 1
-        [[ "$count" == 1 ]] || { printf 'NATGateway %s disappeared before its held result was verified\n' "$id" >&2; return 1; }
+        [[ "$count" == 1 ]] || { printf 'NATGateway %s disappeared before cleanup was verified\n' "$id" >&2; return 1; }
         gateway_cr="$(jq -c '.items[0]' <<<"$crs")"
-        [[ "$(jq -r '.metadata.uid' <<<"$gateway_cr")" == "$uid" ]] \
-            || { printf 'NATGateway %s UID changed during deletion\n' "$id" >&2; return 1; }
-        job="$(jq -c '[.status.provisioningJobs[]? | select(.type == "deprovision")] | last // {}' <<<"$gateway_cr")"
+        [[ "$(jq -r '.metadata.uid' <<<"$gateway_cr")" == "$k8s_uid" ]] \
+            || { printf 'NATGateway %s Kubernetes object identity changed during deletion\n' "$id" >&2; return 1; }
+        job="$(network_task_entry "$gateway_cr" delete_nat_gateway)"
         job_id="$(jq -r '.jobID // ""' <<<"$job")"
         job_state="$(jq -r '.state // ""' <<<"$job")"
-        if [[ "$job_state" == Failed || "$job_state" == Canceled ]]; then
+        if [[ "$job_state" == Failed || "$job_state" == Cancelled ]]; then
             printf 'NATGateway delete job %s ended in %s; retaining dependencies\n' "$job_id" "$job_state" >&2
             return 1
         fi
         finalizers="$(jq -c '.metadata.finalizers // []' <<<"$gateway_cr")"
-        if [[ -n "$job_id" ]] \
+        if [[ -n "$job_id" && "$job_state" == Succeeded ]] \
             && ! jq -e --arg operator "$operator_finalizer" 'index($operator) != null' \
                 <<<"$finalizers" >/dev/null; then
-            if ! details="$(nat_gateway_aap_job_details "$job_id" nat_gateway.delete)"; then
-                printf 'Could not inspect NATGateway delete job %s; retaining dependencies\n' "$job_id" >&2
-                return 1
-            fi
-            nat_gateway_assert_delete_job "$details" "$gateway_cr" || return 1
+            [[ "$(jq -cS '.status.taskInput' <<<"$gateway_cr")" == "$task_input" ]] \
+                || { printf 'NATGateway %s task input changed during cleanup\n' "$id" >&2; return 1; }
             [[ "$finalizers" == *"$hold_finalizer"* ]] \
                 || { printf 'NATGateway test hold finalizer was lost before result verification\n' >&2; return 1; }
             break
@@ -4620,11 +4460,11 @@ delete_nat_gateway_and_verify() {
     done
     [[ "$SECONDS" -lt "$deadline" ]] \
         || { printf 'Timed out waiting for NATGateway %s delete job/result\n' "$id" >&2; return 1; }
-    nat_gateway_assert_provider_absent "$uid" "$address" "$namespace" || return 1
-    local eip_cr eip_state
+    nat_gateway_assert_provider_absent "$id" "$address" "$namespace" || return 1
+    local eip_cr
     eip_cr="$(external_ip_cr_json "$external_ip_id")" || return 1
-    eip_state="$(jq -r '.status.state // ""' <<<"$eip_cr")"
-    [[ "$eip_state" == Allocated && "$(jq -r '.status.address' <<<"$eip_cr")" == "$address" ]] \
+    [[ "$(network_ready_condition_status "$eip_cr")" == True \
+        && "$(jq -r '.status.address' <<<"$eip_cr")" == "$address" ]] \
         || { printf 'ExternalIP %s was released before NATGateway cleanup completed\n' "$external_ip_id" >&2; return 1; }
     nat_gateway_remove_hold_finalizer "$id" "$virtual_network_id" "$external_ip_id" || return 1
     deadline=$((SECONDS + 600))
@@ -4643,7 +4483,7 @@ delete_nat_gateway_and_verify() {
             unset 'CREATED_NAT_GATEWAY_UIDS[index]'
         fi
     done
-    info "NATGateway ${id} provider cleanup accepted by AAP job ${job_id}."
+    info "NATGateway ${id} provider cleanup accepted by AAP task ${job_id}."
 }
 
 cleanup_created_nat_gateways() {
@@ -4692,8 +4532,7 @@ delete_external_ip_and_verify() {
     local output_file="${TEMP_DIR}/delete-external-ip-${id}.out"
     local hold_finalizer="osac.openshift.io/e2e-hold-external-ip"
     local operator_finalizer="osac.openshift.io/externalip-finalizer"
-    local cr crs count deadline=$((SECONDS + 600)) release_job release_job_id="" job_state artifacts
-    local release_generation
+    local cr crs count deadline=$((SECONDS + 600)) release_job release_job_id="" job_state
     local release_validated=false
     cr="$(external_ip_cr_json "$id")"
     if [[ -z "$(jq -r '.metadata.deletionTimestamp // ""' <<<"$cr")" ]]; then
@@ -4722,25 +4561,19 @@ delete_external_ip_and_verify() {
         fi
         [[ "$count" == 1 ]] || die "Expected one ExternalIP CR for UUID ${id} during deletion"
         cr="$(jq -c '.items[0]' <<<"$crs")"
-        release_generation="$(jq -er '.metadata.generation' <<<"$cr")" \
-            || die "Could not read the deleting ExternalIP ${id} generation"
-        release_job="$(jq -c '[.status.provisioningJobs[]? | select(.type == "deprovision")] | last // {}' <<<"$cr")"
+        release_job="$(network_task_entry "$cr" delete_external_ip)"
         release_job_id="$(jq -r '.jobID // ""' <<<"$release_job")"
         job_state="$(jq -r '.state // ""' <<<"$release_job")"
-        if [[ -n "$release_job_id" && ( "$job_state" == Failed || "$job_state" == Canceled ) ]]; then
+        if [[ -n "$release_job_id" && ( "$job_state" == Failed || "$job_state" == Cancelled ) ]]; then
             die "AAP release job ${release_job_id} ended in ${job_state} for ExternalIP ${id}"
         fi
-        if [[ -n "$release_job_id" ]] \
+        if [[ -n "$release_job_id" && "$job_state" == Succeeded ]] \
             && jq -e --arg hold "$hold_finalizer" --arg operator "$operator_finalizer" '
                 (.metadata.finalizers // []) as $finalizers
                 | ($finalizers | index($hold) != null)
                   and ($finalizers | index($operator) == null)' <<<"$cr" >/dev/null; then
-            if artifacts="$(external_ip_aap_job_artifacts "$release_job_id" 2>/dev/null)"; then
-                external_ip_assert_result "$artifacts" external_ip.release "$uid" "$release_generation" \
-                    || die "AAP release artifact does not match ExternalIP ${id}"
-                release_validated=true
-                break
-            fi
+            release_validated=true
+            break
         fi
         sleep 2
     done
@@ -4765,14 +4598,14 @@ delete_external_ip_and_verify() {
         sleep 2
     done
     [[ "$count" == 0 ]] || die "Timed out waiting for ExternalIP ${id} to be removed after cleanup"
-    external_ip_assert_state_absent "$uid" "$id"
+    external_ip_assert_state_absent "$id" "$id"
     external_ip_pool_wait_for_delta "$capacity_delta"
     external_ip_remove_created_id "$id"
     info "ExternalIP ${id} is released and Fulfillment capacity is updated; AAP job ${release_job_id}"
 }
 
 run_external_ip_lifecycle() {
-    local pool_status initial_total output_file state_after_retry original_job cr name
+    local pool_status initial_total output_file state_after_replay cr task_input_before jobs_before replay_address
     pool_status="$(external_ip_pool_get_json)" \
         || die "Could not read test ExternalIPPool capacity"
     initial_total="$(jq -er '.object.status.total | tonumber' <<<"$pool_status")" \
@@ -4809,21 +4642,25 @@ run_external_ip_lifecycle() {
         || die "Two ExternalIPs received the same address from one pool"
     external_ip_pool_wait_for_delta 2
 
-    info "Retrying ExternalIP ${EXTERNAL_IP_ONE_ID} with the same Kubernetes UID..."
-    original_job="$EXTERNAL_IP_ONE_PROVISION_JOB_ID"
+    info "Replaying ExternalIP ${EXTERNAL_IP_ONE_ID}'s stored create task input..."
     cr="$(external_ip_cr_json "$EXTERNAL_IP_ONE_ID")"
-    name="$(jq -er '.metadata.name' <<<"$cr")"
-    oc patch externalip "$name" -n "$NETWORKING_NAMESPACE" --subresource=status \
-        --type=merge -p '{"status":{"phase":"Progressing","state":"Pending","conditions":[],"provisioningJobs":[]}}' >/dev/null
-    wait_for_external_ip_ready "$EXTERNAL_IP_ONE_ID"
-    [[ "$LAST_EXTERNAL_IP_PROVISION_JOB_ID" != "$original_job" ]] \
-        || die "ExternalIP retry did not create a new AAP job"
+    task_input_before="$(jq -cS '.status.taskInput' <<<"$cr")"
+    jobs_before="$(jq -cS '.status.jobs' <<<"$cr")"
+    replay_network_task_input "$cr" create_external_ip \
+        || die "AAP could not replay the stored ExternalIP task input"
+    replay_address="$(jq -er '.artifacts.osac_result.external_ip.address' "$LAST_REPLAYED_AAP_RESULT_FILE")" \
+        || die "ExternalIP replay did not return its typed address result"
     [[ "$LAST_EXTERNAL_IP_UID" == "$EXTERNAL_IP_ONE_UID" \
-        && "$LAST_EXTERNAL_IP_ADDRESS" == "$EXTERNAL_IP_ONE_ADDRESS" ]] \
-        || die "ExternalIP retry changed its UID or reserved address"
-    state_after_retry="$(external_ip_state_entry "$EXTERNAL_IP_ONE_UID" "$EXTERNAL_IP_ONE_ID")"
-    [[ "$state_after_retry" == "$EXTERNAL_IP_ONE_STATE" ]] \
-        || die "ExternalIP retry changed its UID-owned provider reservation"
+        && "$replay_address" == "$EXTERNAL_IP_ONE_ADDRESS" ]] \
+        || die "ExternalIP task replay changed its API ID or reserved address"
+    cr="$(external_ip_cr_json "$EXTERNAL_IP_ONE_ID")"
+    [[ "$(jq -cS '.status.taskInput' <<<"$cr")" == "$task_input_before" \
+        && "$(jq -cS '.status.jobs' <<<"$cr")" == "$jobs_before" \
+        && "$(network_ready_condition_status "$cr")" == True ]] \
+        || die "ExternalIP task replay changed the stored input, operator history, or Ready condition"
+    state_after_replay="$(external_ip_state_entry "$EXTERNAL_IP_ONE_UID" "$EXTERNAL_IP_ONE_ID")"
+    [[ "$state_after_replay" == "$EXTERNAL_IP_ONE_STATE" ]] \
+        || die "ExternalIP task replay changed its API-ID-owned provider reservation"
     external_ip_pool_wait_for_delta 2
 
     if [[ "${SUITE_USES_EXTERNAL_IP_ATTACHMENT:-false}" == true ]]; then
@@ -4834,8 +4671,8 @@ run_external_ip_lifecycle() {
     cr="$(external_ip_cr_json "$EXTERNAL_IP_TWO_ID")"
     [[ "$(jq -r '.status.address' <<<"$cr")" == "$EXTERNAL_IP_TWO_ADDRESS" ]] \
         || die "Deleting ExternalIP ${EXTERNAL_IP_ONE_ID} changed its peer address"
-    state_after_retry="$(external_ip_state_entry "$EXTERNAL_IP_TWO_UID" "$EXTERNAL_IP_TWO_ID")"
-    [[ "$state_after_retry" == "$EXTERNAL_IP_TWO_STATE" ]] \
+    state_after_replay="$(external_ip_state_entry "$EXTERNAL_IP_TWO_UID" "$EXTERNAL_IP_TWO_ID")"
+    [[ "$state_after_replay" == "$EXTERNAL_IP_TWO_STATE" ]] \
         || die "Deleting ExternalIP ${EXTERNAL_IP_ONE_ID} changed its peer reservation"
 
     delete_external_ip_and_verify "$EXTERNAL_IP_TWO_ID" "$EXTERNAL_IP_TWO_UID" 0
@@ -4845,9 +4682,9 @@ run_external_ip_lifecycle() {
 }
 
 run_external_ip_attachment_lifecycle() {
-    local original_job state_after_retry peer_state peer_eip_state entry client="$EXTERNAL_IP_SYNTHETIC_CLIENT"
+    local original_job state_after_replay peer_state peer_eip_state entry client="$EXTERNAL_IP_SYNTHETIC_CLIENT"
     [[ -n "$EXTERNAL_IP_SYNTHETIC_TARGET_ID" && -n "$EXTERNAL_IP_SYNTHETIC_TARGET_UID" \
-        && -n "$EXTERNAL_IP_SYNTHETIC_TARGET_IP" && -n "$EXTERNAL_IP_ATTACHMENT_SUBNET_UID" ]] \
+        && -n "$EXTERNAL_IP_SYNTHETIC_TARGET_IP" && -n "$EXTERNAL_IP_ATTACHMENT_SUBNET_API_ID" ]] \
         || die "ExternalIPAttachment lifecycle requires a synthetic DHCP target and Ready Subnet"
 
     attach_synthetic_external_ip_attachment \
@@ -4871,21 +4708,21 @@ run_external_ip_attachment_lifecycle() {
     wait_for_external_ip_response "$EXTERNAL_IP_ONE_ADDRESS"
     wait_for_external_ip_response "$EXTERNAL_IP_TWO_ADDRESS"
 
-    info "Retrying the first synthetic ExternalIPAttachment with the same provider identity..."
+    info "Replaying the first synthetic ExternalIPAttachment with the same API ID..."
     original_job="$EXTERNAL_IP_ATTACHMENT_ONE_JOB_ID"
     run_synthetic_external_ip_attachment_attach_job \
         "$EXTERNAL_IP_ATTACHMENT_ONE_ID" "$EXTERNAL_IP_ATTACHMENT_ONE_UID" \
         "$EXTERNAL_IP_ATTACHMENT_ONE_NAME" "$EXTERNAL_IP_ONE_ID" \
         "$EXTERNAL_IP_ONE_UID" "$EXTERNAL_IP_ONE_NAME" "$EXTERNAL_IP_ONE_ADDRESS" \
-        "${TEMP_DIR}/synthetic-eia-${EXTERNAL_IP_ATTACHMENT_ONE_ID}-retry" \
-        || die "AAP could not retry synthetic ExternalIPAttachment ${EXTERNAL_IP_ATTACHMENT_ONE_ID}"
+        "${TEMP_DIR}/synthetic-eia-${EXTERNAL_IP_ATTACHMENT_ONE_ID}-replay" \
+        || die "AAP could not replay synthetic ExternalIPAttachment ${EXTERNAL_IP_ATTACHMENT_ONE_ID}"
     [[ "$LAST_EXTERNAL_IP_ATTACHMENT_PROVISION_JOB_ID" != "$original_job" ]] \
-        || die "ExternalIPAttachment retry did not create a new AAP job"
+        || die "ExternalIPAttachment task replay did not create a new AAP job"
     entry="$(external_ip_attachment_state_entry \
         "$EXTERNAL_IP_ATTACHMENT_ONE_UID" "$EXTERNAL_IP_ATTACHMENT_ONE_ID")"
-    state_after_retry="$entry"
-    [[ "$state_after_retry" == "$EXTERNAL_IP_ATTACHMENT_ONE_STATE" ]] \
-        || die "Synthetic ExternalIPAttachment retry changed its UID-owned provider state"
+    state_after_replay="$entry"
+    [[ "$state_after_replay" == "$EXTERNAL_IP_ATTACHMENT_ONE_STATE" ]] \
+        || die "Synthetic ExternalIPAttachment task replay changed its API-ID-owned provider state"
     wait_for_external_ip_response "$EXTERNAL_IP_ONE_ADDRESS"
 
     peer_state="$(external_ip_attachment_state_entry \
@@ -4895,7 +4732,8 @@ run_external_ip_attachment_lifecycle() {
         "$EXTERNAL_IP_ATTACHMENT_ONE_UID" "$EXTERNAL_IP_ONE_ADDRESS" \
         || die "Synthetic detach failed for ${EXTERNAL_IP_ATTACHMENT_ONE_ID}; retaining EIPs and network resources"
     first_cr="$(external_ip_cr_json "$EXTERNAL_IP_ONE_ID")"
-    [[ "$(jq -r '.status.state' <<<"$first_cr")" == Allocated ]] \
+    [[ "$(network_ready_condition_status "$first_cr")" == True \
+        && "$(jq -r '.status.address' <<<"$first_cr")" == "$EXTERNAL_IP_ONE_ADDRESS" ]] \
         || die "ExternalIP ${EXTERNAL_IP_ONE_ID} was released before its attachment cleanup completed"
     if probe_external_ip_response "$EXTERNAL_IP_ONE_ADDRESS" >/dev/null 2>&1; then
         die "Detached ExternalIP ${EXTERNAL_IP_ONE_ADDRESS} still reaches the synthetic DHCP client"
@@ -4918,7 +4756,7 @@ run_external_ip_attachment_lifecycle() {
     remove_external_ip_client_route "$EXTERNAL_IP_TWO_ADDRESS" \
         || die "Could not remove the test route for ExternalIP ${EXTERNAL_IP_TWO_ADDRESS}"
     detach_dhcp_client "$client"
-    info "Synthetic-target ExternalIPAttachment ingress, retry, peer preservation, and detach checks passed."
+    info "Synthetic-target ExternalIPAttachment ingress, task replay, peer preservation, and detach checks passed."
 }
 
 cleanup_created_external_ips() {
@@ -4927,7 +4765,7 @@ cleanup_created_external_ips() {
         || return 1
 
     local id crs count cr uid name output_file release_job release_job_id job_state
-    local release_generation artifacts hold_finalizer operator_finalizer
+    local hold_finalizer operator_finalizer
     local state_file remaining deadline
     hold_finalizer="osac.openshift.io/e2e-hold-external-ip"
     operator_finalizer="osac.openshift.io/externalip-finalizer"
@@ -4939,7 +4777,7 @@ cleanup_created_external_ips() {
         count="$(jq -er '.items | length' <<<"$crs")" || return 1
         if [[ "$count" == 1 ]]; then
             cr="$(jq -c '.items[0]' <<<"$crs")"
-            uid="$(jq -r '.metadata.uid' <<<"$cr")"
+            uid="$id"
             name="$(jq -er '.metadata.name' <<<"$cr")" || return 1
             if [[ -z "$(jq -r '.metadata.deletionTimestamp // ""' <<<"$cr")" ]]; then
                 output_file="${TEMP_DIR}/cleanup-external-ip-${id}.out"
@@ -4961,28 +4799,23 @@ cleanup_created_external_ips() {
                 [[ "$count" != 0 ]] || break
                 [[ "$count" == 1 ]] || return 1
                 cr="$(jq -c '.items[0]' <<<"$crs")"
-                release_job="$(jq -c '[.status.provisioningJobs[]? | select(.type == "deprovision")] | last // {}' <<<"$cr")"
+                release_job="$(network_task_entry "$cr" delete_external_ip)"
                 release_job_id="$(jq -r '.jobID // ""' <<<"$release_job")"
                 job_state="$(jq -r '.state // ""' <<<"$release_job")"
-                if [[ "$job_state" == Failed || "$job_state" == Canceled ]]; then
+                if [[ "$job_state" == Failed || "$job_state" == Cancelled ]]; then
                     printf 'ExternalIP %s release job ended in %s; preserving resources\n' "$id" "$job_state" >&2
                     return 1
                 fi
-                if [[ -n "$release_job_id" ]] \
+                if [[ -n "$release_job_id" && "$job_state" == Succeeded ]] \
                     && jq -e --arg hold "$hold_finalizer" --arg operator "$operator_finalizer" '
                         (.metadata.finalizers // []) as $values
                         | ($values | index($hold) != null)
                           and ($values | index($operator) == null)' <<<"$cr" >/dev/null; then
-                    release_generation="$(jq -er '.metadata.generation' <<<"$cr")" || return 1
-                    if artifacts="$(external_ip_aap_job_artifacts "$release_job_id" 2>/dev/null)" \
-                        && external_ip_assert_result "$artifacts" external_ip.release "$uid" \
-                            "$release_generation"; then
-                        oc patch externalip "$name" -n "$NETWORKING_NAMESPACE" \
-                            --type=merge -p="$(jq -c --arg hold "$hold_finalizer" \
-                                '{metadata:{finalizers:((.metadata.finalizers // []) | map(select(. != $hold)))}}' \
-                                <<<"$cr")" >/dev/null \
-                            || return 1
-                    fi
+                    oc patch externalip "$name" -n "$NETWORKING_NAMESPACE" \
+                        --type=merge -p="$(jq -c --arg hold "$hold_finalizer" \
+                            '{metadata:{finalizers:((.metadata.finalizers // []) | map(select(. != $hold)))}}' \
+                            <<<"$cr")" >/dev/null \
+                        || return 1
                 fi
                 sleep 2
             done
@@ -5052,7 +4885,7 @@ cleanup_created_external_ip_attachments() {
             return 1
         }
         cr="$(external_ip_attachment_cr_json "$id")" || return 1
-        uid="$(jq -er '.metadata.uid' <<<"$cr")" || return 1
+        uid="$id"
         name="$(jq -er '.metadata.name' <<<"$cr")" || return 1
         eip_id="$(jq -er '.spec.externalIP' <<<"$cr")" || return 1
         bmi_id="$(jq -er '.spec.baremetalInstance' <<<"$cr")" || return 1
@@ -5070,25 +4903,29 @@ cleanup_created_external_ip_attachments() {
         jq -e --arg id "$eip_id" --arg tenant "$OSAC_TENANT" '
           .metadata.labels["osac.openshift.io/externalip-uuid"] == $id
           and .metadata.annotations["osac.openshift.io/tenant"] == $tenant
-          and .metadata.annotations["osac.openshift.io/implementation-strategy"] == "agentless_net"
-          and .status.state == "Allocated"' <<<"$eip_cr" >/dev/null || {
+          and .status.networkManagers.fabric.name == "agentless_net"
+          and (.status.conditions | any(.[]?; .type == "Ready" and .status == "True"))' \
+            <<<"$eip_cr" >/dev/null || {
             printf 'ExternalIPAttachment %s refers to an unallocated or out-of-scope ExternalIP %s\n' "$id" "$eip_id" >&2
             return 1
         }
         address="$(jq -er '.status.address' <<<"$eip_cr")" || return 1
         if [[ "$state_count" == 1 ]]; then
             entry="$(jq -c '.[0]' <<<"$state_rows")"
-            [[ "$(jq -r '.uid' <<<"$entry")" == "$uid" ]] || {
-                printf 'ExternalIPAttachment %s provider UID does not match its Kubernetes UID\n' "$id" >&2
+            [[ "$(jq -r '.uid' <<<"$entry")" == "$id" \
+                && "$(jq -r '.fulfillment_id' <<<"$entry")" == "$id" ]] || {
+                printf 'ExternalIPAttachment %s provider API ID does not match its CR label\n' "$id" >&2
                 return 1
             }
-            jq -e --arg id "$bmi_id" --arg tenant "$OSAC_TENANT" '
-              .payload.context.target.kind == "BareMetalInstance"
-              and .payload.context.target.fulfillment_id == $id
-              and .payload.context.target.tenant_id == $tenant
-              and (.payload.context.target.name | startswith("agentless-eip-bmi-"))' \
+            jq -e --arg eip "$eip_id" --arg tenant "$OSAC_TENANT" '
+              .external_ip_uid == $eip
+              and .tenant_id == $tenant
+              and .payload.context.external_ip.id == $eip
+              and .payload.context.destination.routing_domain.type == "tenant_virtual_network"
+              and (.payload.context.destination.routing_domain.virtual_network_id | type == "string")
+              and (.payload.context.destination.routing_domain.subnet_id | type == "string")' \
                 <<<"$entry" >/dev/null || {
-                printf 'ExternalIPAttachment %s saved target context is outside the selected BMI scope\n' "$id" >&2
+                printf 'ExternalIPAttachment %s saved destination context is outside the API-ID contract\n' "$id" >&2
                 return 1
             }
             namespace="$(jq -er '.payload.provider.namespace_name' <<<"$entry")" || return 1
@@ -5104,7 +4941,7 @@ cleanup_created_external_ip_attachments() {
             namespace=""
         fi
         info "Cleaning ExternalIPAttachment ${id} (${name}) before its ExternalIP or BMI..."
-        delete_external_ip_attachment_and_verify "$id" "$uid" "$address" "$namespace" || return 1
+        delete_external_ip_attachment_and_verify "$id" "$id" "$address" "$namespace" || return 1
     done
     cleanup_synthetic_external_ip_attachments
 }
@@ -5130,17 +4967,18 @@ cleanup_synthetic_external_ip_attachments() {
             return 1
         }
         entry="$(jq -c '.[0]' <<<"$rows")"
-        jq -e --arg tenant "$OSAC_TENANT" --arg uid "$uid" --arg id "$id" \
-            --arg target "$EXTERNAL_IP_SYNTHETIC_TARGET_NAME" \
-            '.uid == $uid and .fulfillment_id == $id and .tenant_id == $tenant
-             and .payload.context.target.kind == "BareMetalInstance"
-             and .payload.context.target.name == $target
-             and (.payload.context.external_ip.name | startswith("agentless-eip-"))' \
+        jq -e --arg tenant "$OSAC_TENANT" --arg id "$id" \
+            --arg vn "$FIRST_FULFILLMENT_ID" --arg subnet "$EXTERNAL_IP_ATTACHMENT_SUBNET_ID" \
+            --arg destination "$EXTERNAL_IP_SYNTHETIC_TARGET_IP" \
+            '.uid == $id and .fulfillment_id == $id and .tenant_id == $tenant
+             and .virtual_network_uid == $vn and .subnet_uid == $subnet
+             and .payload.context.destination.address == $destination
+             and .payload.context.destination.routing_domain.type == "tenant_virtual_network"' \
             <<<"$entry" >/dev/null || {
             printf 'Synthetic ExternalIPAttachment provider row %s is outside this run scope\n' "$id" >&2
             return 1
         }
-        external_ip_id="$(jq -er '.payload.context.external_ip.fulfillment_id' <<<"$entry")" \
+        external_ip_id="$(jq -er '.payload.context.external_ip.id' <<<"$entry")" \
             || return 1
         selected=false
         for selected_id in "${CREATED_EXTERNAL_IP_IDS[@]}" "${CLEANUP_EIP_IDS[@]}"; do
@@ -5297,7 +5135,7 @@ cleanup_created_external_ip_pool() {
         fi
     fi
     if ! wait_for_external_ip_pool_removed "$EXTERNAL_IP_POOL_ID" \
-        "$EXTERNAL_IP_POOL_K8S_UID"; then
+        "$EXTERNAL_IP_POOL_API_ID"; then
         printf 'ExternalIPPool %s is not fully removed; preserving provider access for recovery\n' \
             "$EXTERNAL_IP_POOL_ID" >&2
         return 1
@@ -5337,7 +5175,7 @@ cleanup_interrupted_dhcp_clients() {
 
     local all_names labeled_names container client prefix recovery_dir label_dir
     local runner_label client_label prefix_label
-    local container_mac saved_mac attachment_file resource_json uid subnet_ref
+    local container_mac saved_mac attachment_file resource_json api_id attachment_uid subnet_ref
     local selected_subnet candidate_subnet link previous_prefix candidate
     local switch_vlan_json provisioning_vlan
     local duplicate
@@ -5358,7 +5196,7 @@ cleanup_interrupted_dhcp_clients() {
             containers+=("$container")
             continue
         fi
-        if [[ "$container" =~ ^(osac5530-[0-9]{14})-(a1|a2|b1)$ ]]; then
+        if [[ "$container" =~ ^(osac(5530|6752)-[0-9]{14})-(a1|a2|b1)$ ]]; then
             selected_containers["$container"]=true
             containers+=("$container")
         fi
@@ -5388,7 +5226,7 @@ cleanup_interrupted_dhcp_clients() {
             [[ "$client_label" == "$client" && "$prefix_label" == "$prefix" ]] \
                 || die "Step 5 client ${container} has mismatched ownership labels"
         else
-            [[ "$prefix" =~ ^osac5530-[0-9]{14}$ ]] \
+            [[ "$prefix" =~ ^osac(5530|6752)-[0-9]{14}$ ]] \
                 || die "Refusing to clean unlabelled non-E2E client container ${container}"
         fi
 
@@ -5396,7 +5234,9 @@ cleanup_interrupted_dhcp_clients() {
             '{{index .Config.Labels "io.osac.e2e.run-dir"}}' "$container" 2>/dev/null || true)"
         recovery_dir=""
         if [[ -n "$label_dir" && "$label_dir" != '<no value>' ]]; then
-            [[ "$label_dir" == "${TMPDIR:-/tmp}"/osac-5530-vlan-e2e.* \
+            [[ "$label_dir" == "${TMPDIR:-/tmp}"/osac-6752-vlan-e2e.* \
+                || "$label_dir" == /tmp/osac-6752-vlan-e2e.* \
+                || "$label_dir" == "${TMPDIR:-/tmp}"/osac-5530-vlan-e2e.* \
                 || "$label_dir" == /tmp/osac-5530-vlan-e2e.* ]] \
                 && [[ -d "$label_dir" && ! -L "$label_dir" ]] \
                 || die "Step 5 client ${container} has an invalid recovery directory label"
@@ -5405,7 +5245,7 @@ cleanup_interrupted_dhcp_clients() {
             container_mac="$(docker exec "$container" cat /sys/class/net/eth0/address 2>/dev/null || true)"
             container_mac="$(tr '[:upper:]' '[:lower:]' <<<"$container_mac" | tr -d '\r\n')"
             matching_dirs=()
-            for candidate in "${TMPDIR:-/tmp}"/osac-5530-vlan-e2e.*; do
+            for candidate in "${TMPDIR:-/tmp}"/osac-6752-vlan-e2e.* "${TMPDIR:-/tmp}"/osac-5530-vlan-e2e.*; do
                 [[ -d "$candidate" && ! -L "$candidate" \
                     && -f "$candidate/client-${client}.mac" ]] || continue
                 saved_mac="$(tr '[:upper:]' '[:lower:]' \
@@ -5416,7 +5256,7 @@ cleanup_interrupted_dhcp_clients() {
             if [[ "${#matching_dirs[@]}" == 1 ]]; then
                 recovery_dir="${matching_dirs[0]}"
             elif [[ "${#matching_dirs[@]}" == 0 \
-                && "$prefix" =~ ^osac5530-[0-9]{14}$ ]]; then
+                && "$prefix" =~ ^osac(5530|6752)-[0-9]{14}$ ]]; then
                 recovery_dir=""
             else
                 die "Could not identify unique recovery data for Step 5 client ${container}"
@@ -5441,9 +5281,9 @@ cleanup_interrupted_dhcp_clients() {
                 <"$recovery_dir/client-${client}.mac" | tr -d '\r\n')"
             [[ "$saved_mac" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] \
                 || die "Saved MAC for Step 5 client ${container} is invalid"
-            attachment_file="$recovery_dir/${client}-move-network-attachment.json"
+            attachment_file="$recovery_dir/${client}-apply-network-attachment.json"
             if [[ ! -f "$attachment_file" ]]; then
-                attachment_file="$recovery_dir/${client}-offboard-network-attachment.json"
+                attachment_file="$recovery_dir/${client}-delete-network-attachment.json"
             fi
         else
             client_link "$client"
@@ -5465,24 +5305,26 @@ cleanup_interrupted_dhcp_clients() {
         fi
 
         if [[ -n "$attachment_file" && -f "$attachment_file" ]]; then
-            resource_json="$(jq -ce '.osac_job_vars.resource' "$attachment_file")" \
-                || die "Saved BMI attachment recovery data for ${container} is invalid"
-            jq -e --arg client "$client" --arg tenant "$OSAC_TENANT" '
-              .apiVersion == "osac.openshift.io/v1alpha1"
-              and .kind == "BareMetalInstance"
-              and .metadata.name == ("osac-e2e-" + $client)
-              and .spec.externalHostID == ("osac-e2e-" + $client)
-              and .metadata.annotations["osac.openshift.io/tenant"] == $tenant
-              and .metadata.annotations["osac.openshift.io/owner-reference"] == "vlan-e2e-run"
-              and .metadata.annotations["osac.openshift.io/implementation-strategy"] == "agentless_net"
-              and (.metadata.uid | type == "string" and test("^[0-9a-f-]{36}$"))
-              and (.spec.networkAttachments | type == "array" and length == 1)
-              and (.spec.networkAttachments[0].subnetRef | type == "string")
-              and (.spec.networkAttachments[0].interface == "eth0")
+            resource_json="$(jq -ce '.osac_job_vars' "$attachment_file")" \
+                || die "Saved NetworkAttachment recovery input for ${container} is invalid"
+            jq -e --arg client "$client" '
+              (.task == "apply_network_attachment" or .task == "delete_network_attachment")
+              and .manager.name == "agentless_net" and .manager.type == "fabric"
+              and .resource.apiVersion == "osac.openshift.io/v1alpha1"
+              and .resource.kind == "NetworkAttachment"
+              and .resource.metadata.name == ("baremetalinstance-" + .target.id)
+              and .resource.id == .target.id
+              and .target.kind == "BareMetalInstance"
+              and .target.host_name == ("osac-e2e-" + $client)
+              and (.resource.metadata.uid | type == "string" and test("^[0-9a-f-]{36}$"))
+              and .network_attachment.interface.type == "physical"
+              and .network_attachment.interface.name == "eth0"
+              and (.network_attachment.interface.mac_address | type == "string" and test("^([0-9a-f]{2}:){5}[0-9a-f]{2}$"))
             ' <<<"$resource_json" >/dev/null \
-                || die "Saved BMI identity for Step 5 client ${container} is outside the E2E scope"
-            uid="$(jq -er '.metadata.uid' <<<"$resource_json")"
-            subnet_ref="$(jq -er '.spec.networkAttachments[0].subnetRef' <<<"$resource_json")"
+                || die "Saved NetworkAttachment identity for Step 5 client ${container} is outside the E2E scope"
+            api_id="$(jq -er '.target.id' <<<"$resource_json")"
+            attachment_uid="$(jq -er '.resource.metadata.uid' <<<"$resource_json")"
+            subnet_ref="$(jq -er '.network_attachment.subnet' <<<"$resource_json")"
             selected_subnet=false
             for candidate_subnet in "${CREATED_SUBNET_IDS[@]}"; do
                 if [[ "$candidate_subnet" == "$subnet_ref" ]]; then
@@ -5493,17 +5335,14 @@ cleanup_interrupted_dhcp_clients() {
             [[ "$selected_subnet" == true ]] \
                 || die "Step 5 client ${container} references a Subnet outside the selected cleanup scope"
 
-            if [[ "$AAP_SUBNET_READER_SETUP_ATTEMPTED" != true ]]; then
-                configure_aap_subnet_reader \
-                    || die "Could not configure AAP access to offboard Step 5 client ${container}"
-            fi
-            CLIENT_BMI_UID["$client"]="$uid"
+            CLIENT_BMI_API_ID["$client"]="$api_id"
+            CLIENT_ATTACHMENT_UID["$client"]="$attachment_uid"
             CLIENT_ATTACHMENT_SUBNET["$client"]="$subnet_ref"
             CLIENT_ATTACHMENT_ACTIVE["$client"]=true
             CLIENT_ATTACHMENT_PENDING["$client"]=false
             CLIENT_PRESERVED_MAC["$client"]="$saved_mac"
             offboard_client_from_subnet "$client" "$subnet_ref" \
-                || die "Could not offboard Step 5 client ${container} through osac-move-network-attachment"
+                || die "Could not remove Step 5 client ${container} through delete_network_attachment"
         fi
 
         docker rm -f "$container" >/dev/null \
@@ -5526,7 +5365,7 @@ prepare_suite_cleanup() {
     local nat_gateway_filter nat_gateway_items nat_gateway_object nat_gateway_cr nat_gateway_crs nat_gateway_uid nat_gateway_vn_id nat_gateway_vn_uid nat_gateway_vn_cr nat_gateway_eip_id nat_gateway_eip_uid nat_gateway_eip_cr nat_gateway_id
     local pool_request pool_response pool_error pool_items external_ips state_before=""
     local pool_object pool_id pool_name pool_cidr pool_crs pool_count pool_cr pool_uid
-    local pool_state pool_status allocated available total active_count
+    local pool_state pool_status allocated available total active_count pool_initial_entry
     local eip_object eip_id eip_name eip_cr eip_uid eip_pool eip_address id item attachment_eip_id attachment_bmi_id
     local eip_candidate selected_eip
     local pool_ip_crs pool_ip_count pool_eip_ids_json selected_parent parent_id_candidate
@@ -5535,7 +5374,7 @@ prepare_suite_cleanup() {
     local nat_gateway_uids_json nat_gateway_ids_json selected_nat_gateway_ids_json nat_gateway_orphan_rows
     local snapshot synthetic_row synthetic_id synthetic_uid synthetic_eip_id synthetic_address
     local -a vn_ids=() vn_uids=() subnet_ids=() subnet_uids=()
-    local -a pool_ids=() pool_uids=() pool_cidrs=() pool_eip_ids_jsons=()
+    local -a pool_ids=() pool_uids=() pool_cidrs=() pool_eip_ids_jsons=() pool_initial_entries=()
     local -a pool_initial_allocated=() pool_initial_available=()
     local -a eip_ids=() eip_uids=() assigned_eip_ids=()
     local -a bmi_ids=() bmi_uids=() attachment_ids=() attachment_uids=()
@@ -5560,11 +5399,10 @@ prepare_suite_cleanup() {
             [[ -n "$id" ]] || continue
             local cr uid
             cr="$(virtual_network_cr_json "$id")"
-            jq -e '.metadata.annotations["osac.openshift.io/implementation-strategy"] == "agentless_net"' \
+            jq -e '.status.networkManagers.fabric.name == "agentless_net"' \
                 <<<"$cr" >/dev/null \
                 || die "Refusing to clean a test-named VirtualNetwork managed by another provider"
-            uid="$(jq -er '.metadata.uid' <<<"$cr")" \
-                || die "VirtualNetwork ${id} has no Kubernetes UID"
+            uid="$id"
             vn_ids+=("$id")
             vn_uids+=("$uid")
         done < <(jq -r '.[].id' <<<"$vn_items")
@@ -5601,11 +5439,10 @@ prepare_suite_cleanup() {
                 [[ "$selected_parent" == true ]] \
                     || die "Subnet ${id} is not attached to a selected E2E VirtualNetwork"
                 cr="$(subnet_cr_json "$id" "$parent_id")"
-                jq -e '.metadata.annotations["osac.openshift.io/implementation-strategy"] == "agentless_net"' \
+                jq -e '.status.networkManagers.fabric.name == "agentless_net"' \
                     <<<"$cr" >/dev/null \
                     || die "Refusing to clean a test-named Subnet managed by another provider"
-                uid="$(jq -er '.metadata.uid' <<<"$cr")" \
-                    || die "Subnet ${id} has no Kubernetes UID"
+                uid="$id"
                 subnet_ids+=("$id")
                 subnet_uids+=("$uid")
             done < <(jq -c '.[]' <<<"$subnet_items")
@@ -5652,8 +5489,7 @@ prepare_suite_cleanup() {
                 local bmi_cr bmi_uid
                 bmi_cr="$(baremetal_instance_cr_json "$id")" \
                     || die "Legacy test target ${id} has no unique Kubernetes CR"
-                bmi_uid="$(jq -er '.metadata.uid' <<<"$bmi_cr")" \
-                    || die "Legacy test target ${id} has no Kubernetes UID"
+                bmi_uid="$id"
                 bmi_ids+=("$id")
                 bmi_uids+=("$bmi_uid")
             done < <(jq -r '.[].id' <<<"$bmi_items")
@@ -5662,8 +5498,7 @@ prepare_suite_cleanup() {
             [[ -n "$attachment_id" ]] || continue
             attachment_cr="$(external_ip_attachment_cr_json "$attachment_id")" \
                 || die "Test ExternalIPAttachment ${attachment_id} has no unique Kubernetes CR"
-            attachment_uid="$(jq -er '.metadata.uid' <<<"$attachment_cr")" \
-                || die "Test ExternalIPAttachment ${attachment_id} has no Kubernetes UID"
+            attachment_uid="$attachment_id"
             attachment_eip_id="$(jq -er '.spec.externalIP' <<<"$attachment_cr")" \
                 || die "Test ExternalIPAttachment ${attachment_id} has no ExternalIP reference"
             attachment_bmi_id="$(jq -er '.spec.baremetalInstance' <<<"$attachment_cr")" \
@@ -5753,16 +5588,13 @@ prepare_suite_cleanup() {
             pool_cr="$(jq -c '.items[0]' <<<"$pool_crs")"
             external_ip_pool_validate_cr_identity "$pool_cr" "$pool_id" \
                 || die "Test pool ${pool_id} Kubernetes CR identity does not match Fulfillment"
-            nat_gateway_uid="$(jq -er '.metadata.uid' <<<"$nat_gateway_cr")" \
-                || die "NATGateway ${nat_gateway_id} has no Kubernetes UID"
+            nat_gateway_uid="$nat_gateway_id"
             nat_gateway_vn_cr="$(virtual_network_cr_json "$nat_gateway_vn_id")" \
                 || die "NATGateway ${nat_gateway_id} VirtualNetwork CR is unavailable"
-            nat_gateway_vn_uid="$(jq -er '.metadata.uid' <<<"$nat_gateway_vn_cr")" \
-                || die "NATGateway ${nat_gateway_id} VirtualNetwork has no Kubernetes UID"
+            nat_gateway_vn_uid="$nat_gateway_vn_id"
             nat_gateway_eip_cr="$(external_ip_cr_json "$nat_gateway_eip_id" "$pool_id")" \
                 || die "NATGateway ${nat_gateway_id} ExternalIP CR is unavailable"
-            nat_gateway_eip_uid="$(jq -er '.metadata.uid' <<<"$nat_gateway_eip_cr")" \
-                || die "NATGateway ${nat_gateway_id} ExternalIP has no Kubernetes UID"
+            nat_gateway_eip_uid="$nat_gateway_eip_id"
             local provider_rows provider_count
             provider_rows="$(jq -ce --arg uid "$nat_gateway_uid" \
                 '[.nat_gateways[] | select(.uid == $uid)]' <<<"$state_before")" \
@@ -5839,12 +5671,17 @@ prepare_suite_cleanup() {
                 pool_cr="$(jq -c '.items[0]' <<<"$pool_crs")"
                 external_ip_pool_validate_cr_identity "$pool_cr" "$pool_id" \
                     || die "ExternalIPPool ${pool_id} CR identity does not match its Fulfillment object"
-                pool_uid="$(jq -er '.metadata.uid' <<<"$pool_cr")"
+                pool_uid="$pool_id"
             else
                 pool_uid="$(jq -r --arg id "$pool_id" \
                     '[.external_ip_pools[] | select(.fulfillment_id == $id) | .uid] | first // ""' \
                     <<<"$state_before")"
             fi
+            pool_initial_entry="$(jq -ce --arg id "$pool_id" \
+                '[.external_ip_pools[] | select(.fulfillment_id == $id)]
+                 | if length == 1 then .[0] else error("expected one API-ID pool state row") end' \
+                <<<"$state_before")" \
+                || die "ExternalIPPool $pool_id has no API-ID state snapshot"
 
             pool_eip_ids=()
             pool_eip_uids=()
@@ -5863,9 +5700,9 @@ prepare_suite_cleanup() {
                     if [[ "$eip_pool" == "$pool_id" ]]; then
                         [[ "$(jq -r '.metadata.annotations["osac.openshift.io/tenant"] // ""' <<<"$eip_cr")" == "$OSAC_TENANT" ]] \
                             || die "ExternalIP ${eip_id} belongs to a different tenant"
-                        [[ "$(jq -r '.metadata.annotations["osac.openshift.io/implementation-strategy"] // ""' <<<"$eip_cr")" == agentless_net ]] \
-                            || die "ExternalIP ${eip_id} is not managed by AgentlessNet"
-                        eip_uid="$(jq -er '.metadata.uid' <<<"$eip_cr")"
+                        [[ "$(jq -r '.status.networkManagers.fabric.name // ""' <<<"$eip_cr")" == agentless_net ]] \
+                            || die "ExternalIP ${eip_id} is not assigned to AgentlessNet"
+                        eip_uid="$eip_id"
                         eip_address="$(jq -r '.status.address // ""' <<<"$eip_cr")"
                         [[ -n "$eip_address" ]] \
                             || die "ExternalIP ${eip_id} has no address for route cleanup"
@@ -5900,7 +5737,7 @@ prepare_suite_cleanup() {
                     || die "ExternalIPPool ${pool_name} has a provider reservation outside the E2E name scope"
             fi
 
-            EXTERNAL_IP_POOL_K8S_UID="$pool_uid"
+            EXTERNAL_IP_POOL_API_ID="$pool_uid"
             pool_status="$(external_ip_pool_get_json)" \
                 || die "Could not read ExternalIPPool ${pool_id} counters before cleanup"
             allocated="$(jq -er '(.object.status.allocated // 0) | tonumber' <<<"$pool_status")" \
@@ -5914,6 +5751,7 @@ prepare_suite_cleanup() {
             pool_ids+=("$pool_id")
             pool_uids+=("$pool_uid")
             pool_cidrs+=("$pool_cidr")
+            pool_initial_entries+=("$pool_initial_entry")
             pool_eip_ids_jsons+=("$pool_eip_ids_json")
             pool_initial_allocated+=("$((allocated - provider_ip_count))")
             pool_initial_available+=("$((available + provider_ip_count))")
@@ -5970,18 +5808,21 @@ prepare_suite_cleanup() {
         while IFS= read -r synthetic_row; do
             [[ -n "$synthetic_row" ]] || continue
             jq -e --arg tenant "$OSAC_TENANT" \
-                --arg target "$EXTERNAL_IP_SYNTHETIC_TARGET_NAME" '
+                --argjson vns "$(cleanup_array_json "${vn_ids[@]}")" \
+                --argjson subnets "$(cleanup_array_json "${subnet_ids[@]}")" \
+                --argjson eips "$(jq -c '[.[].id]' <<<"$eip_items")" '
               .tenant_id == $tenant
-              and .payload.context.target.kind == "BareMetalInstance"
-              and .payload.context.target.name == $target
-              and (.payload.context.external_ip.name | startswith("agentless-eip-"))
+              and (.virtual_network_uid as $id | ($vns | index($id)) != null)
+              and (.subnet_uid as $id | ($subnets | index($id)) != null)
+              and (.external_ip_uid as $id | ($eips | index($id)) != null)
+              and .payload.context.destination.routing_domain.type == "tenant_virtual_network"
             ' <<<"$synthetic_row" >/dev/null \
                 || die "Synthetic ExternalIPAttachment provider state is outside the cleanup scope"
             synthetic_id="$(jq -er '.fulfillment_id' <<<"$synthetic_row")" \
                 || die "Synthetic ExternalIPAttachment state has no Fulfillment UUID"
             synthetic_uid="$(jq -er '.uid' <<<"$synthetic_row")" \
-                || die "Synthetic ExternalIPAttachment state has no Kubernetes UID"
-            synthetic_eip_id="$(jq -er '.payload.context.external_ip.fulfillment_id' <<<"$synthetic_row")" \
+                || die "Synthetic ExternalIPAttachment state has no API ID"
+            synthetic_eip_id="$(jq -er '.payload.context.external_ip.id' <<<"$synthetic_row")" \
                 || die "Synthetic ExternalIPAttachment state has no ExternalIP UUID"
             synthetic_address="$(jq -er '.external_address' <<<"$synthetic_row")" \
                 || die "Synthetic ExternalIPAttachment state has no allocated address"
@@ -5999,11 +5840,14 @@ prepare_suite_cleanup() {
             synthetic_attachment_uids+=("$synthetic_uid")
             CLEANUP_EIP_ADDRESSES+=("$synthetic_address")
         done < <(jq -ce --arg tenant "$OSAC_TENANT" \
-            --arg target "$EXTERNAL_IP_SYNTHETIC_TARGET_NAME" '
-          [.external_ip_attachments[]
-            | select(.tenant_id == $tenant
-              and .payload.context.target.name == $target
-              and (.payload.context.external_ip.name | startswith("agentless-eip-")))][]
+            --argjson vns "$(cleanup_array_json "${vn_ids[@]}")" \
+            --argjson subnets "$(cleanup_array_json "${subnet_ids[@]}")" \
+            --argjson eips "$(jq -c '[.[].id]' <<<"$eip_items")" '
+          [.external_ip_attachments[] | . as $entry
+            | select($entry.tenant_id == $tenant
+              and ($vns | index($entry.virtual_network_uid)) != null
+              and ($subnets | index($entry.subnet_uid)) != null
+              and ($eips | index($entry.external_ip_uid)) != null)][]
         ' <<<"$state_before")
     fi
     printf '%s\n' "$state_before" >"$CURRENT_STATE_FILE" \
@@ -6018,6 +5862,7 @@ prepare_suite_cleanup() {
     CLEANUP_POOL_IDS=("${pool_ids[@]}")
     CLEANUP_POOL_CIDRS=("${pool_cidrs[@]}")
     CLEANUP_POOL_EIP_IDS_JSON=("${pool_eip_ids_jsons[@]}")
+    CLEANUP_POOL_INITIAL_ENTRIES=("${pool_initial_entries[@]}")
     CLEANUP_EIP_UIDS=("${eip_uids[@]}")
     CLEANUP_EIP_IDS=("${eip_ids[@]}")
     CLEANUP_ATTACHMENT_UIDS=("${attachment_uids[@]}" "${synthetic_attachment_uids[@]}")
@@ -6095,9 +5940,14 @@ prepare_suite_cleanup() {
     fi
     remove_external_ip_client_routes \
         || die "Could not remove test-only upstream routes; preserving ExternalIPs and network resources"
+    if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
+        CLEANUP_CLIENTS_COMPLETE=false
+        cleanup_interrupted_dhcp_clients \
+            || die "Could not offboard interrupted NetworkAttachments before releasing ExternalIPs"
+    fi
     for index in "${!CLEANUP_POOL_IDS[@]}"; do
         EXTERNAL_IP_POOL_ID="${CLEANUP_POOL_IDS[$index]}"
-        EXTERNAL_IP_POOL_K8S_UID="${CLEANUP_POOL_UIDS[$index]}"
+        EXTERNAL_IP_POOL_API_ID="${CLEANUP_POOL_UIDS[$index]}"
         EXTERNAL_IP_POOL_CIDR="${CLEANUP_POOL_CIDRS[$index]}"
         EXTERNAL_IP_POOL_INITIAL_ALLOCATED="${pool_initial_allocated[$index]}"
         EXTERNAL_IP_POOL_INITIAL_AVAILABLE="${pool_initial_available[$index]}"
@@ -6106,22 +5956,16 @@ prepare_suite_cleanup() {
         if [[ "${#CREATED_EXTERNAL_IP_IDS[@]}" -gt 0 ]] && ! cleanup_created_external_ips; then
             die "Could not release all test ExternalIPs from pool ${EXTERNAL_IP_POOL_ID}"
         fi
-        cleanup_created_external_ip_pool \
-            || die "Could not delete test ExternalIPPool ${EXTERNAL_IP_POOL_ID}"
         CREATED_EXTERNAL_IP_IDS=()
     done
-    [[ "${#CLEANUP_PENDING_POOL_IDS[@]}" == 0 ]] \
-        || die "Test ExternalIPPool cleanup is incomplete; preserving provider access"
     EXTERNAL_IP_POOL_ID=""
-    EXTERNAL_IP_POOL_K8S_UID=""
+    EXTERNAL_IP_POOL_API_ID=""
     EXTERNAL_IP_POOL_CIDR=""
+    EXTERNAL_IP_POOL_INITIAL_ENTRY=""
     EXTERNAL_IP_POOL_PENDING_CLEANUP=false
     if [[ "${#CREATED_BARE_METAL_INSTANCE_IDS[@]}" -gt 0 ]]; then
         cleanup_created_bare_metal_instances \
             || die "Could not offboard test BMaaS instances; preserving their Subnets and VirtualNetworks"
-    fi
-    if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
-        cleanup_interrupted_dhcp_clients
     fi
     info "Suite cleanup resource discovery is complete; the exit handler will delete Subnets before VirtualNetworks and verify provider cleanup."
 }
@@ -6140,44 +5984,50 @@ verify_suite_cleanup_provider_state() {
     printf '%s\n' "$current" >"$CURRENT_STATE_FILE" || return 1
 
     for uid in "${CLEANUP_VN_UIDS[@]}"; do
-        if jq -e --arg uid "$uid" 'any(.virtual_networks[]; .uid == $uid)' \
+        if jq -e --arg uid "$uid" 'any(.virtual_networks[]; .uid == $uid) \
+            or (all(.deleted_resources[]; .kind != "VirtualNetwork" or .api_id != $uid))' \
             <<<"$current" >/dev/null; then
-            printf 'Deleted test VirtualNetwork provider row remains for UID %s\n' "$uid" >&2
+            printf 'Deleted VirtualNetwork API ID %s remains in provider state or lacks a tombstone\n' "$uid" >&2
             return 1
         fi
     done
     for uid in "${CLEANUP_SUBNET_UIDS[@]}"; do
-        if jq -e --arg uid "$uid" 'any(.subnets[]; .uid == $uid)' \
+        if jq -e --arg uid "$uid" 'any(.subnets[]; .uid == $uid) \
+            or (all(.deleted_resources[]; .kind != "Subnet" or .api_id != $uid))' \
             <<<"$current" >/dev/null; then
-            printf 'Deleted test Subnet provider row remains for UID %s\n' "$uid" >&2
+            printf 'Deleted Subnet API ID %s remains in provider state or lacks a tombstone\n' "$uid" >&2
             return 1
         fi
     done
     for uid in "${CLEANUP_POOL_UIDS[@]}"; do
-        if jq -e --arg uid "$uid" 'any(.external_ip_pools[]; .uid == $uid)' \
+        if jq -e --arg uid "$uid" 'any(.external_ip_pools[]; .uid == $uid) \
+            or (all(.deleted_resources[]; .kind != "ExternalIPPool" or .api_id != $uid))' \
             <<<"$current" >/dev/null; then
-            printf 'Deleted test ExternalIPPool provider row remains for UID %s\n' "$uid" >&2
+            printf 'Deleted ExternalIPPool API ID %s remains in provider state or lacks a tombstone\n' "$uid" >&2
             return 1
         fi
     done
     for uid in "${CLEANUP_EIP_UIDS[@]}"; do
-        if jq -e --arg uid "$uid" 'any(.external_ips[]; .uid == $uid)' \
+        if jq -e --arg uid "$uid" 'any(.external_ips[]; .uid == $uid) \
+            or (all(.deleted_resources[]; .kind != "ExternalIP" or .api_id != $uid))' \
             <<<"$current" >/dev/null; then
-            printf 'Deleted test ExternalIP provider row remains for UID %s\n' "$uid" >&2
+            printf 'Deleted ExternalIP API ID %s remains in provider state or lacks a tombstone\n' "$uid" >&2
             return 1
         fi
     done
     for uid in "${CLEANUP_ATTACHMENT_UIDS[@]}"; do
-        if jq -e --arg uid "$uid" 'any(.external_ip_attachments[]; .uid == $uid)' \
+        if jq -e --arg uid "$uid" 'any(.external_ip_attachments[]; .uid == $uid) \
+            or (all(.deleted_resources[]; .kind != "ExternalIPAttachment" or .api_id != $uid))' \
             <<<"$current" >/dev/null; then
-            printf 'Deleted test ExternalIPAttachment provider row remains for UID %s\n' "$uid" >&2
+            printf 'Deleted ExternalIPAttachment API ID %s remains in provider state or lacks a tombstone\n' "$uid" >&2
             return 1
         fi
     done
     for uid in "${CLEANUP_NAT_GATEWAY_UIDS[@]}"; do
-        if jq -e --arg uid "$uid" 'any(.nat_gateways[]; .uid == $uid)' \
+        if jq -e --arg uid "$uid" 'any(.nat_gateways[]; .uid == $uid) \
+            or (all(.deleted_resources[]; .kind != "NATGateway" or .api_id != $uid))' \
             <<<"$current" >/dev/null; then
-            printf 'Deleted test NATGateway provider row remains for UID %s\n' "$uid" >&2
+            printf 'Deleted NATGateway API ID %s remains in provider state or lacks a tombstone\n' "$uid" >&2
             return 1
         fi
     done
@@ -6189,7 +6039,7 @@ verify_suite_cleanup_provider_state() {
             host_interface="$(jq -r '.host_interface' <<<"$entry")"
             local namespaces
             if ! namespaces="$(netnode ip netns list)"; then
-                printf 'Could not inspect namespaces after deleting VirtualNetwork UID %s\n' "$uid" >&2
+                printf 'Could not inspect namespaces after deleting VirtualNetwork API ID %s\n' "$uid" >&2
                 return 1
             fi
             if awk -v name="$namespace" '$1 == name { found=1 } END { exit !found }' \
@@ -6204,15 +6054,15 @@ verify_suite_cleanup_provider_state() {
             service_name="agentless-dhcp-${uid}"
             if service_status="$(netnode supervisorctl -c /etc/agentless-net/supervisord.conf \
                 status "$service_name" 2>&1)"; then
-                printf 'Deleted VirtualNetwork DHCP service remains for UID %s\n' "$uid" >&2
+                printf 'Deleted VirtualNetwork DHCP service remains for API ID %s\n' "$uid" >&2
                 return 1
             fi
             if ! supervisor_service_status_is_absent "$service_name" "$service_status"; then
-                printf 'Could not verify Supervisor state for deleted VirtualNetwork UID %s\n' "$uid" >&2
+                printf 'Could not verify Supervisor state for deleted VirtualNetwork API ID %s\n' "$uid" >&2
                 return 1
             fi
             if ! netnode test -d /etc/agentless-net/supervisor.d; then
-                printf 'Could not inspect Supervisor program files after deleting VirtualNetwork UID %s\n' "$uid" >&2
+                printf 'Could not inspect Supervisor program files after deleting VirtualNetwork API ID %s\n' "$uid" >&2
                 return 1
             fi
             service_file="/etc/agentless-net/supervisor.d/${uid}.ini"
@@ -6255,23 +6105,7 @@ verify_suite_cleanup_provider_state() {
             "$CLEANUP_STATE_FILE")
     fi
 
-    for collection in virtual_networks subnets external_ip_pools external_ips external_ip_attachments nat_gateways; do
-        baseline_uids="$(jq -r --arg collection "$collection" \
-            'if (.[$collection] | type) != "array" then error("invalid state collection") else .[$collection][].uid end' \
-            "$BASELINE_STATE_FILE")" || return 1
-        while IFS= read -r uid; do
-            [[ -n "$uid" ]] || continue
-            before="$(jq -cS --arg uid "$uid" --arg collection "$collection" \
-                '.[$collection][] | select(.uid == $uid)' "$BASELINE_STATE_FILE")"
-            after="$(jq -cS --arg uid "$uid" --arg collection "$collection" \
-                '.[$collection][] | select(.uid == $uid)' "$CURRENT_STATE_FILE")"
-            if [[ -z "$after" || "$before" != "$after" ]]; then
-                printf 'Unrelated AgentlessNet %s state for UID %s changed during cleanup\n' \
-                    "$collection" "$uid" >&2
-                return 1
-            fi
-        done <<<"$baseline_uids"
-    done
+    assert_baseline_state_unchanged || return 1
     return 0
 }
 
@@ -6310,25 +6144,7 @@ cleanup_created_virtual_networks() {
         printf 'ERROR: preserving test ExternalIPs and provider state because cleanup is incomplete\n' >&2
         cleanup_incomplete=true
     fi
-    if [[ "$test_nat_gateways_clean" == true && "$test_external_ip_attachments_clean" == true \
-        && "$routes_clean" == true \
-        && "$test_external_ips_clean" == true ]] && ! cleanup_created_external_ip_pool; then
-        test_external_ip_pool_clean=false
-        printf 'ERROR: preserving the ExternalIPPool and provider access because pool cleanup is incomplete\n' >&2
-        cleanup_incomplete=true
-    elif [[ "$test_nat_gateways_clean" != true || "$test_external_ip_attachments_clean" != true || "$routes_clean" != true \
-        || "$test_external_ips_clean" != true ]]; then
-        test_external_ip_pool_clean=false
-    fi
-    if [[ "${CLEANUP_MODE:-false}" == true ]] \
-        && declare -p CLEANUP_PENDING_POOL_IDS >/dev/null 2>&1 \
-        && ((${#CLEANUP_PENDING_POOL_IDS[@]} > 0)); then
-        test_external_ip_pool_clean=false
-        printf 'ERROR: preserving provider access; test ExternalIPPool cleanup is incomplete\n' >&2
-        cleanup_incomplete=true
-    fi
     if [[ "$test_nat_gateways_clean" == true && "$test_external_ips_clean" == true \
-        && "$test_external_ip_pool_clean" == true \
         && "$test_external_ip_attachments_clean" == true && "$routes_clean" == true \
         && "${#CREATED_BARE_METAL_INSTANCE_IDS[@]}" -gt 0 ]] \
         && ! cleanup_created_bare_metal_instances; then
@@ -6338,13 +6154,13 @@ cleanup_created_virtual_networks() {
     fi
     if [[ "$test_nat_gateways_clean" == true && "$test_external_ip_attachments_clean" == true \
         && "$routes_clean" == true \
-        && "$test_external_ips_clean" == true && "$test_external_ip_pool_clean" == true \
+        && "$test_external_ips_clean" == true \
         && "$test_baremetal_instances_clean" == true ]] && ! cleanup_created_subnets; then
         test_subnets_clean=false
         printf 'ERROR: test-owned Subnet cleanup is incomplete; preserving its provider and DHCP state for recovery\n' >&2
         cleanup_incomplete=true
     elif [[ "$test_nat_gateways_clean" != true || "$test_external_ip_attachments_clean" != true || "$routes_clean" != true \
-        || "$test_external_ips_clean" != true || "$test_external_ip_pool_clean" != true \
+        || "$test_external_ips_clean" != true \
         || "$test_baremetal_instances_clean" != true ]]; then
         test_subnets_clean=false
     fi
@@ -6379,6 +6195,43 @@ cleanup_created_virtual_networks() {
             test_vns_clean=false
         fi
     done
+    if [[ "$test_nat_gateways_clean" == true && "$test_external_ip_attachments_clean" == true \
+        && "$routes_clean" == true && "$test_external_ips_clean" == true \
+        && "$test_baremetal_instances_clean" == true && "$test_subnets_clean" == true \
+        && "$test_vns_clean" == true ]]; then
+        if [[ "${CLEANUP_MODE:-false}" == true && "${#CLEANUP_POOL_IDS[@]}" -gt 0 ]]; then
+            for index in "${!CLEANUP_POOL_IDS[@]}"; do
+                EXTERNAL_IP_POOL_ID="${CLEANUP_POOL_IDS[$index]}"
+                EXTERNAL_IP_POOL_API_ID="${CLEANUP_POOL_UIDS[$index]}"
+                EXTERNAL_IP_POOL_CIDR="${CLEANUP_POOL_CIDRS[$index]}"
+                EXTERNAL_IP_POOL_INITIAL_ENTRY="${CLEANUP_POOL_INITIAL_ENTRIES[$index]}"
+                EXTERNAL_IP_POOL_PENDING_CLEANUP=true
+                if ! cleanup_created_external_ip_pool; then
+                    test_external_ip_pool_clean=false
+                    printf 'ERROR: preserving test pool %s after Subnet and VirtualNetwork cleanup failed\n' \
+                        "$EXTERNAL_IP_POOL_ID" >&2
+                    cleanup_incomplete=true
+                    break
+                fi
+            done
+            if [[ "${#CLEANUP_PENDING_POOL_IDS[@]}" -gt 0 ]]; then
+                test_external_ip_pool_clean=false
+                cleanup_incomplete=true
+            fi
+        elif [[ "$EXTERNAL_IP_POOL_PENDING_CLEANUP" == true ]]; then
+            if ! cleanup_created_external_ip_pool; then
+                test_external_ip_pool_clean=false
+                cleanup_incomplete=true
+            fi
+        fi
+    else
+        test_external_ip_pool_clean=false
+    fi
+    EXTERNAL_IP_POOL_ID=""
+    EXTERNAL_IP_POOL_API_ID=""
+    EXTERNAL_IP_POOL_CIDR=""
+    EXTERNAL_IP_POOL_INITIAL_ENTRY=""
+    EXTERNAL_IP_POOL_PENDING_CLEANUP=false
     if [[ "${CLEANUP_MODE:-false}" == true \
         && "${CLEANUP_DISCOVERY_COMPLETE:-false}" == true \
         && "$test_nat_gateways_clean" == true \
@@ -6652,14 +6505,9 @@ on_exit() {
     else
         printf 'ERROR: preserving test resources, AAP inventory, and provider access because provider cleanup is incomplete\n' >&2
     fi
-    if [[ "$AAP_SUBNET_READER_SETUP_ATTEMPTED" == true ]]; then
-        if [[ "$provider_cleanup_allowed" != true || "$PRESERVE_E2E_RECOVERY_ARTIFACTS" == true ]]; then
-            printf 'ERROR: preserving the AAP Subnet credential until provider cleanup completes\n' >&2
-        elif ! cleanup_aap_subnet_reader; then
-            printf 'ERROR: AAP Subnet credential cleanup is incomplete; preserving recovery state\n' >&2
-            cleanup_status=1
-            PRESERVE_E2E_RECOVERY_ARTIFACTS=true
-        fi
+    if ! assert_legacy_provider_state_unchanged; then
+        cleanup_status=1
+        PRESERVE_E2E_RECOVERY_ARTIFACTS=true
     fi
     if [[ "$status" == 0 && "$cleanup_status" != 0 ]]; then
         status=1
@@ -6717,6 +6565,10 @@ fi
     || die "OSAC_INSTALL_MODE must be auto, install, or upgrade"
 [[ "$VLAN_E2E_DEBUG" == true || "$VLAN_E2E_DEBUG" == false ]] \
     || die "VLAN_E2E_DEBUG must be true or false"
+[[ "$VLAN_E2E_TAKE_OWNERSHIP" == true || "$VLAN_E2E_TAKE_OWNERSHIP" == false ]] \
+    || die "VLAN_E2E_TAKE_OWNERSHIP must be true or false"
+[[ "$VLAN_E2E_REUSE_INFRA" == true || "$VLAN_E2E_REUSE_INFRA" == false ]] \
+    || die "VLAN_E2E_REUSE_INFRA must be true or false"
 if [[ "$CLEANUP_MODE" != true ]]; then
     [[ "$CUMULUS_VERSION" =~ ^5\.[0-9]+\.[0-9]+$ ]] \
         || die "CUMULUS_VERSION must be an exact Cumulus release such as 5.16.5"
@@ -6837,8 +6689,8 @@ for label, value in zip(("SUBNET_ONE_IPV4_CIDR", "SUBNET_TWO_IPV4_CIDR", "SUBNET
     if not value:
         continue
     network = ipaddress.ip_network(value, strict=True)
-    if not isinstance(network, ipaddress.IPv4Network) or str(network) != value or network.prefixlen > 30:
-        raise SystemExit(f"{label} must be a canonical IPv4 CIDR with prefix length /30 or shorter")
+    if not isinstance(network, ipaddress.IPv4Network) or str(network) != value or network.prefixlen > 28:
+        raise SystemExit(f"{label} must be a canonical IPv4 CIDR with prefix length /28 or shorter")
     if not network.subnet_of(parent):
         raise SystemExit(f"{label} must be contained by VIRTUAL_NETWORK_IPV4_CIDR")
     children.append((label, network))
@@ -6846,8 +6698,8 @@ if len(children) == 2 and children[0][1].overlaps(children[1][1]):
     raise SystemExit("SUBNET_ONE_IPV4_CIDR and SUBNET_TWO_IPV4_CIDR must not overlap")
 PY
 fi
-assert_provider_schema_v1 || die "The AgentlessNet provider schema must remain V1 until OSAC-5528 is complete"
-TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/osac-5530-vlan-e2e.XXXXXX")"
+assert_provider_schema_v1 || die "AgentlessNet must use the network-manager-api-id-v1 SQLite contract"
+TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/osac-6752-vlan-e2e.XXXXXX")"
 BASELINE_STATE_FILE="${TEMP_DIR}/baseline-state.json"
 CURRENT_STATE_FILE="${TEMP_DIR}/current-state.json"
 SWITCH_MANIFEST_FILE="${TEMP_DIR}/switches.json"
@@ -6858,7 +6710,7 @@ fi
 if [[ "$CLEANUP_MODE" != true && "$SUITE_USES_SUBNET_DHCP" == true \
     && "$VLAN_E2E_DEBUG" == true ]]; then
     if [[ -z "$VLAN_E2E_ARTIFACT_DIR" ]]; then
-        DEBUG_ARTIFACT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/osac-5530-dhcp-debug.XXXXXX")"
+        DEBUG_ARTIFACT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/osac-6752-dhcp-debug.XXXXXX")"
         DEBUG_ARTIFACT_DIR_GENERATED=true
     else
         [[ ! -e "$VLAN_E2E_ARTIFACT_DIR" && ! -L "$VLAN_E2E_ARTIFACT_DIR" ]] \
@@ -6871,11 +6723,11 @@ if [[ "$CLEANUP_MODE" != true && "$SUITE_USES_SUBNET_DHCP" == true \
 fi
 if [[ "$SUITE_USES_CLI" == true ]]; then
     if [[ -z "$CLI_BIN" ]]; then
-        CLI_BIN="$(mktemp "${TMPDIR:-/tmp}/osac-5530-cli.XXXXXX")"
+        CLI_BIN="$(mktemp "${TMPDIR:-/tmp}/osac-6752-cli.XXXXXX")"
         GENERATED_CLI_BIN=true
     fi
     if [[ -z "$CLI_CONFIG_DIR" ]]; then
-        CLI_CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/osac-5530-cli-config.XXXXXX")"
+        CLI_CONFIG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/osac-6752-cli-config.XXXXXX")"
         GENERATED_CLI_CONFIG=true
     fi
     if [[ "$GENERATED_CLI_CONFIG" == true ]]; then
@@ -7012,9 +6864,14 @@ OVERLAY_FILE="${INSTALLER_DIR}/values/agentless-net-stub.yaml"
 CLUSTER_DOMAIN="$(oc get ingresses.config/cluster -o jsonpath='{.spec.domain}')"
 [[ -n "$CLUSTER_DOMAIN" ]] || die "Could not read the OpenShift cluster domain"
 OIDC_ISSUER_URL="https://keycloak-keycloak.${CLUSTER_DOMAIN}/realms/osac"
-# This smoke invokes the networking AAP jobs directly; catalog template
-# publication is unrelated and its hook needs a Kubernetes token mount.
-EXTRA_HELM_ARGS="-f ${OVERLAY_FILE} --set-string aap.configAsCode.eeImage=${AAP_IMAGE} --set-string aap.configAsCode.projectGitUri=${AAP_PROJECT_GIT_URI} --set-string aap.configAsCode.projectGitBranch=${AAP_PROJECT_GIT_BRANCH} --set-string operator.image.repository=${OPERATOR_IMAGE_REPOSITORY} --set-string operator.image.tag=${OPERATOR_IMAGE_TAG} --set-string service.images.service.repository=${FULFILLMENT_IMAGE_REPOSITORY} --set-string service.images.service.tag=${FULFILLMENT_IMAGE_TAG} --set service.eventPublisher.enabled=true --set aap.instanceGroups.publishTemplates.enabled=false"
+# This lab invokes fixed networking task templates directly; the template
+# publication hook is not part of this BMaaS-only run.
+EXTRA_HELM_ARGS="-f ${OVERLAY_FILE} --set-string aap.bootstrap.image=${AAP_IMAGE} --set-string aap.configAsCode.eeImage=${AAP_IMAGE} --set-string aap.configAsCode.projectGitUri=${AAP_PROJECT_GIT_URI} --set-string aap.configAsCode.projectGitBranch=${AAP_PROJECT_GIT_BRANCH} --set-string operator.image.repository=${OPERATOR_IMAGE_REPOSITORY} --set-string operator.image.tag=${OPERATOR_IMAGE_TAG} --set-string service.images.service.repository=${FULFILLMENT_IMAGE_REPOSITORY} --set-string service.images.service.tag=${FULFILLMENT_IMAGE_TAG} --set service.eventPublisher.enabled=true --set aap.instanceGroups.publishTemplates.enabled=false"
+INFRA_HELM_ARGS=""
+if [[ "$VLAN_E2E_TAKE_OWNERSHIP" == true ]]; then
+    EXTRA_HELM_ARGS+=" --take-ownership"
+    INFRA_HELM_ARGS="--take-ownership"
+fi
 EXISTING_OSAC_RELEASE="$(helm list -n "$OSAC_NAMESPACE" --filter '^osac$' --short)"
 PREVIOUS_DEPLOYMENT_SETTINGS="{}"
 EXPECTED_DEPLOYMENT_SETTINGS="$(jq -ncS \
@@ -7025,12 +6882,14 @@ EXPECTED_DEPLOYMENT_SETTINGS="$(jq -ncS \
     --arg operator_tag "$OPERATOR_IMAGE_TAG" \
     --arg fulfillment_repository "$FULFILLMENT_IMAGE_REPOSITORY" \
     --arg fulfillment_tag "$FULFILLMENT_IMAGE_TAG" \
-    '{aap:{eeImage:$ee,projectGitUri:$project_uri,projectGitBranch:$project_branch},
+    --arg state_file "$AGENTLESS_NET_STATE_FILE" \
+    '{aap:{bootstrapImage:$ee,eeImage:$ee,projectGitUri:$project_uri,projectGitBranch:$project_branch,
+        stateFile:$state_file},
       operator:{image:{repository:$operator_repository,tag:$operator_tag}},
       fulfillment:{image:{repository:$fulfillment_repository,tag:$fulfillment_tag}},
-      service:{eventPublisherEnabled:true},
+      service:{eventPublisherEnabled:true,caasEnabled:false,vmaasEnabled:false,bmaasEnabled:true},
       networking:{fabricManager:"agentless_net",k8sManager:"",
-        networkClassTitle:"AgentlessNet VirtualNetwork and Subnet baseline"}}')"
+        addressPlan:{overlay:0,fabric:1,lbVip:0}}}')"
 OSAC_DEPLOYMENT_NEEDED=true
 if [[ -n "$EXISTING_OSAC_RELEASE" ]]; then
     PREVIOUS_DEPLOYMENT_SETTINGS="$(deployment_settings)" \
@@ -7066,6 +6925,7 @@ elif [[ -n "$EXISTING_OSAC_RELEASE" || "$OSAC_INSTALL_MODE" == upgrade ]]; then
         --set aap.bootstrap.enabled=false \
         --set service.eventPublisher.enabled=true \
         --set aap.instanceGroups.publishTemplates.enabled=false \
+        --set-string "aap.bootstrap.image=${AAP_IMAGE}" \
         --set-string "aap.configAsCode.eeImage=${AAP_IMAGE}" \
         --set-string "aap.configAsCode.projectGitUri=${AAP_PROJECT_GIT_URI}" \
         --set-string "aap.configAsCode.projectGitBranch=${AAP_PROJECT_GIT_BRANCH}" \
@@ -7081,12 +6941,17 @@ else
     helm dependency build "${INSTALLER_DIR}/charts/osac"
     [[ -f "$AAP_LICENSE_FILE" ]] || die "AAP license file not found: ${AAP_LICENSE_FILE}"
     info "Installing OSAC with the AgentlessNet VirtualNetwork/Subnet profile in ${OSAC_NAMESPACE}..."
-    make -C "$INSTALLER_DIR" install \
+    INSTALL_TARGET=install
+    if [[ "$VLAN_E2E_REUSE_INFRA" == true ]]; then
+        INSTALL_TARGET=install-osac
+    fi
+    make -C "$INSTALLER_DIR" "$INSTALL_TARGET" \
         PLATFORM=openshift \
         "DOMAIN=${CLUSTER_DOMAIN}" \
         PROFILE="$OSAC_PROFILE" \
         NS="$OSAC_NAMESPACE" \
         "AAP_LICENSE_FILE=${AAP_LICENSE_FILE}" \
+        "INFRA_HELM_ARGS=${INFRA_HELM_ARGS}" \
         "EXTRA_HELM_ARGS=${EXTRA_HELM_ARGS}"
 fi
 
@@ -7131,6 +6996,7 @@ AAP_API_CA_FILE="$TEMP_DIR/aap-api-ca.pem"
 prepare_aap_ca_bundle
 sync_aap_project_revision
 configure_aap_execution_environment
+capture_legacy_provider_state
 prepare_containerlab_net_node
 write_cumulus_ssh_config
 prepare_containerlab_switches
@@ -7142,11 +7008,6 @@ fi
 prepare_aap_networking_instance_group
 wait_for_existing_provider_deletions \
     || die "Existing AgentlessNet resources are still deleting; provider access is preserved for recovery"
-if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
-    configure_aap_subnet_reader \
-        || die "Could not configure AAP Kubernetes authentication for BMaaS attachment jobs"
-fi
-
 if [[ "$SUITE_USES_CLI" == true ]]; then
     # The CLI is a local binary, not another container image.
     info "Preparing a temporary CLI CA bundle and building the CLI from this checkout..."
@@ -7163,8 +7024,10 @@ if [[ "$SUITE_USES_CLI" == true ]]; then
         --token-script "$OSAC_TOKEN_SCRIPT" \
         "$OSAC_API"
 
+    ensure_bootstrap_external_ip_pool
     ensure_osac_tenant
     "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" tenant "$OSAC_TENANT"
+    wait_for_tenant_default_networking
 fi
 fi
 
@@ -7203,9 +7066,9 @@ client_macvlan_name() {
 }
 
 run_agentless_net_aap_job() {
-    local job_suffix="$1" extra_vars_file="$2" result_file="$3"
+    local task="$1" extra_vars_file="$2" result_file="$3"
     local route token template job_id
-    template="${AAP_PREFIX}-${job_suffix}"
+    template="${AAP_PREFIX}-${task//_/-}"
     if ! route="$(oc get route osac-aap -n "$OSAC_NAMESPACE" -o jsonpath='{.spec.host}')"; then
         printf 'ERROR: could not read the AAP Controller route before launching %s\n' "$template" >&2
         return 1
@@ -7242,66 +7105,124 @@ run_agentless_net_aap_job() {
     info "AAP ${template} completed as job ${job_id} at source revision ${RUNTIME_SOURCE_COMMIT}."
 }
 
-write_client_bmi_extra_vars() {
-    local client="$1" subnet_ref="$2" output_file="$3" offboard="$4"
-    local uid="${CLIENT_BMI_UID[$client]:-}" mac="${CLIENT_PRESERVED_MAC[$client]:-}"
+write_network_task_extra_vars() {
+    local cr_json="$1" task="$2" output_file="$3"
+    jq -ce --arg task "$task" '
+      .status.taskInput as $input
+      | .status.networkManagers.fabric as $fabric
+      | if ($input | type) != "object" or ($fabric | type) != "object"
+          or ($fabric.name | type) != "string" or ($fabric.ansibleRole | type) != "string"
+        then error("network task input or Fabric Manager reference is missing")
+        else {osac_job_vars:($input + {
+          task:$task,
+          manager:{name:$fabric.name,type:"fabric",ansible_role:$fabric.ansibleRole}
+        })}
+        end' <<<"$cr_json" >"$output_file" \
+        || { printf 'Could not write %s task variables from the stored resource snapshot\n' "$task" >&2; return 1; }
+    chmod 0600 "$output_file"
+}
+
+replay_network_task_input() {
+    local cr_json="$1" task="$2" result_file
+    AAP_JOB_RESULT_SEQUENCE=$((AAP_JOB_RESULT_SEQUENCE + 1))
+    result_file="$TEMP_DIR/${task}-replay-${AAP_JOB_RESULT_SEQUENCE}.json"
+    write_network_task_extra_vars "$cr_json" "$task" "${result_file}.extra-vars.json" \
+        || return 1
+    run_agentless_net_aap_job "$task" "${result_file}.extra-vars.json" "$result_file" \
+        || return 1
+    LAST_REPLAYED_AAP_RESULT_FILE="$result_file"
+}
+
+write_client_network_attachment_extra_vars() {
+    local client="$1" subnet_ref="$2" task="$3" output_file="$4"
+    local api_id="${CLIENT_BMI_API_ID[$client]:-}"
+    local attachment_uid="${CLIENT_ATTACHMENT_UID[$client]:-}"
+    local mac="${CLIENT_PRESERVED_MAC[$client]:-}" subnet_cr subnet_task_input
     [[ -n "$mac" ]] || mac="$(<"$TEMP_DIR/client-${client}.mac")"
-    [[ "$uid" =~ ^[0-9a-f-]{36}$ ]] || {
-        printf 'ERROR: DHCP client %s has no valid simulated BMI UID\n' "$client" >&2
+    [[ "$api_id" =~ ^[0-9a-f-]{36}$ ]] || {
+        printf 'ERROR: DHCP client %s has no valid target API ID\n' "$client" >&2
+        return 1
+    }
+    [[ "$attachment_uid" =~ ^[0-9a-f-]{36}$ ]] || {
+        printf 'ERROR: DHCP client %s has no valid NetworkAttachment snapshot UID\n' "$client" >&2
         return 1
     }
     [[ "$subnet_ref" =~ ^[0-9a-f-]{36}$ ]] || {
         printf 'ERROR: DHCP client %s has no valid Fulfillment Subnet UUID\n' "$client" >&2
         return 1
     }
-    [[ "$mac" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]] || {
-        printf 'ERROR: DHCP client %s has no valid simulated BMI NIC MAC\n' "$client" >&2
+    [[ "$task" == apply_network_attachment || "$task" == query_dhcp_lease \
+        || "$task" == delete_network_attachment ]] || {
+        printf 'ERROR: unsupported NetworkAttachment task %s\n' "$task" >&2
         return 1
     }
-    python3 - "$client" "$OSAC_NAMESPACE" "$OSAC_TENANT" "$subnet_ref" \
-        "$uid" "$mac" "$offboard" "$output_file" <<'PY'
-import datetime
+    [[ "$mac" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]] || {
+        printf 'ERROR: DHCP client %s has no valid physical interface MAC\n' "$client" >&2
+        return 1
+    }
+    subnet_cr="$(subnet_cr_json "$subnet_ref" "")" \
+        || return 1
+    subnet_task_input="$(jq -ce '.status.taskInput | select(type == "object")' <<<"$subnet_cr")" \
+        || { printf 'Subnet %s has no stored task input to build the attachment request\n' "$subnet_ref" >&2; return 1; }
+    jq -e --arg id "$subnet_ref" '
+      .resource.kind == "Subnet" and .resource.id == $id
+      and .virtual_network.kind == "VirtualNetwork"
+      and (.ipam.gateway_ipv4 | type == "string")
+      and (.ipam.physical_ipv4_cidrs | type == "array")
+      and (.tenant | type == "string" and length > 0)' \
+      <<<"$subnet_task_input" >/dev/null || {
+        printf 'Subnet %s stored task input is not a complete networking snapshot\n' "$subnet_ref" >&2
+        return 1
+    }
+    python3 - "$client" "$OSAC_NAMESPACE" "$api_id" "$attachment_uid" \
+        "$subnet_ref" "$mac" "$task" "$subnet_task_input" "$output_file" <<'PY'
 import json
 import os
 import pathlib
 import sys
 
-client, namespace, tenant, subnet_ref, uid, mac, offboard, output_path = sys.argv[1:]
-host_id = f"osac-e2e-{client}"
-resource = {
-    "apiVersion": "osac.openshift.io/v1alpha1",
-    "kind": "BareMetalInstance",
-    "metadata": {
-        "name": host_id,
-        "namespace": namespace,
-        "uid": uid,
-        "annotations": {
-            "osac.openshift.io/tenant": tenant,
-            "osac.openshift.io/owner-reference": "vlan-e2e-run",
-            "osac.openshift.io/implementation-strategy": "agentless_net",
+client, namespace, api_id, attachment_uid, subnet_ref, mac, task, raw_subnet_input, output_path = sys.argv[1:]
+subnet_input = json.loads(raw_subnet_input)
+subnet = subnet_input["resource"]
+network_attachment = {
+    "subnet": subnet_ref,
+    "interface": {"type": "physical", "name": "eth0", "mac_address": mac.lower()},
+    "security_group_ids": [],
+}
+job_vars = {
+    "task": task,
+    "manager": {
+        "name": "agentless_net",
+        "type": "fabric",
+        "ansible_role": "osac.templates.agentless_net",
+    },
+    "resource": {
+        "apiVersion": "osac.openshift.io/v1alpha1",
+        "kind": "NetworkAttachment",
+        "id": api_id,
+        "metadata": {
+            "name": f"baremetalinstance-{api_id}",
+            "namespace": namespace,
+            "uid": attachment_uid,
+            "generation": 1,
+        },
+        "spec": {
+            "target": {"kind": "BareMetalInstance", "id": api_id},
+            "subnet": subnet_ref,
         },
     },
-    "spec": {
-        "externalHostID": host_id,
-        "networkAttachments": [{
-            "subnetRef": subnet_ref,
-            "interface": "eth0",
-            "primary": True,
-        }],
+    "tenant": subnet_input["tenant"],
+    "target": {
+        "kind": "BareMetalInstance",
+        "id": api_id,
+        "host_name": f"osac-e2e-{client}",
     },
+    "network_attachment": network_attachment,
+    "virtual_network": subnet_input["virtual_network"],
+    "subnet": subnet,
+    "ipam": subnet_input["ipam"],
 }
-if offboard == "true":
-    resource["metadata"]["deletionTimestamp"] = (
-        datetime.datetime.now(datetime.timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-payload = {"osac_job_vars": {"resource": resource}}
-if offboard == "query":
-    payload["osac_job_vars"]["network_attachment_macs"] = {
-        subnet_ref: mac.lower(),
-    }
+payload = {"osac_job_vars": job_vars}
 path = pathlib.Path(output_path)
 path.write_text(json.dumps(payload, separators=(",", ":")) + "\n")
 path.chmod(0o600)
@@ -7316,14 +7237,15 @@ attach_client_to_subnet() {
         info "DHCP client ${client} already has the requested simulated BMI attachment."
         return 0
     fi
-    CLIENT_BMI_UID["$client"]="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+    CLIENT_BMI_API_ID["$client"]="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+    CLIENT_ATTACHMENT_UID["$client"]="$(python3 -c 'import uuid; print(uuid.uuid4())')"
     CLIENT_ATTACHMENT_SUBNET["$client"]="$subnet_ref"
     CLIENT_ATTACHMENT_PENDING["$client"]=true
-    extra_vars="$TEMP_DIR/${client}-move-network-attachment.json"
+    extra_vars="$TEMP_DIR/${client}-apply-network-attachment.json"
     AAP_JOB_RESULT_SEQUENCE=$((AAP_JOB_RESULT_SEQUENCE + 1))
-    result_file="$TEMP_DIR/${client}-move-network-attachment-result-${AAP_JOB_RESULT_SEQUENCE}.json"
-    write_client_bmi_extra_vars "$client" "$subnet_ref" "$extra_vars" false
-    run_agentless_net_aap_job move-network-attachment "$extra_vars" "$result_file" \
+    result_file="$TEMP_DIR/${client}-apply-network-attachment-result-${AAP_JOB_RESULT_SEQUENCE}.json"
+    write_client_network_attachment_extra_vars "$client" "$subnet_ref" apply_network_attachment "$extra_vars"
+    run_agentless_net_aap_job apply_network_attachment "$extra_vars" "$result_file" \
         || die "AAP could not attach DHCP client ${client} to Subnet ${subnet_ref}"
     CLIENT_ATTACHMENT_ACTIVE["$client"]=true
     CLIENT_ATTACHMENT_PENDING["$client"]=false
@@ -7342,18 +7264,16 @@ discover_client_dhcp_lease() {
     extra_vars="$TEMP_DIR/${client}-query-dhcp-lease.json"
     AAP_JOB_RESULT_SEQUENCE=$((AAP_JOB_RESULT_SEQUENCE + 1))
     result_file="$TEMP_DIR/${client}-query-dhcp-lease-result-${AAP_JOB_RESULT_SEQUENCE}.json"
-    write_client_bmi_extra_vars "$client" "$subnet_ref" "$extra_vars" query
-    run_agentless_net_aap_job query-dhcp-lease "$extra_vars" "$result_file" \
+    write_client_network_attachment_extra_vars "$client" "$subnet_ref" query_dhcp_lease "$extra_vars"
+    run_agentless_net_aap_job query_dhcp_lease "$extra_vars" "$result_file" \
         || die "AAP could not discover the DHCP lease for client ${client}"
     jq -e --arg subnet "$subnet_ref" --arg ip "$lease_ip" \
         --arg mac "$expected_mac" '
-      (.artifacts.leases | type == "array" and length == 1)
-      and .artifacts.leases[0].subnet_ref == $subnet
-      and .artifacts.leases[0].interface == "eth0"
-      and ((.artifacts.leases[0].mac_address | ascii_downcase) == $mac)
-      and .artifacts.leases[0].ip_address == $ip
+      .artifacts.osac_result.dhcp_lease.ip_address == $ip
+      and ((.artifacts.osac_result.dhcp_lease.mac_address | ascii_downcase) == $mac)
     ' "$result_file" >/dev/null \
         || die "AAP DHCP lease result for ${client} did not match its Subnet, eth0, MAC, and client lease"
+    assert_network_attachment_state "$client"
     info "AAP verified client ${client} lease ${lease_ip} on Subnet ${subnet_ref} for MAC ${expected_mac}."
 }
 
@@ -7368,16 +7288,18 @@ offboard_client_from_subnet() {
         printf 'ERROR: cannot offboard client %s without its original Subnet reference\n' "$client" >&2
         return 1
     }
-    extra_vars="$TEMP_DIR/${client}-offboard-network-attachment.json"
+    extra_vars="$TEMP_DIR/${client}-delete-network-attachment.json"
     AAP_JOB_RESULT_SEQUENCE=$((AAP_JOB_RESULT_SEQUENCE + 1))
-    result_file="$TEMP_DIR/${client}-offboard-network-attachment-result-${AAP_JOB_RESULT_SEQUENCE}.json"
-    write_client_bmi_extra_vars "$client" "$subnet_ref" "$extra_vars" true \
+    result_file="$TEMP_DIR/${client}-delete-network-attachment-result-${AAP_JOB_RESULT_SEQUENCE}.json"
+    write_client_network_attachment_extra_vars "$client" "$subnet_ref" delete_network_attachment "$extra_vars" \
         || return 1
-    run_agentless_net_aap_job move-network-attachment "$extra_vars" "$result_file" \
+    run_agentless_net_aap_job delete_network_attachment "$extra_vars" "$result_file" \
         || return 1
+    assert_network_attachment_state_absent "${CLIENT_BMI_API_ID[$client]}"
     CLIENT_ATTACHMENT_ACTIVE["$client"]=false
     CLIENT_ATTACHMENT_PENDING["$client"]=false
-    unset "CLIENT_ATTACHMENT_SUBNET[$client]" "CLIENT_BMI_UID[$client]"
+    unset "CLIENT_ATTACHMENT_SUBNET[$client]" "CLIENT_BMI_API_ID[$client]" \
+        "CLIENT_ATTACHMENT_UID[$client]"
 }
 
 write_agentless_e2e_helpers() {
@@ -7486,22 +7408,24 @@ def assert_client_leases(args: argparse.Namespace) -> None:
         try:
             network = ipaddress.ip_network(client["subnet"]["ipv4_cidr"], strict=True)
             address = ipaddress.IPv4Address(lease["address"])
-            expected_gateway = ipaddress.IPv4Address(client["subnet"]["gateway_ipv4"])
+            ipam = client["subnet"]["ipam"]
+            expected_gateway = ipaddress.IPv4Address(ipam["gateway_ipv4"])
             expected_mask = str(network.netmask)
-            start = ipaddress.IPv4Address(client["subnet"]["dhcp_range_start"])
-            end = ipaddress.IPv4Address(client["subnet"]["dhcp_range_end"])
+            physical_ranges = [ipaddress.ip_network(value, strict=True)
+                               for value in ipam["physical_ipv4_cidrs"]]
             gateway = ipaddress.IPv4Address(lease["router"])
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(f"client {name} lease or saved Subnet state is malformed") from error
         if not isinstance(network, ipaddress.IPv4Network) or not isinstance(address, ipaddress.IPv4Address):
             raise ValueError(f"client {name} did not receive IPv4")
-        if address not in network or not start <= address <= end:
-            raise ValueError(f"client {name} address {address} is outside its saved DHCP range")
+        if address not in network or not any(address in item for item in physical_ranges):
+            raise ValueError(f"client {name} address {address} is outside the saved physical IPAM ranges")
         if address in {network.network_address, network.broadcast_address, expected_gateway}:
             raise ValueError(f"client {name} address {address} conflicts with Subnet reservations")
-        vip_cidr = client["subnet"].get("vip_cidr", "")
-        if vip_cidr and address in ipaddress.ip_network(vip_cidr, strict=True):
-            raise ValueError(f"client {name} address {address} overlaps the saved VIP reservation")
+        vip_ranges = [ipaddress.ip_network(value, strict=True)
+                      for value in ipam["lb_vip_ipv4_cidrs"]]
+        if any(address in item for item in vip_ranges):
+            raise ValueError(f"client {name} address {address} overlaps the saved LB VIP range")
         if lease.get("netmask") != expected_mask or gateway != expected_gateway:
             raise ValueError(f"client {name} DHCP mask or router differs from its saved Subnet")
         if str(address) in seen_addresses:
@@ -7850,7 +7774,7 @@ copy_debug_client_log() {
     local client="$1" phase="$2" container
     [[ "$VLAN_E2E_DEBUG" == true && "$client" == b1 ]] || return 0
     container="$(client_container "$client")"
-    docker cp "$container:/tmp/osac-5530-udhcpc.log" \
+    docker cp "$container:/tmp/osac-6752-udhcpc.log" \
         "$TEMP_DIR/client-${client}-${phase}-udhcpc.log" >/dev/null 2>&1 || true
     [[ ! -f "$TEMP_DIR/client-${client}-${phase}-udhcpc.log" ]] \
         || chmod 0600 "$TEMP_DIR/client-${client}-${phase}-udhcpc.log"
@@ -7865,7 +7789,7 @@ capture_failed_dhcp_client_state() {
     local client="$1" phase="$2" container service_name
     [[ "$VLAN_E2E_DEBUG" == true ]] || return 0
     container="$(client_container "$client")"
-    service_name="agentless-dhcp-${FIRST_K8S_UID}"
+    service_name="agentless-dhcp-${FIRST_API_ID}"
     {
         printf 'client=%s\n' "$client"
         docker exec "$container" ps || true
@@ -7896,9 +7820,9 @@ capture_failed_dhcp_client_state() {
         netnode ip netns exec "$FIRST_PARENT_NAMESPACE" \
             ip -j address show dev "$SUBNET_THREE_VLAN_INTERFACE" || true
         netnode ip netns exec "$FIRST_PARENT_NAMESPACE" ss -lunp || true
-        netnode cat "/etc/agentless-net/dhcp/${FIRST_K8S_UID}/dnsmasq.conf" || true
-        netnode cat "/var/lib/agentless-net/dhcp/${FIRST_K8S_UID}/dnsmasq.leases" || true
-        netnode tail -n 100 "/var/log/agentless-net/dhcp/${FIRST_K8S_UID}.log" || true
+        netnode cat "/etc/agentless-net/dhcp/${FIRST_API_ID}/dnsmasq.conf" || true
+        netnode cat "/var/lib/agentless-net/dhcp/${FIRST_API_ID}/dnsmasq.leases" || true
+        netnode tail -n 100 "/var/log/agentless-net/dhcp/${FIRST_API_ID}.log" || true
     } >"$TEMP_DIR/dhcp-client-${client}-runtime-${phase}.txt" 2>&1
     chmod 0600 "$TEMP_DIR/dhcp-client-${client}-runtime-${phase}.txt"
 }
@@ -7929,13 +7853,13 @@ start_dhcp_client() {
     local client="$1" container lease_path link_carrier lease_db service_log capture_this_client capture_phase
     container="$(client_container "$client")"
     lease_path=/run/osac-dhcp/lease.json
-    lease_db="/var/lib/agentless-net/dhcp/$FIRST_K8S_UID/dnsmasq.leases"
-    service_log="/var/log/agentless-net/dhcp/$FIRST_K8S_UID.log"
+    lease_db="/var/lib/agentless-net/dhcp/$FIRST_API_ID/dnsmasq.leases"
+    service_log="/var/log/agentless-net/dhcp/$FIRST_API_ID.log"
     capture_this_client=false
     capture_phase=""
     if [[ "$VLAN_E2E_DEBUG" == true && "$client" == b1 ]]; then
         capture_this_client=true
-        if [[ -n "${SUBNET_THREE_K8S_UID:-}" ]]; then
+        if [[ -n "${SUBNET_THREE_API_ID:-}" ]]; then
             capture_phase=30
         else
             capture_phase=subnet-b
@@ -7949,16 +7873,16 @@ start_dhcp_client() {
     if [[ "$capture_this_client" == true ]]; then
         if [[ "$capture_phase" == 30 ]]; then
             start_dhcp_debug_captures "$container" "$SUBNET_THREE_VLAN_ID" \
-                "$capture_phase" "$SUBNET_THREE_K8S_UID" "$SUBNET_THREE_IPV4_CIDR" \
+                "$capture_phase" "$SUBNET_THREE_API_ID" "$SUBNET_THREE_IPV4_CIDR" \
                 "$SUBNET_THREE_VLAN_INTERFACE" "$SUBNET_THREE_AAP_JOB_ID"
         else
             start_dhcp_debug_captures "$container" "$SUBNET_TWO_VLAN_ID" \
-                "$capture_phase" "$SUBNET_TWO_K8S_UID" "$SUBNET_TWO_IPV4_CIDR" \
+                "$capture_phase" "$SUBNET_TWO_API_ID" "$SUBNET_TWO_IPV4_CIDR" \
                 "$SECOND_SUBNET_VLAN_INTERFACE" "$SUBNET_TWO_AAP_JOB_ID"
         fi
-        docker exec "$container" rm -f /tmp/osac-5530-udhcpc.log
+        docker exec "$container" rm -f /tmp/osac-6752-udhcpc.log
         docker exec -d "$container" sh -c \
-            'exec udhcpc -v -f -n -i eth0 -s /usr/local/sbin/osac-udhcpc-hook.sh -t 60 -T 2 >/tmp/osac-5530-udhcpc.log 2>&1'
+            'exec udhcpc -v -f -n -i eth0 -s /usr/local/sbin/osac-udhcpc-hook.sh -t 60 -T 2 >/tmp/osac-6752-udhcpc.log 2>&1'
     else
         docker exec -d "$container" udhcpc -f -n -i eth0 \
             -s /usr/local/sbin/osac-udhcpc-hook.sh -t 60 -T 2
@@ -8044,7 +7968,7 @@ detach_dhcp_client() {
         docker exec "$container" ip route flush dev eth0 || true
     fi
     offboard_client_from_subnet "$client" \
-        || die "Could not offboard DHCP client ${client} through osac-move-network-attachment"
+        || die "Could not remove DHCP client ${client} through delete_network_attachment"
 }
 
 cleanup_dhcp_clients_and_attachments() {
@@ -8131,7 +8055,7 @@ assert_real_client_leases() {
     local lease_file="$TEMP_DIR/dnsmasq-leases.txt" client
     local -a args=(assert-client-leases --expected "$CLIENT_EXPECTED_LEASES_FILE" \
         --dnsmasq-leases "$lease_file")
-    netnode cat "/var/lib/agentless-net/dhcp/${FIRST_K8S_UID}/dnsmasq.leases" >"$lease_file" \
+    netnode cat "/var/lib/agentless-net/dhcp/${FIRST_API_ID}/dnsmasq.leases" >"$lease_file" \
         || die "Could not read the saved dnsmasq lease file for the test VirtualNetwork"
     for client in "$@"; do
         args+=(--lease "$client=$TEMP_DIR/client-${client}.lease.json")
@@ -8157,223 +8081,204 @@ import sqlite3
 import sys
 
 path = pathlib.Path(sys.argv[1])
+empty = {
+    "schema_version": 0,
+    "state_contract": "",
+    "identity_semantics": "api-id",
+    "virtual_networks": [],
+    "subnets": [],
+    "external_ip_pools": [],
+    "external_ips": [],
+    "external_ip_attachments": [],
+    "nat_gateways": [],
+    "network_attachments": [],
+    "network_attachment_ports": [],
+    "deleted_resources": [],
+}
 if not path.exists():
-    print(json.dumps({
-        "schema_version": 0,
-        "virtual_networks": [],
-        "subnets": [],
-        "external_ip_pools": [],
-        "external_ips": [],
-        "external_ip_attachments": [],
-        "nat_gateways": [],
-    }, sort_keys=True))
+    print(json.dumps(empty, sort_keys=True))
     raise SystemExit(0)
-expected_virtual_network_columns = {
-    "uid", "tenant_id", "virtual_network_cidr", "namespace_name",
-    "namespace_interface", "host_interface", "transit_cidr", "transit_start",
-    "payload",
-}
-expected_subnet_columns = {
-    "uid", "virtual_network_uid", "tenant_id", "vlan_id", "vlan_interface",
-    "ipv4_cidr", "phase", "payload",
-}
-expected_external_ip_pool_columns = {
-    "uid", "fulfillment_id", "tenant_id", "ip_family", "ipv4_cidr",
-}
-expected_external_ip_columns = {
-    "uid", "fulfillment_id", "tenant_id", "pool_uid", "address",
-}
-expected_attachment_columns = {
-    "uid", "fulfillment_id", "tenant_id", "external_ip_uid",
-    "virtual_network_uid", "subnet_uid", "external_address", "phase", "payload",
-}
-expected_nat_gateway_columns = {
-    "uid", "fulfillment_id", "tenant_id", "external_ip_uid",
-    "virtual_network_uid", "external_address", "phase", "payload",
+expected_columns = {
+    "virtual_networks": ["uid", "tenant_id", "virtual_network_cidr", "namespace_name", "namespace_interface", "host_interface", "transit_cidr", "transit_start", "payload"],
+    "subnets": ["uid", "virtual_network_uid", "tenant_id", "vlan_id", "vlan_interface", "ipv4_cidr", "phase", "payload"],
+    "external_ip_pools": ["uid", "fulfillment_id", "tenant_id", "ip_family", "ipv4_cidr"],
+    "external_ips": ["uid", "fulfillment_id", "tenant_id", "pool_uid", "address"],
+    "attachments": ["uid", "fulfillment_id", "tenant_id", "external_ip_uid", "virtual_network_uid", "subnet_uid", "external_address", "phase", "payload"],
+    "nat_gateways": ["uid", "fulfillment_id", "tenant_id", "external_ip_uid", "virtual_network_uid", "external_address", "phase", "payload"],
+    "network_attachments": ["uid", "tenant_id", "virtual_network_uid", "subnet_uid", "host_name", "interface_name", "mac_address", "address", "phase", "payload"],
+    "network_attachment_ports": ["switch_name", "port_name", "attachment_uid"],
+    "deleted_resources": ["kind", "uid", "tenant_id"],
+    "state_metadata": ["key", "value"],
 }
 connection = None
 try:
     connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=60)
     connection.execute("BEGIN")
-    tables = {
-        row[0]
-        for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    }
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if tables != set(expected_columns):
+        raise SystemExit("AgentlessNet SQLite tables do not match the API-ID contract; preserving the file")
     version = connection.execute("PRAGMA user_version").fetchone()[0]
-    legacy_tables = {"virtual_networks", "subnets", "external_ip_pools", "external_ips"}
-    attachment_tables = legacy_tables | {"attachments"}
-    current_tables = attachment_tables | {"nat_gateways"}
-    if version != 1 or tables not in (legacy_tables, attachment_tables, current_tables):
-        raise SystemExit("AgentlessNet SQLite state is incompatible with schema v1; preserving it")
+    if version != 1:
+        raise SystemExit("AgentlessNet SQLite user_version is not 1; preserving the file")
+    for table, columns in expected_columns.items():
+        actual = [row[1] for row in connection.execute(f"PRAGMA table_info({table})")]
+        if actual != columns:
+            raise SystemExit(f"AgentlessNet SQLite {table} columns do not match the API-ID contract; preserving the file")
+    metadata = connection.execute("SELECT key, value FROM state_metadata ORDER BY key").fetchall()
+    if metadata != [("contract", "network-manager-api-id-v1")]:
+        raise SystemExit("AgentlessNet SQLite contract marker does not match; preserving the file")
 
-    virtual_network_columns = {
-        row[1]
-        for row in connection.execute("PRAGMA table_info(virtual_networks)")
-    }
-    subnet_columns = {
-        row[1]
-        for row in connection.execute("PRAGMA table_info(subnets)")
-    }
-    external_ip_pool_columns = {
-        row[1]
-        for row in connection.execute("PRAGMA table_info(external_ip_pools)")
-    }
-    external_ip_columns = {
-        row[1]
-        for row in connection.execute("PRAGMA table_info(external_ips)")
-    }
-    attachment_columns = set()
-    if "attachments" in tables:
-        attachment_columns = {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(attachments)")
-        }
-    nat_gateway_columns = set()
-    if "nat_gateways" in tables:
-        nat_gateway_columns = {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(nat_gateways)")
-        }
-    if (
-        virtual_network_columns != expected_virtual_network_columns
-        or subnet_columns != expected_subnet_columns
-        or external_ip_pool_columns != expected_external_ip_pool_columns
-        or external_ip_columns != expected_external_ip_columns
-        or ("attachments" in tables and attachment_columns != expected_attachment_columns)
-        or ("nat_gateways" in tables and nat_gateway_columns != expected_nat_gateway_columns)
-    ):
-        raise SystemExit("AgentlessNet SQLite table definitions are incompatible with schema v1; preserving it")
+    def payloads(table):
+        return [json.loads(row[0]) for row in connection.execute(f"SELECT payload FROM {table} ORDER BY uid")]
 
-    subnet_entries = [
-        json.loads(row[0])
-        for row in connection.execute("SELECT payload FROM subnets ORDER BY uid")
+    pools = [
+        {"uid": row[0], "api_id": row[0], "fulfillment_id": row[1], "tenant_id": row[2], "ip_family": row[3], "ipv4_cidr": row[4]}
+        for row in connection.execute("SELECT uid, fulfillment_id, tenant_id, ip_family, ipv4_cidr FROM external_ip_pools ORDER BY uid")
     ]
-    entries = [
-        json.loads(row[0])
-        for row in connection.execute("SELECT payload FROM virtual_networks ORDER BY uid")
+    ips = [
+        {"uid": row[0], "api_id": row[0], "fulfillment_id": row[1], "tenant_id": row[2], "pool_uid": row[3], "address": row[4]}
+        for row in connection.execute("SELECT uid, fulfillment_id, tenant_id, pool_uid, address FROM external_ips ORDER BY uid")
     ]
-    external_ip_pool_entries = [
-        {
-            "uid": row[0],
-            "fulfillment_id": row[1],
-            "tenant_id": row[2],
-            "ip_family": row[3],
-            "ipv4_cidr": row[4],
-        }
-        for row in connection.execute(
-            """SELECT uid, fulfillment_id, tenant_id, ip_family, ipv4_cidr
-               FROM external_ip_pools ORDER BY uid"""
-        )
+    attachments = [
+        {"uid": row[0], "api_id": row[0], "fulfillment_id": row[1], "tenant_id": row[2], "external_ip_uid": row[3], "virtual_network_uid": row[4], "subnet_uid": row[5], "external_address": row[6], "phase": row[7], "payload": json.loads(row[8])}
+        for row in connection.execute("SELECT uid, fulfillment_id, tenant_id, external_ip_uid, virtual_network_uid, subnet_uid, external_address, phase, payload FROM attachments ORDER BY uid")
     ]
-    external_ip_entries = [
-        {
-            "uid": row[0],
-            "fulfillment_id": row[1],
-            "tenant_id": row[2],
-            "pool_uid": row[3],
-            "address": row[4],
-        }
-        for row in connection.execute(
-            """SELECT uid, fulfillment_id, tenant_id, pool_uid, address
-               FROM external_ips ORDER BY uid"""
-        )
+    nat_gateways = [
+        {"uid": row[0], "api_id": row[0], "fulfillment_id": row[1], "tenant_id": row[2], "external_ip_uid": row[3], "virtual_network_uid": row[4], "external_address": row[5], "phase": row[6], "payload": json.loads(row[7])}
+        for row in connection.execute("SELECT uid, fulfillment_id, tenant_id, external_ip_uid, virtual_network_uid, external_address, phase, payload FROM nat_gateways ORDER BY uid")
     ]
-    attachment_entries = [
-        {
-            "uid": row[0],
-            "fulfillment_id": row[1],
-            "tenant_id": row[2],
-            "external_ip_uid": row[3],
-            "virtual_network_uid": row[4],
-            "subnet_uid": row[5],
-            "external_address": row[6],
-            "phase": row[7],
-            "payload": json.loads(row[8]),
-        }
-        for row in connection.execute(
-            """SELECT uid, fulfillment_id, tenant_id, external_ip_uid,
-                      virtual_network_uid, subnet_uid, external_address, phase, payload
-               FROM attachments ORDER BY uid"""
-        )
-    ] if "attachments" in tables else []
-    nat_gateway_entries = [
-        {
-            "uid": row[0],
-            "fulfillment_id": row[1],
-            "tenant_id": row[2],
-            "external_ip_uid": row[3],
-            "virtual_network_uid": row[4],
-            "external_address": row[5],
-            "phase": row[6],
-            "payload": json.loads(row[7]),
-        }
-        for row in connection.execute(
-            """SELECT uid, fulfillment_id, tenant_id, external_ip_uid,
-                      virtual_network_uid, external_address, phase, payload
-               FROM nat_gateways ORDER BY uid"""
-        )
-    ] if "nat_gateways" in tables else []
+    network_attachments = payloads("network_attachments")
+    for item in network_attachments:
+        item["api_id"] = item["uid"]
+    ports = [
+        {"switch_name": row[0], "port_name": row[1], "attachment_uid": row[2], "attachment_api_id": row[2]}
+        for row in connection.execute("SELECT switch_name, port_name, attachment_uid FROM network_attachment_ports ORDER BY switch_name, port_name")
+    ]
+    deleted = [
+        {"kind": row[0], "uid": row[1], "api_id": row[1], "tenant_id": row[2]}
+        for row in connection.execute("SELECT kind, uid, tenant_id FROM deleted_resources ORDER BY kind, uid")
+    ]
+    snapshot = {
+        "schema_version": version,
+        "state_contract": metadata[0][1],
+        "identity_semantics": "api-id",
+        "virtual_networks": payloads("virtual_networks"),
+        "subnets": payloads("subnets"),
+        "external_ip_pools": pools,
+        "external_ips": ips,
+        "external_ip_attachments": attachments,
+        "nat_gateways": nat_gateways,
+        "network_attachments": network_attachments,
+        "network_attachment_ports": ports,
+        "deleted_resources": deleted,
+    }
 except (OSError, sqlite3.DatabaseError, json.JSONDecodeError) as error:
     raise SystemExit("AgentlessNet SQLite state is unreadable; preserving it") from error
 finally:
     if connection is not None:
         connection.close()
-print(json.dumps({
-    "schema_version": version,
-    "virtual_networks": entries,
-    "subnets": subnet_entries,
-    "external_ip_pools": external_ip_pool_entries,
-    "external_ips": external_ip_entries,
-    "external_ip_attachments": attachment_entries,
-    "nat_gateways": nat_gateway_entries,
-}, sort_keys=True))
+print(json.dumps(snapshot, sort_keys=True))
 PY
 }
 
 save_current_state() {
     state_snapshot > "$CURRENT_STATE_FILE"
     jq -e '.schema_version == 1
+      and .state_contract == "network-manager-api-id-v1"
+      and .identity_semantics == "api-id"
       and (.virtual_networks | type == "array")
       and (.subnets | type == "array")
       and (.external_ip_pools | type == "array")
       and (.external_ips | type == "array")
       and (.external_ip_attachments | type == "array")
-      and (.nat_gateways | type == "array")' \
+      and (.nat_gateways | type == "array")
+      and (.network_attachments | type == "array")
+      and (.network_attachment_ports | type == "array")
+      and (.deleted_resources | type == "array")' \
         "$CURRENT_STATE_FILE" >/dev/null \
-        || die "AgentlessNet state is not a valid schema-v1 snapshot"
+        || die "AgentlessNet state is not a valid API-ID contract snapshot"
 }
 
 assert_baseline_state_unchanged() {
-    local collection uid before after
-    for collection in virtual_networks subnets external_ip_pools external_ips external_ip_attachments nat_gateways; do
-        while IFS= read -r uid; do
-            [[ -n "$uid" ]] || continue
-            before="$(jq -cS --arg uid "$uid" --arg collection "$collection" \
-                '.[$collection][] | select(.uid == $uid)' "$BASELINE_STATE_FILE")"
-            after="$(jq -cS --arg uid "$uid" --arg collection "$collection" \
-                '.[$collection][] | select(.uid == $uid)' "$CURRENT_STATE_FILE")"
-            [[ -n "$after" && "$before" == "$after" ]] \
-                || die "Pre-existing AgentlessNet ${collection} state for UID ${uid} changed during the test"
-        done < <(jq -r --arg collection "$collection" '.[$collection][].uid' "$BASELINE_STATE_FILE")
+    local collection row identity found
+    for collection in virtual_networks subnets external_ip_pools external_ips \
+        external_ip_attachments nat_gateways network_attachments network_attachment_ports deleted_resources; do
+        while IFS= read -r row; do
+            [[ -n "$row" ]] || continue
+            found="$(jq -e --arg collection "$collection" --argjson row "$row" \
+                'any(.[$collection][]; . == $row)' "$CURRENT_STATE_FILE" >/dev/null 2>&1 && echo true || echo false)"
+            identity="$(jq -r '.api_id // .attachment_api_id // .uid // .attachment_uid // "unknown"' <<<"$row")"
+            if [[ "$found" != true ]]; then
+                printf 'Pre-existing AgentlessNet %s state for API ID %s changed during the test\n' \
+                    "$collection" "$identity" >&2
+                return 1
+            fi
+        done < <(jq -cS --arg collection "$collection" '.[$collection][]' "$BASELINE_STATE_FILE")
     done
 }
 
 get_state_entry() {
-    local uid="$1"
+    local api_id="$1"
     save_current_state
-    jq -ce --arg uid "$uid" '
-      [.virtual_networks[] | select(.uid == $uid)]
-      | if length == 1 then .[0] else error("expected exactly one state entry for UID " + $uid) end' \
+    jq -ce --arg id "$api_id" '
+      [.virtual_networks[] | select(.uid == $id)]
+      | if length == 1 then .[0] else error("expected exactly one state entry for API ID " + $id) end' \
       "$CURRENT_STATE_FILE"
 }
 
 get_subnet_state_entry() {
-    local uid="$1"
+    local api_id="$1"
     save_current_state
-    jq -ce --arg uid "$uid" '
-      [.subnets[] | select(.uid == $uid)]
-      | if length == 1 then .[0] else error("expected exactly one Subnet state entry for UID " + $uid) end' \
+    jq -ce --arg id "$api_id" '
+      [.subnets[] | select(.uid == $id)]
+      | if length == 1 then .[0] else error("expected exactly one Subnet state entry for API ID " + $id) end' \
       "$CURRENT_STATE_FILE"
+}
+
+get_network_attachment_state_entry() {
+    local api_id="$1"
+    save_current_state
+    jq -ce --arg id "$api_id" '
+      [.network_attachments[] | select(.api_id == $id and .uid == $id)]
+      | if length == 1 then .[0] else error("expected one NetworkAttachment state row for API ID " + $id) end' \
+      "$CURRENT_STATE_FILE"
+}
+
+assert_network_attachment_state() {
+    local client="$1" api_id subnet_id mac address subnet_cr subnet_input vn_id entry ports
+    api_id="${CLIENT_BMI_API_ID[$client]:-}"
+    subnet_id="${CLIENT_ATTACHMENT_SUBNET[$client]:-}"
+    mac="$(tr '[:upper:]' '[:lower:]' <"$TEMP_DIR/client-${client}.mac" | tr -d '\r\n')"
+    address="$(jq -er '.address' "$TEMP_DIR/client-${client}.lease.json")" \
+        || die "DHCP client ${client} has no lease for NetworkAttachment state verification"
+    subnet_cr="$(subnet_cr_json "$subnet_id" "")"
+    subnet_input="$(jq -ce '.status.taskInput' <<<"$subnet_cr")"
+    vn_id="$(jq -er '.virtual_network.id' <<<"$subnet_input")"
+    entry="$(get_network_attachment_state_entry "$api_id")"
+    jq -e --arg id "$api_id" --arg tenant "$OSAC_TENANT" --arg subnet "$subnet_id" \
+        --arg vn "$vn_id" --arg host "osac-e2e-${client}" --arg mac "$mac" --arg address "$address" '
+      .api_id == $id and .uid == $id and .tenant_id == $tenant
+      and .subnet_uid == $subnet and .virtual_network_uid == $vn
+      and .host_name == $host and .interface_name == "eth0"
+      and .mac_address == $mac and .address == $address and .phase == "ready"
+      and (.ports | type == "array" and length > 0)
+      and ([.ports[] | select(.selected == true)] | length == 1)' \
+      <<<"$entry" >/dev/null || die "NetworkAttachment ${api_id} state does not match its API snapshots and DHCP lease"
+    ports="$(jq -ce --arg id "$api_id" \
+        '[.network_attachment_ports[] | select(.attachment_api_id == $id)]' "$CURRENT_STATE_FILE")"
+    [[ "$(jq -er 'length' <<<"$ports")" == "$(jq -er '.ports | length' <<<"$entry")" ]] \
+        || die "NetworkAttachment ${api_id} saved port claims differ from its state payload"
+}
+
+assert_network_attachment_state_absent() {
+    local api_id="$1"
+    save_current_state
+    jq -e --arg id "$api_id" --arg tenant "$OSAC_TENANT" '
+      all(.network_attachments[]; .api_id != $id and .uid != $id)
+      and all(.network_attachment_ports[]; .attachment_api_id != $id)
+      and any(.deleted_resources[]; .kind == "NetworkAttachment" and .api_id == $id and .tenant_id == $tenant)' \
+      "$CURRENT_STATE_FILE" >/dev/null \
+        || die "NetworkAttachment ${api_id} remains claimed or has no delete tombstone"
 }
 
 get_external_ip_pool_state_entry() {
@@ -8398,22 +8303,24 @@ assert_virtual_network_state() {
     local fulfillment_id="$1"
     local expected_cidr="$2"
     local peer_fulfillment_id="${3:-}"
-    local cr_json cr_uid cr_name backend_id cr_cidr entry transit_cidr namespace_name
+    local cr_json cr_api_id cr_name backend_id cr_cidr entry transit_cidr namespace_name
     local host_interface namespace_interface namespace_ip host_ip gateway
     local expected_addresses host_address_json namespace_address_json
     local host_link_json namespace_link_json route_json all_routes policy rules
 
     cr_json="$(virtual_network_cr_json "$fulfillment_id")"
-    cr_uid="$(jq -r '.metadata.uid' <<<"$cr_json")"
+    cr_api_id="$(jq -r '.metadata.labels["osac.openshift.io/virtualnetwork-uuid"]' <<<"$cr_json")"
     cr_name="$(jq -r '.metadata.name' <<<"$cr_json")"
     backend_id="$(jq -r '.status.backendNetworkId // ""' <<<"$cr_json")"
     cr_cidr="$(jq -r '.spec.ipv4Cidr' <<<"$cr_json")"
-    [[ -n "$cr_uid" && "$backend_id" == "$cr_uid" ]] \
-        || die "VirtualNetwork ${fulfillment_id} does not report its Kubernetes UID as backendNetworkId"
+    [[ "$cr_api_id" == "$fulfillment_id" ]] \
+        || die "VirtualNetwork ${fulfillment_id} CR does not retain its API ID"
+    [[ -z "$backend_id" || "$backend_id" == "$fulfillment_id" ]] \
+        || die "VirtualNetwork ${fulfillment_id} reports an unexpected backend ID"
     [[ "$cr_cidr" == "$expected_cidr" ]] \
         || die "VirtualNetwork ${fulfillment_id} CR CIDR changed from the request"
 
-    entry="$(get_state_entry "$cr_uid")"
+    entry="$(get_state_entry "$cr_api_id")"
     [[ "$(jq -r '.virtual_network_cidr' <<<"$entry")" == "$expected_cidr" ]] \
         || die "Saved provider CIDR does not match the VirtualNetwork CR"
     transit_cidr="$(jq -r '.transit.cidr' <<<"$entry")"
@@ -8438,10 +8345,10 @@ assert_virtual_network_state() {
         || die "Linux namespace ${namespace_name} is absent"
 
     host_link_json="$(netnode ip -j -d link show dev "$host_interface")"
-    jq -e --arg alias "osac-vn:${cr_uid}" '
+    jq -e --arg alias "osac-vn:${cr_api_id}" '
       length == 1 and .[0].ifalias == $alias and .[0].linkinfo.info_kind == "veth"
       and (.[0].flags | index("UP") != null)' <<<"$host_link_json" >/dev/null \
-        || die "Host uplink ${host_interface} is not the expected UID-owned veth in UP state"
+        || die "Host uplink ${host_interface} is not the expected API-ID-owned veth in UP state"
     namespace_link_json="$(netnode ip netns exec "$namespace_name" ip -j -d link show dev "$namespace_interface")"
     jq -e --arg name "$namespace_interface" '
       length == 1 and .[0].ifname == $name and (.[0].flags | index("UP") != null)' \
@@ -8487,7 +8394,7 @@ assert_virtual_network_state() {
     netnode ip netns exec "$namespace_name" ping -n -I "$namespace_interface" -c 1 -W 2 "$gateway" \
         >/dev/null 2>&1 || die "Namespace ${namespace_name} cannot reach its host gateway ${gateway}"
 
-    info "Verified Fulfillment ID ${fulfillment_id}, CR ${cr_name}, Kubernetes UID ${cr_uid}, /31 ${transit_cidr}, gateway ${gateway}"
+    info "Verified VirtualNetwork API ID ${fulfillment_id}, CR ${cr_name}, /31 ${transit_cidr}, gateway ${gateway}"
 }
 
 assert_vlan_on_switches() {
@@ -8559,89 +8466,99 @@ assert_new_vlans_avoid_baseline() {
 
 assert_subnet_state() {
     local fulfillment_id="$1" parent_fulfillment_id="$2" expected_cidr="$3"
-    local cr_json parent_cr parent_uid cr_uid cr_name entry parent_entry
-    local vlan_id vlan_interface namespace_name gateway dhcp_start dhcp_end
-    local expected_gateway expected_dhcp_start expected_dhcp_end expected_netmask
+    local cr_json parent_cr subnet_api_id parent_api_id cr_name entry parent_entry ipam
+    local vlan_id vlan_interface namespace_name gateway network_address expected_netmask
     local link_json address_json config_path config service_status socket_output
 
     cr_json="$(subnet_cr_json "$fulfillment_id" "$parent_fulfillment_id")"
     parent_cr="$(virtual_network_cr_json "$parent_fulfillment_id")"
-    cr_uid="$(jq -r '.metadata.uid' <<<"$cr_json")"
-    parent_uid="$(jq -r '.metadata.uid' <<<"$parent_cr")"
+    subnet_api_id="$(jq -er '.metadata.labels["osac.openshift.io/subnet-uuid"]' <<<"$cr_json")"
+    parent_api_id="$(jq -er '.metadata.labels["osac.openshift.io/virtualnetwork-uuid"]' <<<"$parent_cr")"
     cr_name="$(jq -r '.metadata.name' <<<"$cr_json")"
-    [[ -n "$cr_uid" ]] || die "Subnet ${fulfillment_id} has no Kubernetes UID"
+    [[ "$subnet_api_id" == "$fulfillment_id" && "$parent_api_id" == "$parent_fulfillment_id" ]] \
+        || die "Subnet or VirtualNetwork API ID label does not match its Fulfillment ID"
     [[ "$(jq -r '.spec.ipv4Cidr' <<<"$cr_json")" == "$expected_cidr" ]] \
         || die "Subnet ${fulfillment_id} CR CIDR changed from the request"
-    [[ "$(jq -r '.status.phase' <<<"$cr_json")" == Ready ]] \
-        || die "Subnet ${fulfillment_id} CR is not Ready"
     jq -e '.status.conditions | any(.[]?; .type == "Ready" and .status == "True")' \
         <<<"$cr_json" >/dev/null || die "Subnet ${fulfillment_id} has no successful Ready condition"
 
-    entry="$(get_subnet_state_entry "$cr_uid")"
-    parent_entry="$(get_state_entry "$parent_uid")"
-    jq -e --arg uid "$cr_uid" --arg parent "$parent_uid" --arg tenant "$OSAC_TENANT" \
+    entry="$(get_subnet_state_entry "$subnet_api_id")"
+    parent_entry="$(get_state_entry "$parent_api_id")"
+    ipam="$(jq -ce '.status.taskInput.ipam | select(type == "object")' <<<"$cr_json")" \
+        || die "Subnet ${fulfillment_id} has no captured IPAM task input"
+    jq -e --arg id "$subnet_api_id" --arg parent "$parent_api_id" --arg tenant "$OSAC_TENANT" \
         --arg cidr "$expected_cidr" '
-      ((keys | sort) == ["dhcp_range_end","dhcp_range_start","gateway_ipv4","ipv4_cidr","phase","tenant_id","trunk_interface","uid","vip_cidr","virtual_network_uid","vlan_id","vlan_interface"])
-      and .uid == $uid
+      ((keys | sort) == ["ipam","ipv4_cidr","phase","tenant_id","trunk_interface","uid","vlan_id","vlan_interface","virtual_network_uid"])
+      and .uid == $id
       and .virtual_network_uid == $parent
       and .tenant_id == $tenant
       and .ipv4_cidr == $cidr
       and .phase == "ready"
       and (.vlan_id | type == "number" and . >= 1 and . <= 4094)' \
       <<<"$entry" >/dev/null || die "Saved AgentlessNet Subnet state does not match the Ready Fulfillment resource"
+    jq -e --argjson expected "$ipam" '
+      .ipam == $expected
+      and .status.ipam.gatewayIPv4 == $expected.gateway_ipv4
+      and (.status.ipam.overlayIPv4CIDRs // []) == $expected.overlay_ipv4_cidrs
+      and (.status.ipam.physicalIPv4CIDRs // []) == $expected.physical_ipv4_cidrs
+      and (.status.ipam.lbVipIPv4CIDRs // []) == $expected.lb_vip_ipv4_cidrs' \
+      <<<"$(jq -n --argjson status "$(jq -c '.status' <<<"$cr_json")" --argjson state "$entry" \
+          '{ipam:$state.ipam,status:$status}')" >/dev/null \
+        || die "Subnet ${fulfillment_id} stored and observed IPAM differ"
 
     vlan_id="$(jq -r '.vlan_id' <<<"$entry")"
     vlan_interface="$(jq -r '.vlan_interface' <<<"$entry")"
     namespace_name="$(jq -r '.namespace_name' <<<"$parent_entry")"
-    gateway="$(jq -r '.gateway_ipv4' <<<"$entry")"
-    dhcp_start="$(jq -r '.dhcp_range_start' <<<"$entry")"
-    dhcp_end="$(jq -r '.dhcp_range_end' <<<"$entry")"
-    read -r expected_gateway expected_dhcp_start expected_dhcp_end expected_netmask \
-        < <(python3 -c 'import ipaddress,sys; n=ipaddress.ip_network(sys.argv[1], strict=True); print(n.network_address+1, n.network_address+2, n.broadcast_address-1, n.netmask)' "$expected_cidr")
-    [[ "$gateway" == "$expected_gateway" && "$dhcp_start" == "$expected_dhcp_start" \
-        && "$dhcp_end" == "$expected_dhcp_end" ]] \
-        || die "Subnet ${fulfillment_id} gateway or DHCP range is incorrect"
+    gateway="$(jq -r '.ipam.gateway_ipv4' <<<"$entry")"
+    read -r network_address expected_netmask \
+        < <(python3 -c 'import ipaddress,sys; n=ipaddress.ip_network(sys.argv[1], strict=True); print(n.network_address, n.netmask)' "$expected_cidr")
+    jq -e --argjson prefix "${expected_cidr#*/}" '
+      (.physical_ipv4_cidrs | length > 0)
+      and (.overlay_ipv4_cidrs | length == 0)
+      and (.lb_vip_ipv4_cidrs | length == 0)' <<<"$ipam" >/dev/null \
+        || die "Subnet ${fulfillment_id} IPAM is not all-physical"
 
     link_json="$(netnode ip netns exec "$namespace_name" ip -j -d link show dev "$vlan_interface")"
-    jq -e --arg alias "osac-subnet:${cr_uid}" --argjson vlan "$vlan_id" '
+    jq -e --arg alias "osac-subnet:${subnet_api_id}" --argjson vlan "$vlan_id" '
       length == 1 and .[0].ifalias == $alias and .[0].linkinfo.info_kind == "vlan"
       and (.[0].linkinfo.info_data.id | tonumber) == $vlan
       and (.[0].flags | index("UP") != null)' <<<"$link_json" >/dev/null \
-        || die "Subnet VLAN interface ${vlan_interface} is not UID-owned, up, and tagged ${vlan_id}"
+        || die "Subnet VLAN interface ${vlan_interface} is not API-ID-owned, up, and tagged ${vlan_id}"
     address_json="$(netnode ip netns exec "$namespace_name" ip -j -4 address show dev "$vlan_interface")"
     jq -e --arg ip "$gateway" --argjson prefix "${expected_cidr#*/}" \
         'any(.[].addr_info[]?; .family == "inet" and .local == $ip and .prefixlen == $prefix)' \
         <<<"$address_json" >/dev/null \
         || die "Subnet gateway ${gateway}/${expected_cidr#*/} is absent from ${vlan_interface}"
 
-    config_path="/etc/agentless-net/dhcp/${parent_uid}/dnsmasq.conf"
+    config_path="/etc/agentless-net/dhcp/${parent_api_id}/dnsmasq.conf"
     config="$(netnode cat "$config_path")" \
         || die "Per-VirtualNetwork DHCP configuration is missing for Subnet ${fulfillment_id}"
     grep -Fxq "interface=${vlan_interface}" <<<"$config" \
         || die "DHCP does not bind to Subnet interface ${vlan_interface}"
-    grep -Fxq "dhcp-range=set:${vlan_interface},${dhcp_start},${dhcp_end},${expected_netmask},12h" <<<"$config" \
-        || die "DHCP range does not match saved Subnet state for ${fulfillment_id}"
+    grep -Fxq "dhcp-range=set:${vlan_interface},${network_address},static,${expected_netmask},12h" <<<"$config" \
+        || die "DHCP static range does not match the Subnet IPAM for ${fulfillment_id}"
     grep -Fxq "dhcp-option=tag:${vlan_interface},option:router,${gateway}" <<<"$config" \
         || die "DHCP router option does not match Subnet gateway ${gateway}"
     netnode dnsmasq --test --conf-file="$config_path" >/dev/null 2>&1 \
         || die "dnsmasq rejected the combined DHCP configuration for VirtualNetwork ${parent_uid}"
     service_status="$(netnode supervisorctl -c /etc/agentless-net/supervisord.conf \
-        status "agentless-dhcp-${parent_uid}")"
+        status "agentless-dhcp-${parent_api_id}")"
     grep -Fq ' RUNNING ' <<<"$service_status" \
         || die "Per-VirtualNetwork DHCP Supervisor service is not running"
     socket_output="$(netnode ip netns exec "$namespace_name" ss -H -lun)"
     grep -Eq ':67([[:space:]]|$)' <<<"$socket_output" \
         || die "DHCP UDP port 67 is not listening inside namespace ${namespace_name}"
     assert_vlan_on_switches "$vlan_id" true
-    info "Verified Subnet ${fulfillment_id} (${cr_name}), gateway ${gateway}, VLAN ${vlan_id}, and DHCP range ${dhcp_start}-${dhcp_end}"
+    info "Verified Subnet ${fulfillment_id} (${cr_name}), gateway ${gateway}, VLAN ${vlan_id}, and physical IPAM ${expected_cidr}"
 }
 
 assert_uid_subnet_state_absent() {
     local uid="$1" parent_uid="$2" namespace_name="$3" vlan_interface="$4" vlan_id="$5"
     local config_path config
     save_current_state
-    jq -e --arg uid "$uid" 'all(.subnets[]; .uid != $uid)' "$CURRENT_STATE_FILE" >/dev/null \
-        || die "Deleted Subnet UID ${uid} remains in provider state"
+    jq -e --arg id "$uid" 'all(.subnets[]; .uid != $id)
+      and any(.deleted_resources[]; .kind == "Subnet" and .api_id == $id)' "$CURRENT_STATE_FILE" >/dev/null \
+        || die "Deleted Subnet API ID ${uid} remains in provider state or lacks its tombstone"
     if netnode ip netns exec "$namespace_name" ip link show dev "$vlan_interface" >/dev/null 2>&1; then
         die "Deleted Subnet VLAN interface ${vlan_interface} remains in namespace ${namespace_name}"
     fi
@@ -8669,15 +8586,15 @@ assert_virtual_network_dhcp_absent() {
 
 assert_private_vn_isolation() {
     local first_id="$1" peer_id="$2"
-    local first_json peer_json first_uid peer_uid first_entry peer_entry
+    local first_json peer_json first_api_id peer_api_id first_entry peer_entry
     local first_ns first_if peer_ip peer_ns peer_if
     first_json="$(virtual_network_cr_json "$first_id")"
     peer_json="$(virtual_network_cr_json "$peer_id")"
-    first_uid="$(jq -r '.metadata.uid' <<<"$first_json")"
-    peer_uid="$(jq -r '.metadata.uid' <<<"$peer_json")"
-    [[ "$first_uid" != "$peer_uid" ]] || die "Overlapping VirtualNetworks share a Kubernetes UID"
-    first_entry="$(get_state_entry "$first_uid")"
-    peer_entry="$(get_state_entry "$peer_uid")"
+    first_api_id="$(jq -er '.metadata.labels["osac.openshift.io/virtualnetwork-uuid"]' <<<"$first_json")"
+    peer_api_id="$(jq -er '.metadata.labels["osac.openshift.io/virtualnetwork-uuid"]' <<<"$peer_json")"
+    [[ "$first_api_id" != "$peer_api_id" ]] || die "Overlapping VirtualNetworks share an API ID"
+    first_entry="$(get_state_entry "$first_api_id")"
+    peer_entry="$(get_state_entry "$peer_api_id")"
     [[ "$(jq -r '.transit.cidr' <<<"$first_entry")" != "$(jq -r '.transit.cidr' <<<"$peer_entry")" ]] \
         || die "Overlapping VirtualNetworks share a transit /31"
     first_ns="$(jq -r '.namespace_name' <<<"$first_entry")"
@@ -8710,10 +8627,12 @@ delete_virtual_network_by_id() {
         if [[ "$count" == 0 ]]; then
             break
         fi
-        job_id="$(jq -r '[.items[0].status.provisioningJobs[]? | select(.type == "deprovision") | .jobID] | last // ""' <<<"$current")"
-        job_state="$(jq -r '[.items[0].status.provisioningJobs[]? | select(.type == "deprovision") | .state] | last // ""' <<<"$current")"
-        [[ "$job_state" != Failed && "$job_state" != Canceled ]] \
-            || die "AAP deprovision job failed while deleting test-owned UUID ${id}"
+        local vn_cr
+        vn_cr="$(jq -c '.items[0]' <<<"$current")"
+        job_id="$(network_task_job_id "$vn_cr" delete_virtual_network)"
+        job_state="$(network_task_state "$vn_cr" delete_virtual_network)"
+        [[ "$job_state" != Failed && "$job_state" != Cancelled ]] \
+            || die "AAP delete_virtual_network job failed while deleting test-owned API ID ${id}"
         [[ -z "$job_id" ]] || LAST_DELETE_AAP_JOB_ID="$job_id"
         sleep 2
     done
@@ -8794,11 +8713,9 @@ create_external_ip_pool() {
 
     printf 'ExternalIPPool Fulfillment UUID: %s\n' "$EXTERNAL_IP_POOL_ID"
     wait_for_external_ip_pool_ready "$EXTERNAL_IP_POOL_ID"
-    [[ "$EXTERNAL_IP_POOL_K8S_UID" != "$EXTERNAL_IP_POOL_ID" ]] \
-        || die "ExternalIPPool Kubernetes UID and Fulfillment UUID unexpectedly match"
     EXTERNAL_IP_POOL_INITIAL_ENTRY="$(get_external_ip_pool_state_entry \
-        "$EXTERNAL_IP_POOL_K8S_UID" "$EXTERNAL_IP_POOL_ID")"
-    jq -e --arg uid "$EXTERNAL_IP_POOL_K8S_UID" --arg id "$EXTERNAL_IP_POOL_ID" \
+        "$EXTERNAL_IP_POOL_API_ID" "$EXTERNAL_IP_POOL_ID")"
+    jq -e --arg uid "$EXTERNAL_IP_POOL_API_ID" --arg id "$EXTERNAL_IP_POOL_ID" \
         --arg cidr "$EXTERNAL_IP_POOL_CIDR" '
       .uid == $uid
       and .fulfillment_id == $id
@@ -8808,7 +8725,7 @@ create_external_ip_pool() {
         || die "Saved AgentlessNet ExternalIPPool identity does not match the CR"
     [[ -n "$EXTERNAL_IP_POOL_CREATE_AAP_JOB_ID" ]] \
         || die "No successful AAP provision job ID was recorded for ExternalIPPool ${EXTERNAL_IP_POOL_ID}"
-    info "ExternalIPPool ${EXTERNAL_IP_POOL_ID} is Ready; Kubernetes UID ${EXTERNAL_IP_POOL_K8S_UID}; AAP job ${EXTERNAL_IP_POOL_CREATE_AAP_JOB_ID}"
+    info "ExternalIPPool ${EXTERNAL_IP_POOL_ID} is Ready; provider state is keyed by API ID; AAP job ${EXTERNAL_IP_POOL_CREATE_AAP_JOB_ID}"
     assert_baseline_state_unchanged
 }
 
@@ -8819,10 +8736,10 @@ delete_external_ip_pool() {
     local current_entry
 
     [[ "$EXTERNAL_IP_POOL_PENDING_CLEANUP" == true \
-        && -n "$EXTERNAL_IP_POOL_ID" && -n "$EXTERNAL_IP_POOL_K8S_UID" ]] \
+        && -n "$EXTERNAL_IP_POOL_ID" && -n "$EXTERNAL_IP_POOL_API_ID" ]] \
         || die "ExternalIPPool test identity is incomplete before deletion"
     current_entry="$(get_external_ip_pool_state_entry \
-        "$EXTERNAL_IP_POOL_K8S_UID" "$EXTERNAL_IP_POOL_ID")"
+        "$EXTERNAL_IP_POOL_API_ID" "$EXTERNAL_IP_POOL_ID")"
     [[ "$current_entry" == "$EXTERNAL_IP_POOL_INITIAL_ENTRY" ]] \
         || die "ExternalIPPool provider state changed during the VLAN/Subnet test"
 
@@ -8834,7 +8751,7 @@ delete_external_ip_pool() {
             die "Private Fulfillment could not delete ExternalIPPool ${EXTERNAL_IP_POOL_ID}"
         fi
     fi
-    wait_for_external_ip_pool_removed "$EXTERNAL_IP_POOL_ID" "$EXTERNAL_IP_POOL_K8S_UID" \
+    wait_for_external_ip_pool_removed "$EXTERNAL_IP_POOL_ID" "$EXTERNAL_IP_POOL_API_ID" \
         || die "ExternalIPPool ${EXTERNAL_IP_POOL_ID} was not completely removed"
     [[ -z "$EXTERNAL_IP_POOL_DELETE_AAP_JOB_ID" ]] \
         || info "Observed ExternalIPPool AAP delete job ID: ${EXTERNAL_IP_POOL_DELETE_AAP_JOB_ID}"
@@ -8846,16 +8763,17 @@ delete_external_ip_pool() {
 assert_uid_provider_state_absent() {
     local uid="$1" namespace_name="$2" host_interface="$3" namespace_list
     save_current_state
-    jq -e --arg uid "$uid" 'all(.virtual_networks[]; .uid != $uid)' "$CURRENT_STATE_FILE" >/dev/null \
-        || die "Deleted VirtualNetwork UID ${uid} remains in provider state"
-    jq -e --arg uid "$uid" 'all(.subnets[]; .virtual_network_uid != $uid)' "$CURRENT_STATE_FILE" >/dev/null \
-        || die "Deleted VirtualNetwork UID ${uid} still has Subnet provider state"
+    jq -e --arg id "$uid" 'all(.virtual_networks[]; .uid != $id)
+      and any(.deleted_resources[]; .kind == "VirtualNetwork" and .api_id == $id)' "$CURRENT_STATE_FILE" >/dev/null \
+        || die "Deleted VirtualNetwork API ID ${uid} remains in provider state or lacks its tombstone"
+    jq -e --arg id "$uid" 'all(.subnets[]; .virtual_network_uid != $id)' "$CURRENT_STATE_FILE" >/dev/null \
+        || die "Deleted VirtualNetwork API ID ${uid} still has Subnet provider state"
     namespace_list="$(netnode ip netns list)"
     if awk -v name="$namespace_name" '$1 == name { found=1 } END { exit !found }' <<<"$namespace_list"; then
         die "Deleted namespace ${namespace_name} remains on the test node"
     fi
     if netnode ip -j -d link show dev "$host_interface" >/dev/null 2>&1; then
-        die "Deleted UID-owned host uplink ${host_interface} remains on the test node"
+        die "Deleted API-ID-owned host uplink ${host_interface} remains on the test node"
     fi
 }
 
@@ -8899,8 +8817,8 @@ if not transit.subnet_of(parent):
 
 def validate(value, label):
     network = ipaddress.ip_network(value, strict=True)
-    if not isinstance(network, ipaddress.IPv4Network) or network.prefixlen > 30 or str(network) != value:
-        raise SystemExit(f"{label} must be a canonical IPv4 subnet of /30 or larger")
+    if not isinstance(network, ipaddress.IPv4Network) or network.prefixlen > 28 or str(network) != value:
+        raise SystemExit(f"{label} must be a canonical IPv4 subnet of /28 or larger")
     if not network.subnet_of(parent):
         raise SystemExit(f"{label} must be inside the requested VirtualNetwork")
     if network.overlaps(transit):
@@ -8956,8 +8874,8 @@ if any(not value.subnet_of(parent) for value in transits):
 
 def validate(value: str, label: str):
     network = ipaddress.ip_network(value, strict=True)
-    if not isinstance(network, ipaddress.IPv4Network) or network.prefixlen > 30 or str(network) != value:
-        raise SystemExit(f"{label} must be a canonical IPv4 subnet of /30 or larger")
+    if not isinstance(network, ipaddress.IPv4Network) or network.prefixlen > 28 or str(network) != value:
+        raise SystemExit(f"{label} must be a canonical IPv4 subnet of /28 or larger")
     if not network.subnet_of(parent) or any(network.overlaps(transit) for transit in transits):
         raise SystemExit(f"{label} must be inside the parent and outside both transit ranges")
     return network
@@ -8991,21 +8909,21 @@ PY
 
 create_nat_gateway_subnet() {
     local name="$1" parent_id="$2" cidr="$3" output_file="$4"
-    local id cr uid job_id
+    local id cr api_id job_id
     create_subnet "$name" "$parent_id" "$cidr" "$output_file" \
         || die "Could not create NATGateway test Subnet ${name}"
     id="$(<"${output_file}.id")"
     cr="$(wait_for_subnet_cr_created "$id" "$parent_id")"
-    uid="$(jq -er '.metadata.uid' <<<"$cr")" \
-        || die "NATGateway test Subnet ${id} has no Kubernetes UID"
+    api_id="$(jq -er '.metadata.labels["osac.openshift.io/subnet-uuid"]' <<<"$cr")" \
+        || die "NATGateway test Subnet ${id} has no API ID label"
     wait_for_subnet_ready "$id" "$parent_id"
     cr="$(subnet_cr_json "$id" "$parent_id")"
-    job_id="$(jq -er '.status.provisioningJobs | map(.jobID // empty) | last' <<<"$cr")" \
+    job_id="$(network_task_job_id "$cr" create_subnet)" \
         || die "NATGateway test Subnet ${id} has no AAP provision job"
     wait_for_subnet_aap_provision_success "$id" "$parent_id" "$job_id"
     assert_subnet_state "$id" "$parent_id" "$cidr"
     LAST_NAT_GATEWAY_SUBNET_ID="$id"
-    LAST_NAT_GATEWAY_SUBNET_UID="$uid"
+    LAST_NAT_GATEWAY_SUBNET_UID="$api_id"
     LAST_NAT_GATEWAY_SUBNET_CIDR="$cidr"
 }
 
@@ -9037,7 +8955,7 @@ attach_nat_gateway_dhcp_client() {
     assert_client_gateway "$client" "$subnet_entry"
 }
 
-resolve_test_subnet_30_cidr() {
+resolve_test_subnet_28_cidr() {
     local parent_cidr="$1" transit_cidr="$2" used_cidr="$3" subnet_output
     subnet_output="$(python3 - "$parent_cidr" "$transit_cidr" "$used_cidr" \
         "$SUBNET_THREE_IPV4_CIDR" <<'PY'
@@ -9054,18 +8972,18 @@ if not used.subnet_of(parent) or used.overlaps(transit):
     raise SystemExit("The active Subnet CIDR is outside its parent or overlaps transit")
 if override:
     candidate = ipaddress.ip_network(override, strict=True)
-    if not isinstance(candidate, ipaddress.IPv4Network) or candidate.prefixlen != 30 or str(candidate) != override:
-        raise SystemExit("SUBNET_THREE_IPV4_CIDR must be a canonical IPv4 /30")
+    if not isinstance(candidate, ipaddress.IPv4Network) or candidate.prefixlen != 28 or str(candidate) != override:
+        raise SystemExit("SUBNET_THREE_IPV4_CIDR must be a canonical IPv4 /28")
     if not candidate.subnet_of(parent) or candidate.overlaps(transit) or candidate.overlaps(used):
         raise SystemExit("SUBNET_THREE_IPV4_CIDR overlaps an excluded network")
 else:
-    candidate = next((network for network in parent.subnets(new_prefix=30)
+    candidate = next((network for network in parent.subnets(new_prefix=28)
                       if not network.overlaps(transit) and not network.overlaps(used)), None)
     if candidate is None:
-        raise SystemExit("VirtualNetwork CIDR has no free /30 test Subnet outside transit and active Subnets")
+        raise SystemExit("VirtualNetwork CIDR has no free /28 test Subnet outside transit and active Subnets")
 print(candidate)
 PY
-    )" || die "Could not select a non-overlapping /30 test Subnet"
+    )" || die "Could not select a non-overlapping /28 test Subnet"
     SUBNET_THREE_IPV4_CIDR="$subnet_output"
 }
 
@@ -9106,10 +9024,10 @@ create_primary_virtual_network_for_suite() {
     wait_for_virtual_network_ready "$FIRST_FULFILLMENT_ID"
     FIRST_CR="$(virtual_network_cr_json "$FIRST_FULFILLMENT_ID")"
     FIRST_CR_NAME="$(jq -er '.metadata.name' <<<"$FIRST_CR")"
-    FIRST_K8S_UID="$(jq -er '.metadata.uid' <<<"$FIRST_CR")"
-    FIRST_AAP_JOB_ID="$(jq -er '.status.provisioningJobs | map(.jobID // empty) | last' <<<"$FIRST_CR")"
+    FIRST_API_ID="$(jq -er '.metadata.labels["osac.openshift.io/virtualnetwork-uuid"]' <<<"$FIRST_CR")"
+    FIRST_AAP_JOB_ID="$(network_task_job_id "$FIRST_CR" create_virtual_network)"
     wait_for_aap_provision_success "$FIRST_FULFILLMENT_ID" "$FIRST_AAP_JOB_ID"
-    FIRST_ENTRY="$(get_state_entry "$FIRST_K8S_UID")"
+    FIRST_ENTRY="$(get_state_entry "$FIRST_API_ID")"
     FIRST_NAMESPACE_NAME="$(jq -r '.namespace_name' <<<"$FIRST_ENTRY")"
     FIRST_HOST_INTERFACE="$(jq -r '.uplink.host_interface' <<<"$FIRST_ENTRY")"
     assert_virtual_network_state "$FIRST_FULFILLMENT_ID" "$VIRTUAL_NETWORK_IPV4_CIDR"
@@ -9124,7 +9042,7 @@ create_external_ip_attachment_test_network_and_client() {
     if [[ -z "${FIRST_FULFILLMENT_ID:-}" ]]; then
         create_primary_virtual_network_for_suite
     fi
-    entry="$(get_state_entry "$FIRST_K8S_UID")"
+    entry="$(get_state_entry "$FIRST_API_ID")"
     transit_cidr="$(jq -er '.transit.cidr' <<<"$entry")" \
         || die "Test VirtualNetwork has no saved transit CIDR"
     if [[ -n "$EXTERNAL_IP_ATTACHMENT_SUBNET_CIDR" ]]; then
@@ -9140,9 +9058,9 @@ create_external_ip_attachment_test_network_and_client() {
     wait_for_subnet_ready "$EXTERNAL_IP_ATTACHMENT_SUBNET_ID" "$FIRST_FULFILLMENT_ID"
     EXTERNAL_IP_ATTACHMENT_SUBNET_CR="$(subnet_cr_json \
         "$EXTERNAL_IP_ATTACHMENT_SUBNET_ID" "$FIRST_FULFILLMENT_ID")"
-    EXTERNAL_IP_ATTACHMENT_SUBNET_UID="$(jq -er '.metadata.uid' \
+    EXTERNAL_IP_ATTACHMENT_SUBNET_API_ID="$(jq -er '.metadata.labels["osac.openshift.io/subnet-uuid"]' \
         <<<"$EXTERNAL_IP_ATTACHMENT_SUBNET_CR")" \
-        || die "ExternalIPAttachment test Subnet has no Kubernetes UID"
+        || die "ExternalIPAttachment test Subnet has no API ID label"
     assert_subnet_state "$EXTERNAL_IP_ATTACHMENT_SUBNET_ID" "$FIRST_FULFILLMENT_ID" \
         "$EXTERNAL_IP_ATTACHMENT_SUBNET_CIDR"
 
@@ -9163,8 +9081,8 @@ create_external_ip_attachment_test_network_and_client() {
     attach_client_to_subnet "$client" "$EXTERNAL_IP_ATTACHMENT_SUBNET_ID"
     start_dhcp_client "$client"
     discover_client_dhcp_lease "$client"
-    EXTERNAL_IP_SYNTHETIC_TARGET_ID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
-    EXTERNAL_IP_SYNTHETIC_TARGET_UID="${CLIENT_BMI_UID[$client]:-}"
+    EXTERNAL_IP_SYNTHETIC_TARGET_ID="${CLIENT_BMI_API_ID[$client]:-}"
+    EXTERNAL_IP_SYNTHETIC_TARGET_UID="$EXTERNAL_IP_SYNTHETIC_TARGET_ID"
     EXTERNAL_IP_SYNTHETIC_TARGET_IP="$(jq -er '.address' \
         "$TEMP_DIR/client-${client}.lease.json")" \
         || die "Synthetic target client ${client} did not receive a Subnet address"
@@ -9251,14 +9169,14 @@ delete_primary_virtual_network_for_suite() {
     delete_virtual_network_by_id "$FIRST_FULFILLMENT_ID"
     printf 'delete AAP job ID (test VN): %s\n' "$LAST_DELETE_AAP_JOB_ID"
     assert_uid_provider_state_absent \
-        "$FIRST_K8S_UID" "$FIRST_NAMESPACE_NAME" "$FIRST_HOST_INTERFACE"
+        "$FIRST_API_ID" "$FIRST_NAMESPACE_NAME" "$FIRST_HOST_INTERFACE"
     save_current_state
     assert_baseline_state_unchanged
 }
 
 run_subnet_dhcp_checks() {
 info "Snapshotting existing switch VLAN memberships and reserved ranges before creating sibling Subnets..."
-FIRST_ENTRY="$(get_state_entry "$FIRST_K8S_UID")"
+FIRST_ENTRY="$(get_state_entry "$FIRST_API_ID")"
 FIRST_TRANSIT_CIDR="$(jq -r '.transit.cidr' <<<"$FIRST_ENTRY")"
 resolve_test_subnet_cidrs "$VIRTUAL_NETWORK_IPV4_CIDR" "$FIRST_TRANSIT_CIDR"
 printf 'test Subnet CIDRs: %s %s\n' "$SUBNET_ONE_IPV4_CIDR" "$SUBNET_TWO_IPV4_CIDR"
@@ -9272,8 +9190,8 @@ create_subnet "$SUBNET_ONE_NAME" "$FIRST_FULFILLMENT_ID" \
 SUBNET_ONE_FULFILLMENT_ID="$(cat "${SUBNET_ONE_OUTPUT}.id")"
 wait_for_subnet_ready "$SUBNET_ONE_FULFILLMENT_ID" "$FIRST_FULFILLMENT_ID"
 SUBNET_ONE_CR="$(subnet_cr_json "$SUBNET_ONE_FULFILLMENT_ID" "$FIRST_FULFILLMENT_ID")"
-SUBNET_ONE_K8S_UID="$(jq -r '.metadata.uid' <<<"$SUBNET_ONE_CR")"
-SUBNET_ONE_AAP_JOB_ID="$(jq -er '.status.provisioningJobs | map(.jobID // empty) | last' <<<"$SUBNET_ONE_CR")"
+    SUBNET_ONE_API_ID="$(jq -er '.metadata.labels["osac.openshift.io/subnet-uuid"]' <<<"$SUBNET_ONE_CR")"
+SUBNET_ONE_AAP_JOB_ID="$(network_task_job_id "$SUBNET_ONE_CR" create_subnet)"
 wait_for_subnet_aap_provision_success "$SUBNET_ONE_FULFILLMENT_ID" \
     "$FIRST_FULFILLMENT_ID" "$SUBNET_ONE_AAP_JOB_ID"
 assert_subnet_state "$SUBNET_ONE_FULFILLMENT_ID" "$FIRST_FULFILLMENT_ID" \
@@ -9284,16 +9202,16 @@ create_subnet "$SUBNET_TWO_NAME" "$FIRST_FULFILLMENT_ID" \
 SUBNET_TWO_FULFILLMENT_ID="$(cat "${SUBNET_TWO_OUTPUT}.id")"
 wait_for_subnet_ready "$SUBNET_TWO_FULFILLMENT_ID" "$FIRST_FULFILLMENT_ID"
 SUBNET_TWO_CR="$(subnet_cr_json "$SUBNET_TWO_FULFILLMENT_ID" "$FIRST_FULFILLMENT_ID")"
-SUBNET_TWO_K8S_UID="$(jq -r '.metadata.uid' <<<"$SUBNET_TWO_CR")"
-SUBNET_TWO_AAP_JOB_ID="$(jq -er '.status.provisioningJobs | map(.jobID // empty) | last' <<<"$SUBNET_TWO_CR")"
+    SUBNET_TWO_API_ID="$(jq -er '.metadata.labels["osac.openshift.io/subnet-uuid"]' <<<"$SUBNET_TWO_CR")"
+SUBNET_TWO_AAP_JOB_ID="$(network_task_job_id "$SUBNET_TWO_CR" create_subnet)"
 wait_for_subnet_aap_provision_success "$SUBNET_TWO_FULFILLMENT_ID" \
     "$FIRST_FULFILLMENT_ID" "$SUBNET_TWO_AAP_JOB_ID"
 assert_subnet_state "$SUBNET_ONE_FULFILLMENT_ID" "$FIRST_FULFILLMENT_ID" \
     "$SUBNET_ONE_IPV4_CIDR"
 assert_subnet_state "$SUBNET_TWO_FULFILLMENT_ID" "$FIRST_FULFILLMENT_ID" \
     "$SUBNET_TWO_IPV4_CIDR"
-SUBNET_ONE_ENTRY="$(get_subnet_state_entry "$SUBNET_ONE_K8S_UID")"
-SUBNET_TWO_ENTRY="$(get_subnet_state_entry "$SUBNET_TWO_K8S_UID")"
+SUBNET_ONE_ENTRY="$(get_subnet_state_entry "$SUBNET_ONE_API_ID")"
+SUBNET_TWO_ENTRY="$(get_subnet_state_entry "$SUBNET_TWO_API_ID")"
 SUBNET_ONE_VLAN_ID="$(jq -r '.vlan_id' <<<"$SUBNET_ONE_ENTRY")"
 SUBNET_TWO_VLAN_ID="$(jq -r '.vlan_id' <<<"$SUBNET_TWO_ENTRY")"
 [[ "$SUBNET_ONE_VLAN_ID" != "$SUBNET_TWO_VLAN_ID" ]] \
@@ -9301,7 +9219,7 @@ SUBNET_TWO_VLAN_ID="$(jq -r '.vlan_id' <<<"$SUBNET_TWO_ENTRY")"
 assert_new_vlans_avoid_baseline "$SUBNET_ONE_VLAN_ID" "$SUBNET_TWO_VLAN_ID"
 printf 'Subnet Fulfillment UUIDs: %s %s\n' \
     "$SUBNET_ONE_FULFILLMENT_ID" "$SUBNET_TWO_FULFILLMENT_ID"
-printf 'Subnet Kubernetes UIDs: %s %s\n' "$SUBNET_ONE_K8S_UID" "$SUBNET_TWO_K8S_UID"
+printf 'Subnet API IDs: %s %s\n' "$SUBNET_ONE_API_ID" "$SUBNET_TWO_API_ID"
 printf 'Subnet VLAN IDs: %s %s\n' "$SUBNET_ONE_VLAN_ID" "$SUBNET_TWO_VLAN_ID"
 save_current_state
 assert_baseline_state_unchanged
@@ -9334,11 +9252,11 @@ for client in a1 a2 b1; do
     cp "$TEMP_DIR/client-${client}.lease.json" "$TEMP_DIR/client-${client}.before-restart.json"
 done
 netnode supervisorctl -c /etc/agentless-net/supervisord.conf \
-    restart "agentless-dhcp-${FIRST_K8S_UID}"
+    restart "agentless-dhcp-${FIRST_API_ID}"
 service_ready=false
 for ((attempt = 1; attempt <= 30; attempt++)); do
     if netnode supervisorctl -c /etc/agentless-net/supervisord.conf \
-        status "agentless-dhcp-${FIRST_K8S_UID}" | grep -Fq ' RUNNING '; then
+        status "agentless-dhcp-${FIRST_API_ID}" | grep -Fq ' RUNNING '; then
         service_ready=true
         break
     fi
@@ -9356,27 +9274,27 @@ assert_same_subnet_l2 a1 a2
 assert_client_gateway a1 "$SUBNET_ONE_ENTRY"
 assert_client_gateway b1 "$SUBNET_TWO_ENTRY"
 
-info "Removing only the test-owned Subnet interface and exercising the operator's retry path..."
+info "Removing only the test-owned Subnet interface and replaying the stored create_subnet input..."
 FIRST_SUBNET_ENTRY_BEFORE_RETRY="$(jq -cS '.' <<<"$SUBNET_ONE_ENTRY")"
+FIRST_SUBNET_INPUT_BEFORE_REPLAY="$(jq -cS '.status.taskInput' <<<"$SUBNET_ONE_CR")"
+FIRST_SUBNET_JOBS_BEFORE_REPLAY="$(jq -cS '.status.jobs' <<<"$SUBNET_ONE_CR")"
 link_json="$(netnode ip netns exec "$FIRST_PARENT_NAMESPACE" ip -j -d link show dev "$FIRST_SUBNET_VLAN_INTERFACE")"
-jq -e --arg alias "osac-subnet:${SUBNET_ONE_K8S_UID}" --argjson vlan "$SUBNET_ONE_VLAN_ID" '
+jq -e --arg alias "osac-subnet:${SUBNET_ONE_API_ID}" --argjson vlan "$SUBNET_ONE_VLAN_ID" '
   length == 1 and .[0].ifalias == $alias and .[0].linkinfo.info_kind == "vlan"
   and (.[0].linkinfo.info_data.id | tonumber) == $vlan' <<<"$link_json" >/dev/null \
     || die "Refusing to remove a Subnet interface without the test UID ownership alias"
-FIRST_SUBNET_JOB_BEFORE_RETRY="$SUBNET_ONE_AAP_JOB_ID"
 netnode ip netns exec "$FIRST_PARENT_NAMESPACE" ip link delete dev "$FIRST_SUBNET_VLAN_INTERFACE"
-oc patch subnet "$(jq -r '.metadata.name' <<<"$SUBNET_ONE_CR")" \
-    -n "$NETWORKING_NAMESPACE" --subresource=status --type=merge \
-    -p '{"status":{"phase":"Progressing","conditions":[],"provisioningJobs":[]}}' >/dev/null
-wait_for_subnet_retry_success "$SUBNET_ONE_FULFILLMENT_ID" \
-    "$FIRST_FULFILLMENT_ID" "$FIRST_SUBNET_JOB_BEFORE_RETRY"
-SUBNET_ONE_AAP_JOB_ID="$RETRIED_SUBNET_AAP_JOB_ID"
-wait_for_subnet_ready "$SUBNET_ONE_FULFILLMENT_ID" "$FIRST_FULFILLMENT_ID"
+replay_network_task_input "$SUBNET_ONE_CR" create_subnet \
+    || die "AAP could not replay the stored Subnet task input"
+SUBNET_ONE_CR="$(subnet_cr_json "$SUBNET_ONE_FULFILLMENT_ID" "$FIRST_FULFILLMENT_ID")"
+[[ "$(jq -cS '.status.taskInput' <<<"$SUBNET_ONE_CR")" == "$FIRST_SUBNET_INPUT_BEFORE_REPLAY" \
+    && "$(jq -cS '.status.jobs' <<<"$SUBNET_ONE_CR")" == "$FIRST_SUBNET_JOBS_BEFORE_REPLAY" ]] \
+    || die "Replaying the Subnet task input changed operator task input or job history"
 assert_subnet_state "$SUBNET_ONE_FULFILLMENT_ID" "$FIRST_FULFILLMENT_ID" \
     "$SUBNET_ONE_IPV4_CIDR"
-SUBNET_ONE_ENTRY="$(get_subnet_state_entry "$SUBNET_ONE_K8S_UID")"
+SUBNET_ONE_ENTRY="$(get_subnet_state_entry "$SUBNET_ONE_API_ID")"
 [[ "$(jq -cS '.' <<<"$SUBNET_ONE_ENTRY")" == "$FIRST_SUBNET_ENTRY_BEFORE_RETRY" ]] \
-    || die "Subnet retry did not preserve its UID-owned VLAN and DHCP state"
+    || die "Subnet task-input replay did not preserve its API-ID-owned VLAN and DHCP state"
 for client in a1 a2 b1; do renew_dhcp_client "$client"; done
 for client in a1 a2 b1; do discover_client_dhcp_lease "$client"; done
 assert_real_client_leases a1 a2 b1
@@ -9392,10 +9310,10 @@ assert_real_client_leases a1 a2
 assert_same_subnet_l2 a1 a2
 delete_subnet_by_id "$SUBNET_TWO_FULFILLMENT_ID"
 SECOND_SUBNET_DELETE_AAP_JOB_ID="$LAST_SUBNET_DELETE_AAP_JOB_ID"
-assert_uid_subnet_state_absent "$SUBNET_TWO_K8S_UID" "$FIRST_K8S_UID" \
+assert_uid_subnet_state_absent "$SUBNET_TWO_API_ID" "$FIRST_API_ID" \
     "$FIRST_PARENT_NAMESPACE" "$SECOND_SUBNET_VLAN_INTERFACE" "$SUBNET_TWO_VLAN_ID"
-assert_deleted_subnet_lease_removed "$SUBNET_TWO_CLIENT_MAC" "$FIRST_K8S_UID"
-[[ "$(get_subnet_state_entry "$SUBNET_ONE_K8S_UID" | jq -cS '.')" == \
+assert_deleted_subnet_lease_removed "$SUBNET_TWO_CLIENT_MAC" "$FIRST_API_ID"
+[[ "$(get_subnet_state_entry "$SUBNET_ONE_API_ID" | jq -cS '.')" == \
     "$(jq -cS '.' <<<"$SUBNET_ONE_ENTRY")" ]] \
     || die "Deleting Subnet B altered Subnet A's provider state"
 assert_subnet_state "$SUBNET_ONE_FULFILLMENT_ID" "$FIRST_FULFILLMENT_ID" \
@@ -9407,46 +9325,66 @@ save_current_state
 assert_baseline_state_unchanged
 recreate_dhcp_client_container b1
 
-info "Creating a /30 Subnet and verifying its single DHCP client address..."
-resolve_test_subnet_30_cidr "$VIRTUAL_NETWORK_IPV4_CIDR" "$FIRST_TRANSIT_CIDR" \
+info "Verifying the API rejects a /30 Subnet before provider allocation..."
+resolve_test_subnet_28_cidr "$VIRTUAL_NETWORK_IPV4_CIDR" "$FIRST_TRANSIT_CIDR" \
     "$SUBNET_ONE_IPV4_CIDR"
-SUBNET_THREE_OUTPUT="${TEMP_DIR}/create-subnet-30.out"
+SUBNET_THIRTY_CIDR="$(python3 -c 'import ipaddress,sys; print(next(ipaddress.ip_network(sys.argv[1], strict=True).subnets(new_prefix=30)))' \
+    "$SUBNET_THREE_IPV4_CIDR")"
+SUBNET_THIRTY_NAME="${VIRTUAL_NETWORK_NAME}-subnet-30-rejected"
+SUBNET_THIRTY_OUTPUT="${TEMP_DIR}/create-subnet-30-rejected.out"
+SUBNETS_BEFORE_SMALL_REJECTION="$(state_snapshot | jq -cS '.subnets')"
+if create_subnet "$SUBNET_THIRTY_NAME" "$FIRST_FULFILLMENT_ID" \
+    "$SUBNET_THIRTY_CIDR" "$SUBNET_THIRTY_OUTPUT"; then
+    die "Fulfillment accepted unsupported /30 Subnet ${SUBNET_THIRTY_CIDR}"
+fi
+[[ ! -e "${SUBNET_THIRTY_OUTPUT}.id" ]] \
+    || die "Rejected /30 Subnet unexpectedly returned a Fulfillment ID"
+SUBNET_THIRTY_ITEMS="$(cleanup_cli_list_json subnet \
+    "this.metadata.name == \"${SUBNET_THIRTY_NAME}\"")"
+[[ "$(jq -er 'length' <<<"$SUBNET_THIRTY_ITEMS")" == 0 ]] \
+    || die "Rejected /30 Subnet was persisted in Fulfillment"
+[[ "$(state_snapshot | jq -cS '.subnets')" == "$SUBNETS_BEFORE_SMALL_REJECTION" ]] \
+    || die "Rejected /30 Subnet allocated provider state"
+
+info "Creating a /28 Subnet and verifying its physical DHCP allocation..."
+SUBNET_THREE_OUTPUT="${TEMP_DIR}/create-subnet-28.out"
 create_subnet "$SUBNET_THREE_NAME" "$FIRST_FULFILLMENT_ID" \
     "$SUBNET_THREE_IPV4_CIDR" "$SUBNET_THREE_OUTPUT"
 SUBNET_THREE_FULFILLMENT_ID="$(cat "${SUBNET_THREE_OUTPUT}.id")"
 wait_for_subnet_ready "$SUBNET_THREE_FULFILLMENT_ID" "$FIRST_FULFILLMENT_ID"
 SUBNET_THREE_CR="$(subnet_cr_json "$SUBNET_THREE_FULFILLMENT_ID" "$FIRST_FULFILLMENT_ID")"
-SUBNET_THREE_K8S_UID="$(jq -r '.metadata.uid' <<<"$SUBNET_THREE_CR")"
-SUBNET_THREE_AAP_JOB_ID="$(jq -er '.status.provisioningJobs | map(.jobID // empty) | last' <<<"$SUBNET_THREE_CR")"
+SUBNET_THREE_API_ID="$(jq -er '.metadata.labels["osac.openshift.io/subnet-uuid"]' <<<"$SUBNET_THREE_CR")"
+SUBNET_THREE_AAP_JOB_ID="$(network_task_job_id "$SUBNET_THREE_CR" create_subnet)"
 wait_for_subnet_aap_provision_success "$SUBNET_THREE_FULFILLMENT_ID" \
     "$FIRST_FULFILLMENT_ID" "$SUBNET_THREE_AAP_JOB_ID"
 assert_subnet_state "$SUBNET_THREE_FULFILLMENT_ID" "$FIRST_FULFILLMENT_ID" \
     "$SUBNET_THREE_IPV4_CIDR"
-SUBNET_THREE_ENTRY="$(get_subnet_state_entry "$SUBNET_THREE_K8S_UID")"
+SUBNET_THREE_ENTRY="$(get_subnet_state_entry "$SUBNET_THREE_API_ID")"
 SUBNET_THREE_VLAN_ID="$(jq -r '.vlan_id' <<<"$SUBNET_THREE_ENTRY")"
 SUBNET_THREE_VLAN_INTERFACE="$(jq -r '.vlan_interface' <<<"$SUBNET_THREE_ENTRY")"
-[[ "$(jq -r '.dhcp_range_start' <<<"$SUBNET_THREE_ENTRY")" == \
-    "$(jq -r '.dhcp_range_end' <<<"$SUBNET_THREE_ENTRY")" ]] \
-    || die "The /30 Subnet does not provide exactly one DHCP address"
+[[ "$(jq -e --arg cidr "$SUBNET_THREE_IPV4_CIDR" \
+    '.ipam.physical_ipv4_cidrs == [$cidr]' <<<"$SUBNET_THREE_ENTRY")" == true ]] \
+    || die "The /28 Subnet does not use its supplied physical address range"
+[[ "$(jq -c '.ipam.overlay_ipv4_cidrs' <<<"$SUBNET_THREE_ENTRY")" == '[]' \
+    && "$(jq -c '.ipam.lb_vip_ipv4_cidrs' <<<"$SUBNET_THREE_ENTRY")" == '[]' ]] \
+    || die "The /28 Subnet IPAM plan includes a nonphysical range"
 assert_new_vlans_avoid_baseline "$SUBNET_ONE_VLAN_ID" "$SUBNET_THREE_VLAN_ID"
 attach_client_to_subnet b1 "$SUBNET_THREE_FULFILLMENT_ID"
 start_dhcp_client b1
 discover_client_dhcp_lease b1
 write_client_lease_expectations "b1=$SUBNET_THREE_ENTRY"
 assert_real_client_leases b1
-[[ "$(jq -r '.address' "$TEMP_DIR/client-b1.lease.json")" == \
-    "$(jq -r '.dhcp_range_start' <<<"$SUBNET_THREE_ENTRY")" ]] \
-    || die "The /30 client did not receive its single available IPv4 address"
+info "DHCP client B1 received a usable address from the /28 physical range."
 assert_client_gateway b1 "$SUBNET_THREE_ENTRY"
-printf 'Subnet /30 lease: client=%s address=%s gateway=%s VLAN=%s\n' \
+printf 'Subnet /28 lease: client=%s address=%s gateway=%s VLAN=%s\n' \
     "$(<"$TEMP_DIR/client-b1.mac")" "$(jq -r '.address' "$TEMP_DIR/client-b1.lease.json")" \
     "$(jq -r '.gateway_ipv4' <<<"$SUBNET_THREE_ENTRY")" "$SUBNET_THREE_VLAN_ID"
 
-info "Detaching B1 and deleting the /30 Subnet while Subnet A remains usable..."
+info "Detaching B1 and deleting the /28 Subnet while Subnet A remains usable..."
 detach_dhcp_client b1
 delete_subnet_by_id "$SUBNET_THREE_FULFILLMENT_ID"
 THIRD_SUBNET_DELETE_AAP_JOB_ID="$LAST_SUBNET_DELETE_AAP_JOB_ID"
-assert_uid_subnet_state_absent "$SUBNET_THREE_K8S_UID" "$FIRST_K8S_UID" \
+assert_uid_subnet_state_absent "$SUBNET_THREE_API_ID" "$FIRST_API_ID" \
     "$FIRST_PARENT_NAMESPACE" "$SUBNET_THREE_VLAN_INTERFACE" "$SUBNET_THREE_VLAN_ID"
 write_client_lease_expectations "a1=$SUBNET_ONE_ENTRY" "a2=$SUBNET_ONE_ENTRY"
 assert_real_client_leases a1 a2
@@ -9460,10 +9398,10 @@ detach_dhcp_client a1
 detach_dhcp_client a2
 delete_subnet_by_id "$SUBNET_ONE_FULFILLMENT_ID"
 FIRST_SUBNET_DELETE_AAP_JOB_ID="$LAST_SUBNET_DELETE_AAP_JOB_ID"
-assert_uid_subnet_state_absent "$SUBNET_ONE_K8S_UID" "$FIRST_K8S_UID" \
+assert_uid_subnet_state_absent "$SUBNET_ONE_API_ID" "$FIRST_API_ID" \
     "$FIRST_PARENT_NAMESPACE" "$FIRST_SUBNET_VLAN_INTERFACE" "$SUBNET_ONE_VLAN_ID"
-assert_virtual_network_dhcp_absent "$FIRST_K8S_UID" "$FIRST_PARENT_NAMESPACE"
-netnode test ! -e "/etc/agentless-net/dhcp/${FIRST_K8S_UID}/dnsmasq.conf" \
+assert_virtual_network_dhcp_absent "$FIRST_API_ID" "$FIRST_PARENT_NAMESPACE"
+netnode test ! -e "/etc/agentless-net/dhcp/${FIRST_API_ID}/dnsmasq.conf" \
     || die "Combined DHCP configuration remains after the VirtualNetwork's last Subnet was deleted"
 save_current_state
 assert_baseline_state_unchanged
@@ -9490,10 +9428,10 @@ create_nat_gateway_virtual_networks() {
         wait_for_virtual_network_ready "$SECOND_FULFILLMENT_ID"
         SECOND_CR="$(virtual_network_cr_json "$SECOND_FULFILLMENT_ID")"
         SECOND_CR_NAME="$(jq -er '.metadata.name' <<<"$SECOND_CR")"
-        SECOND_K8S_UID="$(jq -er '.metadata.uid' <<<"$SECOND_CR")"
-        SECOND_AAP_JOB_ID="$(jq -er '.status.provisioningJobs | map(.jobID // empty) | last' <<<"$SECOND_CR")"
+        SECOND_API_ID="$(jq -er '.metadata.labels["osac.openshift.io/virtualnetwork-uuid"]' <<<"$SECOND_CR")"
+        SECOND_AAP_JOB_ID="$(network_task_job_id "$SECOND_CR" create_virtual_network)"
         wait_for_aap_provision_success "$SECOND_FULFILLMENT_ID" "$SECOND_AAP_JOB_ID"
-        SECOND_ENTRY="$(get_state_entry "$SECOND_K8S_UID")"
+        SECOND_ENTRY="$(get_state_entry "$SECOND_API_ID")"
         SECOND_NAMESPACE_NAME="$(jq -r '.namespace_name' <<<"$SECOND_ENTRY")"
         SECOND_HOST_INTERFACE="$(jq -r '.uplink.host_interface' <<<"$SECOND_ENTRY")"
         assert_virtual_network_state "$SECOND_FULFILLMENT_ID" "$VIRTUAL_NETWORK_IPV4_CIDR"
@@ -9505,8 +9443,8 @@ create_nat_gateway_virtual_networks() {
 
 nat_gateway_create_subnets() {
     local first_entry second_entry first_transit second_transit output_file
-    first_entry="$(get_state_entry "$FIRST_K8S_UID")"
-    second_entry="$(get_state_entry "$SECOND_K8S_UID")"
+    first_entry="$(get_state_entry "$FIRST_API_ID")"
+    second_entry="$(get_state_entry "$SECOND_API_ID")"
     first_transit="$(jq -er '.transit.cidr' <<<"$first_entry")" \
         || die "Primary VirtualNetwork has no saved transit CIDR"
     second_transit="$(jq -er '.transit.cidr' <<<"$second_entry")" \
@@ -9614,11 +9552,11 @@ nat_gateway_assert_client_leases() {
     args=(assert-client-leases --expected "$CLIENT_EXPECTED_LEASES_FILE" \
         --dnsmasq-leases "$lease_file")
     : >"$lease_file"
-    netnode cat "/var/lib/agentless-net/dhcp/${FIRST_K8S_UID}/dnsmasq.leases" \
+    netnode cat "/var/lib/agentless-net/dhcp/${FIRST_API_ID}/dnsmasq.leases" \
         >"$lease_file" \
         || die "Could not read the primary NATGateway dnsmasq lease file"
-    if [[ -n "${SECOND_K8S_UID:-}" && "$SECOND_K8S_UID" != "$FIRST_K8S_UID" ]]; then
-        netnode cat "/var/lib/agentless-net/dhcp/${SECOND_K8S_UID}/dnsmasq.leases" \
+    if [[ -n "${SECOND_API_ID:-}" && "$SECOND_API_ID" != "$FIRST_API_ID" ]]; then
+        netnode cat "/var/lib/agentless-net/dhcp/${SECOND_API_ID}/dnsmasq.leases" \
             >>"$lease_file" \
             || die "Could not read the peer NATGateway dnsmasq lease file"
     fi
@@ -9667,9 +9605,9 @@ run_nat_gateway_lifecycle() {
     [[ "$EXTERNAL_IP_ONE_ADDRESS" != "$EXTERNAL_IP_TWO_ADDRESS" ]] \
         || die "NATGateway test ExternalIPs received the same address"
 
-    FIRST_ENTRY="$(get_state_entry "$FIRST_K8S_UID")"
-    SECOND_ENTRY="$(get_state_entry "$SECOND_K8S_UID")"
-    jq -e --arg uid "$FIRST_K8S_UID" --arg peer "$SECOND_K8S_UID" \
+    FIRST_ENTRY="$(get_state_entry "$FIRST_API_ID")"
+    SECOND_ENTRY="$(get_state_entry "$SECOND_API_ID")"
+    jq -e --arg uid "$FIRST_API_ID" --arg peer "$SECOND_API_ID" \
         'all(.subnets[]; .virtual_network_uid != $uid and .virtual_network_uid != $peer)' \
         "$CURRENT_STATE_FILE" >/dev/null \
         || die "NATGateway empty-VirtualNetwork case requires both test VirtualNetworks to have no Subnets"
@@ -9680,13 +9618,13 @@ run_nat_gateway_lifecycle() {
     NAT_GATEWAY_ONE_ID="$(<"${output_file}.id")"
     nat_gateway_wait_for_ready "$NAT_GATEWAY_ONE_ID" "$FIRST_FULFILLMENT_ID" "$EXTERNAL_IP_ONE_ID"
     gateway_cr="$(nat_gateway_cr_json "$NAT_GATEWAY_ONE_ID" "$FIRST_FULFILLMENT_ID" "$EXTERNAL_IP_ONE_ID")"
-    NAT_GATEWAY_ONE_UID="$(jq -er '.metadata.uid' <<<"$gateway_cr")"
+    NAT_GATEWAY_ONE_UID="$NAT_GATEWAY_ONE_ID"
     NAT_GATEWAY_ONE_INITIAL_STATE="$(nat_gateway_assert_provider_state \
-        "$NAT_GATEWAY_ONE_ID" "$NAT_GATEWAY_ONE_UID" "$FIRST_K8S_UID" \
+        "$NAT_GATEWAY_ONE_ID" "$NAT_GATEWAY_ONE_UID" "$FIRST_API_ID" \
         "$EXTERNAL_IP_ONE_UID" "$EXTERNAL_IP_ONE_ADDRESS")"
     nat_gateway_assert_provider_rules "$NAT_GATEWAY_ONE_ID" "$NAT_GATEWAY_ONE_UID" \
         "$EXTERNAL_IP_ONE_ADDRESS" "$NAT_GATEWAY_ONE_INITIAL_STATE"
-    FIRST_ENTRY="$(get_state_entry "$FIRST_K8S_UID")"
+    FIRST_ENTRY="$(get_state_entry "$FIRST_API_ID")"
     FIRST_NAMESPACE_NAME="$(jq -er '.namespace_name' <<<"$FIRST_ENTRY")"
     nat_gateway_assert_transit_exempt "$FIRST_NAMESPACE_NAME" \
         "$(jq -er '.transit.host_ip' <<<"$FIRST_ENTRY")" \
@@ -9707,9 +9645,9 @@ run_nat_gateway_lifecycle() {
     NAT_GATEWAY_TWO_ID="$(<"${output_file}.id")"
     nat_gateway_wait_for_ready "$NAT_GATEWAY_TWO_ID" "$SECOND_FULFILLMENT_ID" "$EXTERNAL_IP_TWO_ID"
     gateway_cr="$(nat_gateway_cr_json "$NAT_GATEWAY_TWO_ID" "$SECOND_FULFILLMENT_ID" "$EXTERNAL_IP_TWO_ID")"
-    NAT_GATEWAY_TWO_UID="$(jq -er '.metadata.uid' <<<"$gateway_cr")"
+    NAT_GATEWAY_TWO_UID="$NAT_GATEWAY_TWO_ID"
     NAT_GATEWAY_TWO_INITIAL_STATE="$(nat_gateway_assert_provider_state \
-        "$NAT_GATEWAY_TWO_ID" "$NAT_GATEWAY_TWO_UID" "$SECOND_K8S_UID" \
+        "$NAT_GATEWAY_TWO_ID" "$NAT_GATEWAY_TWO_UID" "$SECOND_API_ID" \
         "$EXTERNAL_IP_TWO_UID" "$EXTERNAL_IP_TWO_ADDRESS")"
     nat_gateway_assert_provider_rules "$NAT_GATEWAY_TWO_ID" "$NAT_GATEWAY_TWO_UID" \
         "$EXTERNAL_IP_TWO_ADDRESS" "$NAT_GATEWAY_TWO_INITIAL_STATE"
@@ -9717,12 +9655,12 @@ run_nat_gateway_lifecycle() {
 
     nat_gateway_create_subnets
     NAT_GATEWAY_ONE_INITIAL_STATE="$(nat_gateway_assert_provider_state \
-        "$NAT_GATEWAY_ONE_ID" "$NAT_GATEWAY_ONE_UID" "$FIRST_K8S_UID" \
+        "$NAT_GATEWAY_ONE_ID" "$NAT_GATEWAY_ONE_UID" "$FIRST_API_ID" \
         "$EXTERNAL_IP_ONE_UID" "$EXTERNAL_IP_ONE_ADDRESS")"
     nat_gateway_assert_provider_rules "$NAT_GATEWAY_ONE_ID" "$NAT_GATEWAY_ONE_UID" \
         "$EXTERNAL_IP_ONE_ADDRESS" "$NAT_GATEWAY_ONE_INITIAL_STATE"
     NAT_GATEWAY_TWO_INITIAL_STATE="$(nat_gateway_assert_provider_state \
-        "$NAT_GATEWAY_TWO_ID" "$NAT_GATEWAY_TWO_UID" "$SECOND_K8S_UID" \
+        "$NAT_GATEWAY_TWO_ID" "$NAT_GATEWAY_TWO_UID" "$SECOND_API_ID" \
         "$EXTERNAL_IP_TWO_UID" "$EXTERNAL_IP_TWO_ADDRESS")"
     nat_gateway_assert_provider_rules "$NAT_GATEWAY_TWO_ID" "$NAT_GATEWAY_TWO_UID" \
         "$EXTERNAL_IP_TWO_ADDRESS" "$NAT_GATEWAY_TWO_INITIAL_STATE"
@@ -9743,10 +9681,10 @@ run_nat_gateway_lifecycle() {
     wait_for_nat_gateway_source a2 "$EXTERNAL_IP_ONE_ADDRESS"
     wait_for_nat_gateway_source b1 "$EXTERNAL_IP_TWO_ADDRESS"
 
-    info "Retrying NATGateway A for the same UID and provider identity..."
-    nat_gateway_retry_and_verify "$NAT_GATEWAY_ONE_ID" "$FIRST_FULFILLMENT_ID" "$EXTERNAL_IP_ONE_ID"
+    info "Replaying NATGateway A's stored task input with the same API ID..."
+    nat_gateway_replay_and_verify "$NAT_GATEWAY_ONE_ID" "$FIRST_FULFILLMENT_ID" "$EXTERNAL_IP_ONE_ID"
     NAT_GATEWAY_ONE_INITIAL_STATE="$(nat_gateway_assert_provider_state \
-        "$NAT_GATEWAY_ONE_ID" "$NAT_GATEWAY_ONE_UID" "$FIRST_K8S_UID" \
+        "$NAT_GATEWAY_ONE_ID" "$NAT_GATEWAY_ONE_UID" "$FIRST_API_ID" \
         "$EXTERNAL_IP_ONE_UID" "$EXTERNAL_IP_ONE_ADDRESS")"
     nat_gateway_assert_provider_rules "$NAT_GATEWAY_ONE_ID" "$NAT_GATEWAY_ONE_UID" \
         "$EXTERNAL_IP_ONE_ADDRESS" "$NAT_GATEWAY_ONE_INITIAL_STATE"
@@ -9761,7 +9699,7 @@ run_nat_gateway_lifecycle() {
     NAT_GATEWAY_SUBNET_TWO_UID="$LAST_NAT_GATEWAY_SUBNET_UID"
     NAT_GATEWAY_SUBNET_TWO_ENTRY="$(get_subnet_state_entry "$NAT_GATEWAY_SUBNET_TWO_UID")"
     after_state="$(nat_gateway_assert_provider_state "$NAT_GATEWAY_ONE_ID" \
-        "$NAT_GATEWAY_ONE_UID" "$FIRST_K8S_UID" "$EXTERNAL_IP_ONE_UID" \
+        "$NAT_GATEWAY_ONE_UID" "$FIRST_API_ID" "$EXTERNAL_IP_ONE_UID" \
         "$EXTERNAL_IP_ONE_ADDRESS")"
     [[ "$after_state" == "$NAT_GATEWAY_ONE_INITIAL_STATE" ]] \
         || die "Creating a second Subnet changed the NATGateway provider payload"
@@ -9775,12 +9713,12 @@ run_nat_gateway_lifecycle() {
     info "Deleting Subnet A2 without changing the VN-wide NATGateway..."
     detach_dhcp_client a2
     delete_subnet_by_id "$NAT_GATEWAY_SUBNET_TWO_ID"
-    assert_uid_subnet_state_absent "$NAT_GATEWAY_SUBNET_TWO_UID" "$FIRST_K8S_UID" \
+    assert_uid_subnet_state_absent "$NAT_GATEWAY_SUBNET_TWO_UID" "$FIRST_API_ID" \
         "$FIRST_NAMESPACE_NAME" \
         "$(jq -er '.vlan_interface' <<<"$NAT_GATEWAY_SUBNET_TWO_ENTRY")" \
         "$(jq -er '.vlan_id' <<<"$NAT_GATEWAY_SUBNET_TWO_ENTRY")"
     after_state="$(nat_gateway_assert_provider_state "$NAT_GATEWAY_ONE_ID" \
-        "$NAT_GATEWAY_ONE_UID" "$FIRST_K8S_UID" "$EXTERNAL_IP_ONE_UID" \
+        "$NAT_GATEWAY_ONE_UID" "$FIRST_API_ID" "$EXTERNAL_IP_ONE_UID" \
         "$EXTERNAL_IP_ONE_ADDRESS")"
     [[ "$after_state" == "$NAT_GATEWAY_ONE_INITIAL_STATE" ]] \
         || die "Deleting a Subnet changed the NATGateway provider payload"
@@ -9793,12 +9731,12 @@ run_nat_gateway_lifecycle() {
     info "Deleting the last Subnet and verifying the gateway retains its state..."
     detach_dhcp_client a1
     delete_subnet_by_id "$NAT_GATEWAY_SUBNET_ONE_ID"
-    assert_uid_subnet_state_absent "$NAT_GATEWAY_SUBNET_ONE_UID" "$FIRST_K8S_UID" \
+    assert_uid_subnet_state_absent "$NAT_GATEWAY_SUBNET_ONE_UID" "$FIRST_API_ID" \
         "$FIRST_NAMESPACE_NAME" \
         "$(jq -er '.vlan_interface' <<<"$NAT_GATEWAY_SUBNET_ONE_ENTRY")" \
         "$(jq -er '.vlan_id' <<<"$NAT_GATEWAY_SUBNET_ONE_ENTRY")"
     after_state="$(nat_gateway_assert_provider_state "$NAT_GATEWAY_ONE_ID" \
-        "$NAT_GATEWAY_ONE_UID" "$FIRST_K8S_UID" "$EXTERNAL_IP_ONE_UID" \
+        "$NAT_GATEWAY_ONE_UID" "$FIRST_API_ID" "$EXTERNAL_IP_ONE_UID" \
         "$EXTERNAL_IP_ONE_ADDRESS")"
     [[ "$after_state" == "$NAT_GATEWAY_ONE_INITIAL_STATE" ]] \
         || die "Deleting the last Subnet changed the NATGateway provider payload"
@@ -9828,7 +9766,7 @@ run_nat_gateway_lifecycle() {
         || die "Could not remove the peer NATGateway test-only return route"
     delete_external_ip_and_verify "$EXTERNAL_IP_TWO_ID" "$EXTERNAL_IP_TWO_UID" 0
     delete_subnet_by_id "$NAT_GATEWAY_PEER_SUBNET_ID"
-    assert_uid_subnet_state_absent "$NAT_GATEWAY_PEER_SUBNET_UID" "$SECOND_K8S_UID" \
+    assert_uid_subnet_state_absent "$NAT_GATEWAY_PEER_SUBNET_UID" "$SECOND_API_ID" \
         "$SECOND_NAMESPACE_NAME" \
         "$(jq -er '.vlan_interface' <<<"$NAT_GATEWAY_PEER_SUBNET_ENTRY")" \
         "$(jq -er '.vlan_id' <<<"$NAT_GATEWAY_PEER_SUBNET_ENTRY")"
@@ -9837,7 +9775,7 @@ run_nat_gateway_lifecycle() {
     external_ip_pool_wait_for_delta 0
     save_current_state
     assert_baseline_state_unchanged
-    info "NATGateway SNAT, source observation, retry, Subnet churn, peer isolation, and cleanup passed."
+    info "NATGateway SNAT, source observation, stored-input replay, Subnet churn, peer isolation, and cleanup passed."
 }
 
 run_nat_gateway_suite() {
@@ -9888,13 +9826,13 @@ wait_for_virtual_network_ready "$SECOND_FULFILLMENT_ID"
 assert_provider_key_survived "concurrent VirtualNetwork provisioning"
 FIRST_CR="$(virtual_network_cr_json "$FIRST_FULFILLMENT_ID")"
 SECOND_CR="$(virtual_network_cr_json "$SECOND_FULFILLMENT_ID")"
-FIRST_K8S_UID="$(jq -r '.metadata.uid' <<<"$FIRST_CR")"
-SECOND_K8S_UID="$(jq -r '.metadata.uid' <<<"$SECOND_CR")"
-FIRST_AAP_JOB_ID="$(jq -er '.status.provisioningJobs | map(.jobID // empty) | last' <<<"$FIRST_CR")"
-SECOND_AAP_JOB_ID="$(jq -er '.status.provisioningJobs | map(.jobID // empty) | last' <<<"$SECOND_CR")"
+    FIRST_API_ID="$(jq -er '.metadata.labels["osac.openshift.io/virtualnetwork-uuid"]' <<<"$FIRST_CR")"
+    SECOND_API_ID="$(jq -er '.metadata.labels["osac.openshift.io/virtualnetwork-uuid"]' <<<"$SECOND_CR")"
+FIRST_AAP_JOB_ID="$(network_task_job_id "$FIRST_CR" create_virtual_network)"
+SECOND_AAP_JOB_ID="$(network_task_job_id "$SECOND_CR" create_virtual_network)"
 info "AAP create job IDs: ${FIRST_AAP_JOB_ID}, ${SECOND_AAP_JOB_ID}"
 printf 'create Fulfillment UUIDs: %s %s\n' "$FIRST_FULFILLMENT_ID" "$SECOND_FULFILLMENT_ID"
-printf 'create Kubernetes UIDs: %s %s\n' "$FIRST_K8S_UID" "$SECOND_K8S_UID"
+printf 'create VirtualNetwork API IDs: %s %s\n' "$FIRST_API_ID" "$SECOND_API_ID"
 printf 'create AAP job IDs: %s %s\n' "$FIRST_AAP_JOB_ID" "$SECOND_AAP_JOB_ID"
 
 info "Checking exact /31 endpoints, namespace gateway reachability, and host forwarding rules..."
@@ -9904,40 +9842,31 @@ assert_private_vn_isolation "$FIRST_FULFILLMENT_ID" "$SECOND_FULFILLMENT_ID"
 save_current_state
 assert_baseline_state_unchanged
 
-FIRST_ENTRY_BEFORE_REHYDRATE="$(get_state_entry "$FIRST_K8S_UID" | jq -cS '.')"
-FIRST_JOB_BEFORE_REHYDRATE="$FIRST_AAP_JOB_ID"
-FIRST_CR_NAME="$(jq -r '.metadata.name' <<<"$FIRST_CR")"
-FIRST_NAMESPACE_NAME="$(jq -r '.namespace_name' <<<"$(get_state_entry "$FIRST_K8S_UID")")"
-FIRST_HOST_INTERFACE="$(jq -r '.uplink.host_interface' <<<"$(get_state_entry "$FIRST_K8S_UID")")"
-info "Removing only the first test UID's transient namespace and uplink, then resetting its operator job history to exercise AAP rehydration..."
+FIRST_ENTRY_BEFORE_REHYDRATE="$(get_state_entry "$FIRST_API_ID" | jq -cS '.')"
+FIRST_TASK_INPUT_BEFORE_REPLAY="$(jq -cS '.status.taskInput' <<<"$FIRST_CR")"
+FIRST_JOBS_BEFORE_REPLAY="$(jq -cS '.status.jobs' <<<"$FIRST_CR")"
+FIRST_NAMESPACE_NAME="$(jq -r '.namespace_name' <<<"$(get_state_entry "$FIRST_API_ID")")"
+FIRST_HOST_INTERFACE="$(jq -r '.uplink.host_interface' <<<"$(get_state_entry "$FIRST_API_ID")")"
+info "Removing only the first test API ID's transient namespace and uplink, then replaying its stored task input..."
 netnode ip netns delete "$FIRST_NAMESPACE_NAME"
 # Deleting a network namespace can remove the host side of its veth pair too.
 if netnode ip link show dev "$FIRST_HOST_INTERFACE" >/dev/null 2>&1; then
     netnode ip link delete dev "$FIRST_HOST_INTERFACE"
 fi
 save_current_state
-[[ "$(jq -cS --arg uid "$FIRST_K8S_UID" '.virtual_networks[] | select(.uid == $uid)' "$CURRENT_STATE_FILE")" == "$FIRST_ENTRY_BEFORE_REHYDRATE" ]] \
-    || die "Removing runtime objects changed the persisted UID allocation"
-oc patch virtualnetwork "$FIRST_CR_NAME" -n "$NETWORKING_NAMESPACE" --subresource=status \
-    --type=merge -p '{"status":{"phase":"Progressing","conditions":[],"provisioningJobs":[]}}' >/dev/null
-
-REHYDRATED=false
-for ((attempt = 1; attempt <= 120; attempt++)); do
-    FIRST_CR="$(virtual_network_cr_json "$FIRST_FULFILLMENT_ID")"
-    FIRST_AAP_JOB_ID="$(jq -r '.status.provisioningJobs | map(.jobID // empty) | last // ""' <<<"$FIRST_CR")"
-    if [[ -n "$FIRST_AAP_JOB_ID" && "$FIRST_AAP_JOB_ID" != "$FIRST_JOB_BEFORE_REHYDRATE" ]]; then
-        REHYDRATED=true
-        break
-    fi
-    sleep 2
-done
-[[ "$REHYDRATED" == true ]] \
-    || die "Operator did not trigger a second AAP job for the same Kubernetes UID"
-info "Rehydration AAP job ID: ${FIRST_AAP_JOB_ID}"
-wait_for_aap_provision_success "$FIRST_FULFILLMENT_ID" "$FIRST_AAP_JOB_ID"
-wait_for_virtual_network_ready "$FIRST_FULFILLMENT_ID"
-[[ "$(get_state_entry "$FIRST_K8S_UID" | jq -cS '.')" == "$FIRST_ENTRY_BEFORE_REHYDRATE" ]] \
-    || die "AAP retry allocated a different transit link or changed the UID mapping"
+[[ "$(jq -cS --arg uid "$FIRST_API_ID" '.virtual_networks[] | select(.uid == $uid)' "$CURRENT_STATE_FILE")" == "$FIRST_ENTRY_BEFORE_REHYDRATE" ]] \
+    || die "Removing runtime objects changed the persisted API-ID allocation"
+replay_network_task_input "$FIRST_CR" create_virtual_network \
+    || die "AAP could not replay the stored VirtualNetwork task input"
+FIRST_REPLAY_JOB_ID="$(jq -er '.job_id' "$LAST_REPLAYED_AAP_RESULT_FILE")"
+FIRST_CR="$(virtual_network_cr_json "$FIRST_FULFILLMENT_ID")"
+[[ "$(jq -cS '.status.taskInput' <<<"$FIRST_CR")" == "$FIRST_TASK_INPUT_BEFORE_REPLAY" \
+    && "$(jq -cS '.status.jobs' <<<"$FIRST_CR")" == "$FIRST_JOBS_BEFORE_REPLAY" \
+    && "$(network_ready_condition_status "$FIRST_CR")" == True ]] \
+    || die "Direct task-input replay changed the stored input, operator job history, or Ready condition"
+info "Replayed VirtualNetwork task input as AAP job ${FIRST_REPLAY_JOB_ID}; operator job history stayed intact."
+[[ "$(get_state_entry "$FIRST_API_ID" | jq -cS '.')" == "$FIRST_ENTRY_BEFORE_REHYDRATE" ]] \
+    || die "Task-input replay allocated a different transit link or changed the API-ID mapping"
 assert_virtual_network_state "$FIRST_FULFILLMENT_ID" "$VIRTUAL_NETWORK_IPV4_CIDR" "$SECOND_FULFILLMENT_ID"
 assert_private_vn_isolation "$FIRST_FULFILLMENT_ID" "$SECOND_FULFILLMENT_ID"
 save_current_state
@@ -9946,38 +9875,38 @@ assert_baseline_state_unchanged
 if [[ "$SUITE_USES_EXTERNAL_IP_ATTACHMENT" == true ]]; then
     info "Preparing a synthetic DHCP target on the test VirtualNetwork for ExternalIP ingress checks..."
     create_external_ip_attachment_test_network_and_client
-    info "Running ExternalIP allocation, retry, ingress, detach, and capacity checks..."
+    info "Running ExternalIP allocation, stored-input replay, ingress, detach, and capacity checks..."
     run_external_ip_lifecycle
     delete_subnet_by_id "$EXTERNAL_IP_ATTACHMENT_SUBNET_ID"
 fi
 if [[ "$SUITE_USES_NAT_GATEWAY" == true ]]; then
-    info "Running local NATGateway SNAT, source observation, retry, and Subnet lifecycle checks..."
+    info "Running local NATGateway SNAT, source observation, task-input replay, and Subnet lifecycle checks..."
     run_nat_gateway_lifecycle
 fi
 info "Deleting the first test VirtualNetwork and verifying its peer remains provisioned..."
-FIRST_PEER_ENTRY="$(get_state_entry "$SECOND_K8S_UID" | jq -cS '.')"
+FIRST_PEER_ENTRY="$(get_state_entry "$SECOND_API_ID" | jq -cS '.')"
 delete_virtual_network_by_id "$FIRST_FULFILLMENT_ID"
 FIRST_DELETE_AAP_JOB_ID="$LAST_DELETE_AAP_JOB_ID"
 printf 'delete AAP job ID (first VN): %s\n' "$FIRST_DELETE_AAP_JOB_ID"
-assert_uid_provider_state_absent "$FIRST_K8S_UID" "$FIRST_NAMESPACE_NAME" "$FIRST_HOST_INTERFACE"
-[[ "$(get_state_entry "$SECOND_K8S_UID" | jq -cS '.')" == "$FIRST_PEER_ENTRY" ]] \
+assert_uid_provider_state_absent "$FIRST_API_ID" "$FIRST_NAMESPACE_NAME" "$FIRST_HOST_INTERFACE"
+[[ "$(get_state_entry "$SECOND_API_ID" | jq -cS '.')" == "$FIRST_PEER_ENTRY" ]] \
     || die "Deleting the first VirtualNetwork altered its peer's provider entry"
 assert_virtual_network_state "$SECOND_FULFILLMENT_ID" "$VIRTUAL_NETWORK_IPV4_CIDR"
 save_current_state
 assert_baseline_state_unchanged
 
 info "Deleting the remaining test VirtualNetwork and checking final cleanup..."
-SECOND_NAMESPACE_NAME="$(jq -r '.namespace_name' <<<"$(get_state_entry "$SECOND_K8S_UID")")"
-SECOND_HOST_INTERFACE="$(jq -r '.uplink.host_interface' <<<"$(get_state_entry "$SECOND_K8S_UID")")"
+SECOND_NAMESPACE_NAME="$(jq -r '.namespace_name' <<<"$(get_state_entry "$SECOND_API_ID")")"
+SECOND_HOST_INTERFACE="$(jq -r '.uplink.host_interface' <<<"$(get_state_entry "$SECOND_API_ID")")"
 delete_virtual_network_by_id "$SECOND_FULFILLMENT_ID"
 SECOND_DELETE_AAP_JOB_ID="$LAST_DELETE_AAP_JOB_ID"
 printf 'delete AAP job ID (peer VN): %s\n' "$SECOND_DELETE_AAP_JOB_ID"
-assert_uid_provider_state_absent "$SECOND_K8S_UID" "$SECOND_NAMESPACE_NAME" "$SECOND_HOST_INTERFACE"
+assert_uid_provider_state_absent "$SECOND_API_ID" "$SECOND_NAMESPACE_NAME" "$SECOND_HOST_INTERFACE"
 save_current_state
 assert_baseline_state_unchanged
 
 EXTERNAL_IP_POOL_ENTRY_AFTER_VN_DELETE="$(get_external_ip_pool_state_entry \
-    "$EXTERNAL_IP_POOL_K8S_UID" "$EXTERNAL_IP_POOL_ID")"
+    "$EXTERNAL_IP_POOL_API_ID" "$EXTERNAL_IP_POOL_ID")"
 [[ "$EXTERNAL_IP_POOL_ENTRY_AFTER_VN_DELETE" == "$EXTERNAL_IP_POOL_INITIAL_ENTRY" ]] \
     || die "VirtualNetwork and Subnet deletion altered ExternalIPPool provider state"
 info "Deleting the test-owned ExternalIPPool through Fulfillment and verifying provider cleanup..."
@@ -10061,12 +9990,11 @@ if [[ "$CLEANUP_MODE" == true ]]; then
     ensure_containerlab_switches
     ensure_cumulus_admin_identity
     write_cumulus_ssh_config
+    capture_legacy_provider_state
     prepare_containerlab_net_node
     prepare_containerlab_switches
     if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
         prepare_containerlab_dhcp_supervisor
-        configure_aap_subnet_reader \
-            || die "Could not configure AAP Kubernetes authentication for cleanup of interrupted DHCP clients"
     fi
     prepare_aap_networking_instance_group
     if [[ "$SUITE_USES_NAT_GATEWAY" == true ]]; then
@@ -10106,14 +10034,19 @@ fi
 HOST_IP_FORWARDING_BEFORE="$(netnode sysctl -n net.ipv4.ip_forward)"
 state_snapshot > "$BASELINE_STATE_FILE"
 jq -e '(.schema_version == 0 or .schema_version == 1)
+      and (.identity_semantics == "api-id")
+      and (.schema_version == 0 or .state_contract == "network-manager-api-id-v1")
       and (.virtual_networks | type == "array")
       and (.subnets | type == "array")
       and (.external_ip_pools | type == "array")
       and (.external_ips | type == "array")
       and (.external_ip_attachments | type == "array")
-      and (.nat_gateways | type == "array")' \
+      and (.nat_gateways | type == "array")
+      and (.network_attachments | type == "array")
+      and (.network_attachment_ports | type == "array")
+      and (.deleted_resources | type == "array")' \
     "$BASELINE_STATE_FILE" >/dev/null \
-    || die "AgentlessNet state must be empty or use the current schema v1 before the test starts"
+    || die "AgentlessNet state must be empty or use the API-ID contract before the test starts"
 
 
 case "$VLAN_E2E_SUITE" in
@@ -10133,23 +10066,25 @@ if [[ "$SUITE_USES_SUBNET_DHCP" == true ]]; then
     cleanup_dhcp_clients_and_attachments \
         || die "Could not offboard simulated BMIs or remove run-owned DHCP client links"
 fi
+assert_legacy_provider_state_unchanged \
+    || die "The legacy AgentlessNet database was not preserved"
 case "$VLAN_E2E_SUITE" in
     full)
-        info "Local AgentlessNet VLAN lab E2E passed: ExternalIP allocation/retry/release and synthetic-target ExternalIPAttachment ingress, VN-wide NATGateway SNAT and observed source address, independent Subnet lifecycle, overlapping VirtualNetworks, VN and Subnet retries, internal VLAN exclusion, AAP DHCP attachment and lease lookup for test clients, gateway and same-Subnet L2 traffic across leaves, DHCP service restart, /30 lease, peer-preserving lifecycle, and ordered cleanup. Remote BGP convergence and physical hardware are not covered."
+        info "Local AgentlessNet VLAN lab E2E passed: ExternalIP allocation/replay/release and synthetic-target ExternalIPAttachment ingress, VN-wide NATGateway SNAT and observed source address, independent Subnet lifecycle, overlapping VirtualNetworks, stored-input replay, internal VLAN exclusion, AAP DHCP attachment and lease lookup for test clients, gateway and same-Subnet L2 traffic across leaves, DHCP service restart, /28 allocation with /30 rejection, peer-preserving lifecycle, and ordered cleanup. Remote BGP convergence and physical hardware are not covered."
         ;;
     virtual-network)
         info "VirtualNetwork-only E2E passed: one VN was created, verified, deleted, and cleaned up."
         ;;
     subnet-dhcp)
-        info "Subnet/DHCP-only E2E passed: Subnet, retry, DHCP client, /30, and temporary parent VN cleanup checks passed."
+        info "Subnet/DHCP-only E2E passed: Subnet, stored-input replay, DHCP client, /28 allocation and /30 rejection, and temporary parent VN cleanup passed."
         ;;
     external-ip-pool)
         info "ExternalIPPool-only E2E passed: one pool was created, verified, deleted, and cleaned up."
         ;;
     external-ip)
-        info "ExternalIP E2E passed: two addresses were allocated, one UID retry reused its reservation, the synthetic DHCP target replied through both ExternalIPs, attachment retry and peer preservation passed, attachments were detached before EIPs and network resources, pool capacity was restored, and test network resources were deleted. The external client uses a test-only static route; upstream BGP advertisement is not exercised."
+        info "ExternalIP E2E passed: two addresses were allocated, stored task input replay kept the reservation, the synthetic DHCP target replied through both ExternalIPs, attachment replay and peer preservation passed, attachments were detached before EIPs and network resources, pool capacity was restored, and test network resources were deleted. The external client uses a test-only static route; upstream BGP advertisement is not exercised."
         ;;
     nat-gateway)
-        info "Local NATGateway VLAN lab E2E passed: the VN CIDR was SNATed to the allocated ExternalIP with a transit exemption, Subnet creation and deletion left gateway state unchanged, retry retained provider identity, the peer NATGateway remained unchanged, and cleanup completed. Remote BGP convergence, service restarts, and physical hardware are not covered."
+        info "Local NATGateway VLAN lab E2E passed: the VN CIDR was SNATed to the allocated ExternalIP with a transit exemption, Subnet creation and deletion left gateway state unchanged, stored task input replay retained provider identity, the peer NATGateway remained unchanged, and cleanup completed. Remote BGP convergence, service restarts, and physical hardware are not covered."
         ;;
 esac
