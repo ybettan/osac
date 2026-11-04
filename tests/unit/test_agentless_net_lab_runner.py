@@ -1596,9 +1596,27 @@ def test_bmaas_host_setup_uses_valid_bridge_names_and_recovers_ci_inventory() ->
     assert 'elif [[ -f "$inventory_file" ]]' in helper
     assert "Adopting the two BareMetalHosts from the existing BMaaS CI inventory." in helper
     assert 'bash "$setup_script" 9>&-' in helper
+    assert 'ip -d link show "$host_link"' in helper
+    assert '"link-netns ${switch}"' in helper
+    assert 'sudo ip link del "$host_link"' in helper
     assert helper.index('python3 - "$state_file" "${bmh_names[@]}"') < helper.index(
         'virsh domiflist "$bmh_name"'
     )
+
+
+def test_bmaas_switch_ports_are_ready_before_host_inspection() -> None:
+    suite_start = BMAAS_SOURCE.index("    run_bmaas_suite() {")
+    suite_end = BMAAS_SOURCE.index("    run_bmaas_cleanup() {", suite_start)
+    suite = BMAAS_SOURCE[suite_start:suite_end]
+    playbook = yaml.safe_load(
+        (REPO_ROOT / "tests/e2e/agentless_net/lab/configure_bmaas_access_ports.yml").read_text()
+    )
+    task = playbook[0]["tasks"][0]
+
+    assert suite.index("bmaas_configure_host_ports") < suite.index("bmaas_prepare_hosts")
+    assert task["ansible.builtin.include_role"]["name"] == "ansible_network.network_runner.switch"
+    assert task["ansible.builtin.include_role"]["tasks_from"] == "conf_access_port"
+    assert task["vars"]["port_description"] == "OSAC BMaaS provisioning port"
 
 
 def test_agentless_overlay_is_bmaas_only_with_physical_ipam_and_fresh_state() -> None:
