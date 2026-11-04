@@ -2,6 +2,9 @@
 # operator chart's legacy AgentlessNet stub registration. The umbrella chart
 # renders the contract-format immutable Fabric Manager registration.
 global:
+  services:
+    bmaas:
+      enabled: true
   networking:
     provisioningEnabled: true
     fabricManager: agentless_net
@@ -21,6 +24,8 @@ operator:
   tenants:
   - name: shared
 bmf:
-  replicaCount: 0
+  replicaCount: 1
   metal3:
-    enabled: false
+    enabled: true
+    namespace: host-inventory
+    hostClass: metal3
