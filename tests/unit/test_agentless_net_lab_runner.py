@@ -1252,6 +1252,86 @@ PY
     assert "not the known legacy inventory" in result.stderr
 
 
+def test_provider_inventory_upgrade_accepts_current_inventory_without_bmaas_hosts(
+    tmp_path,
+):
+    source_inventory = REPO_ROOT / "tests/e2e/agentless_net/lab/inventory.yml"
+    existing_result, existing_path, _ = render_provider_inventory(
+        tmp_path, source_inventory
+    )
+    assert existing_result.returncode == 0, existing_result.stderr
+    existing_inventory = existing_path.read_text()
+    bmaas_ports = tmp_path / "bmaas-ports.json"
+    bmaas_ports.write_text(
+        json.dumps(
+            {
+                "virtual-bmh-test-01": {
+                    "data-0": {
+                        "switch": "clab-agentless-net-lab-leaf-1",
+                        "port": "swp5",
+                    }
+                },
+                "virtual-bmh-test-02": {
+                    "data-0": {
+                        "switch": "clab-agentless-net-lab-leaf-2",
+                        "port": "swp5",
+                    }
+                },
+            }
+        )
+    )
+    rendered_result, expected_path, _ = render_provider_inventory(
+        tmp_path, source_inventory, bmaas_ports
+    )
+    assert rendered_result.returncode == 0, rendered_result.stderr
+    expected_inventory = expected_path.read_text()
+    configmap = json.dumps(
+        {"data": {"AGENTLESS_NET_VN_INVENTORY": existing_inventory}}
+    )
+
+    helper = function_block("write_provider_inventory", "sync_aap_project_revision")
+    marker = "<<'PY'\n"
+    first_start = helper.index(marker) + len(marker)
+    first_end = helper.index("\nPY\n", first_start)
+    second_start = helper.index(marker, first_end) + len(marker)
+    second_end = helper.index("\nPY\n", second_start)
+    migration = helper[second_start:second_end]
+    backup_path = tmp_path / "inventory-backup.json"
+    patch_path = tmp_path / "inventory-patch.json"
+    script = f"""
+set -euo pipefail
+python3 - {shlex.quote(configmap)} {shlex.quote(expected_inventory)} \
+    {shlex.quote(str(backup_path))} {shlex.quote(str(patch_path))} <<'PY'
+{migration}
+PY
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    backup = json.loads(backup_path.read_text())
+    assert backup["original_inventory"] == existing_inventory
+    assert backup["expected_inventory"] == expected_inventory
+
+    drifted = yaml.safe_load(existing_inventory)
+    drifted["all"]["vars"]["agentless_net_bmaas_switch_ports"][
+        "clab-agentless-net-lab-leaf-1"
+    ] = ["swp4"]
+    drifted_configmap = json.dumps(
+        {"data": {"AGENTLESS_NET_VN_INVENTORY": yaml.safe_dump(drifted, sort_keys=False)}}
+    )
+    script = f"""
+set -euo pipefail
+python3 - {shlex.quote(drifted_configmap)} {shlex.quote(expected_inventory)} \
+    {shlex.quote(str(backup_path))} {shlex.quote(str(patch_path))} <<'PY'
+{migration}
+PY
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode != 0
+    assert "not the known legacy inventory" in result.stderr
+
+
 def test_aap_ca_bundle_combines_osac_and_default_ingress_cas(tmp_path):
     helper = function_block("prepare_aap_ca_bundle", "sync_aap_project_revision")
     osac_ca = "-----BEGIN CERTIFICATE-----\nOSAC-CA\n-----END CERTIFICATE-----\n"
