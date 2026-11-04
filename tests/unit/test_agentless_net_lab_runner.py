@@ -685,6 +685,169 @@ ensure_containerlab_admin_nvue_key clab-agentless-net-lab-leaf-1
     ]
 
 
+def test_stale_provider_keys_are_reclaimed_before_key_installation(tmp_path):
+    helper = (
+        function_block("switch_nvue_diff", "assert_provider_key_survived")
+        + "\n"
+        + function_block("reclaim_containerlab_provider_keys", "install_containerlab_switch_provider_key")
+    )
+    state = tmp_path / "state"
+    state.mkdir()
+    keys = state / "keys"
+    keys.write_text(
+        "osac-agentless-e2e-admin\n"
+        "osac_e2e_1793803069_1899008\n"
+        "osac_e2e_1793807380_2191235\n"
+        "osac_e2e_1793809370_2244559\n"
+    )
+    (state / "pending").write_text(
+        "nv unset system aaa user cumulus ssh authorized-key osac_e2e_1793807380_2191235\n"
+    )
+    capture = tmp_path / "nvue-reclaim-commands.txt"
+    script = f"""
+set -euo pipefail
+PROVIDER_NVUE_KEY_ID=osac_e2e_test
+STATE={shlex.quote(str(state))}
+CAPTURE={shlex.quote(str(capture))}
+LOG_CAPTURE={shlex.quote(str(tmp_path / "reclaim.log"))}
+info() {{ printf 'INFO: %s\\n' "$*" >>"$LOG_CAPTURE"; }}
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+apply_pending() {{
+    [[ -f "$STATE/pending" ]] || return 0
+    while read -r _ _ _ _ _ _ _ _ staged_key; do
+        [[ -n "$staged_key" ]] || continue
+        grep -Fxv "$staged_key" "$STATE/keys" >"$STATE/keys.new" || true
+        mv "$STATE/keys.new" "$STATE/keys"
+    done <"$STATE/pending"
+    rm -f "$STATE/pending"
+}}
+switch_admin_user_exec() {{
+    local switch="$1"
+    shift
+    [[ "$switch" == clab-agentless-net-lab-leaf-1 ]]
+    printf '%s\\n' "$*" >>"$CAPTURE"
+    case "$*" in
+        'nv config diff --output commands')
+            if [[ -f "$STATE/pending" ]]; then cat "$STATE/pending"; fi
+            ;;
+        'nv config apply --assume-yes') apply_pending ;;
+        'nv show system aaa user cumulus ssh authorized-key --output json')
+            jq -R -s 'split("\\n") | map(select(length > 0)) | map({{(.): {{type: "ssh-ed25519", key: "redacted"}}}}) | add // {{}}' "$STATE/keys"
+            ;;
+        'nv unset system aaa user cumulus ssh authorized-key '*)
+            printf '%s\\n' "$*" >>"$STATE/pending"
+            ;;
+        *) return 2 ;;
+    esac
+}}
+{helper}
+reclaim_containerlab_provider_keys clab-agentless-net-lab-leaf-1
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert keys.read_text().splitlines() == ["osac-agentless-e2e-admin"]
+    assert not (state / "pending").exists()
+    assert capture.read_text().splitlines() == [
+        "nv config diff --output commands",
+        "nv config apply --assume-yes",
+        "nv show system aaa user cumulus ssh authorized-key --output json",
+        "nv unset system aaa user cumulus ssh authorized-key osac_e2e_1793803069_1899008",
+        "nv unset system aaa user cumulus ssh authorized-key osac_e2e_1793809370_2244559",
+        "nv config apply --assume-yes",
+        "nv config diff --output commands",
+        "nv show system aaa user cumulus ssh authorized-key --output json",
+    ]
+    assert (tmp_path / "reclaim.log").read_text().splitlines() == [
+        "INFO: Reclaimed stale per-run NVUE provider keys on clab-agentless-net-lab-leaf-1.",
+    ]
+
+
+def test_clean_switch_needs_no_provider_key_reclaim(tmp_path):
+    helper = (
+        function_block("switch_nvue_diff", "assert_provider_key_survived")
+        + "\n"
+        + function_block("reclaim_containerlab_provider_keys", "install_containerlab_switch_provider_key")
+    )
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "keys").write_text("osac-agentless-e2e-admin\n")
+    capture = tmp_path / "nvue-reclaim-commands.txt"
+    script = f"""
+set -euo pipefail
+PROVIDER_NVUE_KEY_ID=osac_e2e_test
+STATE={shlex.quote(str(state))}
+CAPTURE={shlex.quote(str(capture))}
+info() {{ :; }}
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+switch_admin_user_exec() {{
+    local switch="$1"
+    shift
+    [[ "$switch" == clab-agentless-net-lab-leaf-1 ]]
+    printf '%s\\n' "$*" >>"$CAPTURE"
+    case "$*" in
+        'nv config diff --output commands') ;;
+        'nv show system aaa user cumulus ssh authorized-key --output json')
+            jq -R -s 'split("\\n") | map(select(length > 0)) | map({{(.): {{type: "ssh-ed25519", key: "redacted"}}}}) | add // {{}}' "$STATE/keys"
+            ;;
+        *) return 2 ;;
+    esac
+}}
+{helper}
+reclaim_containerlab_provider_keys clab-agentless-net-lab-leaf-1
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text().splitlines() == [
+        "nv config diff --output commands",
+        "nv show system aaa user cumulus ssh authorized-key --output json",
+    ]
+
+
+def test_unrelated_nvue_candidate_blocks_provider_key_reclaim(tmp_path):
+    helper = (
+        function_block("switch_nvue_diff", "assert_provider_key_survived")
+        + "\n"
+        + function_block("reclaim_containerlab_provider_keys", "install_containerlab_switch_provider_key")
+    )
+    state = tmp_path / "state"
+    state.mkdir()
+    keys = state / "keys"
+    keys.write_text("osac-agentless-e2e-admin\nosac_e2e_1793803069_1899008\n")
+    (state / "pending").write_text("nv set interface swp9 bridge domain br_default\n")
+    capture = tmp_path / "nvue-reclaim-commands.txt"
+    script = f"""
+set -euo pipefail
+PROVIDER_NVUE_KEY_ID=osac_e2e_test
+STATE={shlex.quote(str(state))}
+CAPTURE={shlex.quote(str(capture))}
+info() {{ :; }}
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+switch_admin_user_exec() {{
+    local switch="$1"
+    shift
+    [[ "$switch" == clab-agentless-net-lab-leaf-1 ]]
+    printf '%s\\n' "$*" >>"$CAPTURE"
+    case "$*" in
+        'nv config diff --output commands') cat "$STATE/pending" ;;
+        *) return 2 ;;
+    esac
+}}
+{helper}
+reclaim_containerlab_provider_keys clab-agentless-net-lab-leaf-1
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode != 0
+    assert "unrelated pending NVUE changes" in result.stderr
+    assert capture.read_text().splitlines() == ["nv config diff --output commands"]
+    assert keys.read_text().splitlines() == [
+        "osac-agentless-e2e-admin",
+        "osac_e2e_1793803069_1899008",
+    ]
+
+
 def test_vlan_snapshot_collects_switchd_reserved_range(tmp_path):
     helper_writer = function_block("write_agentless_e2e_helpers", "nvue_interface_config")
     snapshotter = function_block("snapshot_switch_vlan_state", "assert_new_vlans_avoid_baseline")

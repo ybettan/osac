@@ -1292,6 +1292,51 @@ assert_containerlab_admin_nvue_key() {
         || die "The persistent administrator SSH key is not accepted on ${switch}"
 }
 
+reclaim_containerlab_provider_keys() {
+    local switch="$1" pending_diff key_config line key staged=false
+    local stale_unset_re='^nv unset system aaa user cumulus ssh authorized-key osac_e2e_[0-9]+_[0-9]+$'
+    local -a stale_keys=()
+    pending_diff="$(switch_nvue_diff admin "$switch")" \
+        || die "Could not inspect pending NVUE changes on ${switch} before reclaiming stale provider keys"
+    if [[ -n "$pending_diff" ]]; then
+        # A run that dies before its cleanup can leave the removal of its
+        # per-run key staged but unapplied. Reclaim such a candidate, but only
+        # when it touches nothing except those ephemeral keys.
+        while IFS= read -r line; do
+            line="${line%$'\r'}"
+            [[ -z "$line" ]] && continue
+            [[ "$line" =~ $stale_unset_re ]] \
+                || die "Switch ${switch} has unrelated pending NVUE changes; refusing to reclaim stale provider keys"
+        done <<<"$pending_diff"
+        switch_admin_user_exec "$switch" nv config apply --assume-yes \
+            || die "Could not apply the staged stale provider-key removal on ${switch}"
+        staged=true
+    fi
+
+    key_config="$(switch_admin_user_exec "$switch" nv show system aaa user cumulus ssh authorized-key --output json)" \
+        || die "Could not inspect NVUE authorized keys on ${switch} while reclaiming stale provider keys"
+    mapfile -t stale_keys < <(jq -r 'keys[] | select(startswith("osac_e2e_"))' <<<"$key_config")
+    for key in "${stale_keys[@]}"; do
+        [[ -n "$key" ]] || continue
+        switch_admin_user_exec "$switch" nv unset system aaa user cumulus ssh authorized-key "$key" \
+            || die "Could not stage removal of stale NVUE provider key ${key} on ${switch}"
+        staged=true
+    done
+
+    [[ "$staged" == true ]] || return 0
+    switch_admin_user_exec "$switch" nv config apply --assume-yes \
+        || die "Could not apply the stale provider-key cleanup on ${switch}"
+    pending_diff="$(switch_nvue_diff admin "$switch")" \
+        || die "Could not verify the stale provider-key cleanup on ${switch}"
+    [[ -z "$pending_diff" ]] \
+        || die "NVUE candidate changes remain on ${switch} after reclaiming stale provider keys"
+    key_config="$(switch_admin_user_exec "$switch" nv show system aaa user cumulus ssh authorized-key --output json)" \
+        || die "Could not verify NVUE authorized keys on ${switch} after reclaiming stale provider keys"
+    jq -e '[keys[] | select(startswith("osac_e2e_"))] | length == 0' <<<"$key_config" >/dev/null \
+        || die "Stale per-run NVUE provider keys remain configured on ${switch}"
+    info "Reclaimed stale per-run NVUE provider keys on ${switch}."
+}
+
 install_containerlab_switch_provider_key() {
     local switch="$1" key_type="$2" key_data="$3" pending_diff key_config
     info "Installing per-run provider NVUE key on ${switch}."
@@ -1368,6 +1413,7 @@ prepare_containerlab_switches() {
             assert_containerlab_admin_nvue_key "$switch"
         else
             ensure_containerlab_admin_nvue_key "$switch"
+            reclaim_containerlab_provider_keys "$switch"
         fi
         install_containerlab_switch_provider_key "$switch" "$provider_key_type" "$provider_key_data"
     done < <(jq -r '.switches[].name' "$SWITCH_MANIFEST_FILE")
