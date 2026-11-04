@@ -1270,6 +1270,27 @@ def wait_for_bmi_running(*, grpc: GRPCClient, bmi_id: str, retries: int = _BMI_R
     )
 
 
+def wait_for_bmi_external_host(*, k8s: K8sClient, bmi_id: str, bmi_cr_name: str = "") -> tuple[str, str]:
+    """Wait for BMF to bind the BareMetalInstance to a host.
+
+    The Fulfillment-provided CR exists before a host is allocated, so
+    ``externalHostID`` stays empty until BMF claims one. Returns
+    ``(bmh_namespace, bmh_name)``.
+    """
+    name = bmi_cr_name or wait_for_bmi_cr(k8s=k8s, uuid=bmi_id)
+    external_host_id: str = poll_until(
+        fn=lambda: k8s.get_baremetal_instance_external_host_id(name=name),
+        until=lambda value: value.count("/") == 1 and all(value.split("/", 1)),
+        retries=60,
+        delay=2,
+        description=f"BareMetalInstance {name} externalHostID",
+        resource_kind=WaitResourceKind.BARE_METAL_INSTANCE,
+        resource_id=name,
+    )
+    bmh_namespace, bmh_name = external_host_id.split("/", 1)
+    return bmh_namespace, bmh_name
+
+
 def assert_bmi_lifecycle_on_running(
     *, grpc: GRPCClient, k8s: K8sClient, bmi_id: str, bmh_namespace: str, power_cycle: bool = True
 ) -> tuple[str, str]:
