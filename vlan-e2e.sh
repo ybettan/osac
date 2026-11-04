@@ -1293,16 +1293,20 @@ assert_containerlab_admin_nvue_key() {
 }
 
 discard_containerlab_stale_candidate() {
-    local switch="$1" pending_diff line attempt discarded=false
+    local switch="$1" identity="${2:-admin}" pending_diff line attempt discarded=false
     # A pending NVUE revision that only stages per-run provider keys is runner
     # litter: an interrupted run can leave one behind, either removing its own
     # key or restoring the key set it saw when it started. Applying such a
     # revision reverts newer applied configuration, so discard it instead.
-    # Staging several commands and applying them leaves one pending revision
-    # per layer, so keep detaching until nothing runner-owned remains.
+    # NVUE keeps one pending revision per identity, so the candidate must be
+    # inspected and discarded as the identity that will check it. Staging
+    # several commands leaves one pending revision per layer, so keep
+    # detaching until nothing runner-owned remains.
     local stale_candidate_re='^nv (set|unset) system aaa user cumulus ssh authorized-key osac_e2e_[0-9]+_[0-9]+( (key|type)( .*)?)?$'
+    local nv_exec=switch_admin_user_exec
+    [[ "$identity" == admin ]] || nv_exec=switch_exec
     for ((attempt = 1; attempt <= 64; attempt++)); do
-        pending_diff="$(switch_nvue_diff admin "$switch")" \
+        pending_diff="$(switch_nvue_diff "$identity" "$switch")" \
             || die "Could not inspect pending NVUE changes on ${switch} before discarding a stale candidate"
         if [[ -z "$pending_diff" ]]; then
             [[ "$discarded" == false ]] \
@@ -1315,7 +1319,7 @@ discard_containerlab_stale_candidate() {
             [[ "$line" =~ $stale_candidate_re ]] \
                 || die "Switch ${switch} has unrelated pending NVUE changes; refusing to discard a provider-key candidate"
         done <<<"$pending_diff"
-        switch_admin_user_exec "$switch" nv config detach \
+        "$nv_exec" "$switch" nv config detach \
             || die "Could not discard a stale NVUE provider-key candidate on ${switch}"
         discarded=true
     done
@@ -1457,7 +1461,7 @@ configure_containerlab_fabric() {
         [[ -n "$switch" ]] || continue
         # Staging the provider key can leave runner-owned pending revisions
         # behind; discard those, but never unrelated candidate changes.
-        discard_containerlab_stale_candidate "$switch"
+        discard_containerlab_stale_candidate "$switch" provider
         if ! pending_diff="$(switch_nvue_diff provider "$switch")"; then
             die "Could not inspect pending NVUE changes on $switch"
         fi

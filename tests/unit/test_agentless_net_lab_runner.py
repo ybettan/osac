@@ -896,6 +896,56 @@ discard_containerlab_stale_candidate clab-agentless-net-lab-leaf-1
     ]
 
 
+def test_provider_identity_stale_candidate_is_discarded_as_root(tmp_path):
+    helper = (
+        function_block("switch_nvue_diff", "assert_provider_key_survived")
+        + "\n"
+        + function_block("discard_containerlab_stale_candidate", "reclaim_containerlab_provider_keys")
+    )
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "pending").write_text(
+        "nv unset system aaa user cumulus ssh authorized-key osac_e2e_1793812660_2613085\n"
+        "nv set system aaa user cumulus ssh authorized-key osac_e2e_1793810331_2352989 key '*'\n"
+    )
+    capture = tmp_path / "nvue-provider-discard.txt"
+    script = f"""
+set -euo pipefail
+STATE={shlex.quote(str(state))}
+CAPTURE={shlex.quote(str(capture))}
+info() {{ :; }}
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+switch_admin_user_exec() {{
+    printf 'admin:%s\\n' "$*" >>"$CAPTURE"
+    return 3
+}}
+switch_exec() {{
+    local switch="$1"
+    shift
+    [[ "$switch" == clab-agentless-net-lab-leaf-2 ]]
+    printf 'provider:%s\\n' "$*" >>"$CAPTURE"
+    case "$*" in
+        'nv config diff --output commands')
+            if [[ -f "$STATE/pending" ]]; then cat "$STATE/pending"; fi
+            ;;
+        'nv config detach') rm -f "$STATE/pending" ;;
+        *) return 2 ;;
+    esac
+}}
+{helper}
+discard_containerlab_stale_candidate clab-agentless-net-lab-leaf-2 provider
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert not (state / "pending").exists()
+    assert capture.read_text().splitlines() == [
+        "provider:nv config diff --output commands",
+        "provider:nv config detach",
+        "provider:nv config diff --output commands",
+    ]
+
+
 def test_post_install_stale_candidate_is_discarded(tmp_path):
     helper = (
         function_block("switch_nvue_diff", "assert_provider_key_survived")
