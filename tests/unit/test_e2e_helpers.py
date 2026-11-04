@@ -307,3 +307,24 @@ def test_wait_for_security_group_update_fails_at_once_on_failed_state(monkeypatc
 
     with pytest.raises(RuntimeError, match="provider rejected"):
         helpers.wait_for_security_group_update(grpc=grpc, sg_id="sg-id")
+
+
+def test_wait_for_bmi_external_host_polls_until_bmf_binds_a_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("tests.e2e.core.runner.time.sleep", lambda _delay: None)
+    k8s = Mock(spec=K8sClient)
+    k8s.get_baremetal_instance_external_host_id.side_effect = ["", "host-inventory", "host-inventory/virtual-bmh-1"]
+
+    assert helpers.wait_for_bmi_external_host(k8s=k8s, bmi_id="bmi-1", bmi_cr_name="bmi-1") == (
+        "host-inventory",
+        "virtual-bmh-1",
+    )
+    assert k8s.get_baremetal_instance_external_host_id.call_count == 3
+
+
+def test_wait_for_bmi_external_host_fails_when_no_host_is_claimed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("tests.e2e.core.runner.time.sleep", lambda _delay: None)
+    k8s = Mock(spec=K8sClient)
+    k8s.get_baremetal_instance_external_host_id.return_value = ""
+
+    with pytest.raises(TimeoutError, match="externalHostID"):
+        helpers.wait_for_bmi_external_host(k8s=k8s, bmi_id="bmi-1", bmi_cr_name="bmi-1")

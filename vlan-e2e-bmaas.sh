@@ -335,7 +335,14 @@ PY
     }
 
     run_bmaas_cleanup() {
+        local journal
+        journal="${VLAN_E2E_RUN_DIR:-${REPO_ROOT}/.artifacts/agentless-net-bmaas/runs}/${OSAC_BMAAS_RUN_ID:-agentless-bmaas}.json"
         bmaas_pytest_env
+        if [[ ! -f "$journal" ]]; then
+            # Say where the journal was expected: a cleanup that silently finds
+            # nothing leaves the failed run's resources behind.
+            info "No BMaaS resource journal at ${journal}; pass VLAN_E2E_RUN_DIR=<failed run directory> to clean the resources that run created."
+        fi
         export OSAC_BMAAS_CLEANUP=true
         uv run pytest -n 0 tests/e2e/bmaas/agentless_net/test_agentless_net_networking.py \
             -k cleanup_owned_agentless_bmaas

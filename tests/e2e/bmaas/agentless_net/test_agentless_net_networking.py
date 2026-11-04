@@ -19,6 +19,7 @@ from tests.e2e.core.helpers import (
     wait_for_bmh_available,
     wait_for_bmi_cr,
     wait_for_bmi_deletion,
+    wait_for_bmi_external_host,
     wait_for_bmi_grpc_removal,
     wait_for_grpc_security_group_ready,
     wait_for_grpc_subnet_ready,
@@ -357,8 +358,7 @@ def test_agentless_bmaas_existing_flow(
             resources["bmis"].append({"id": bmi_id, "name": bmi_name})
             _write_private_json(_journal_path(), resources)
             bmi_cr_name = wait_for_bmi_cr(k8s=k8s_hub_client, uuid=bmi_id)
-            external_host_id = k8s_hub_client.get_baremetal_instance_external_host_id(name=bmi_cr_name)
-            bmh_ns, bmh_name = external_host_id.split("/", 1)
+            bmh_ns, bmh_name = wait_for_bmi_external_host(k8s=k8s_hub_client, bmi_id=bmi_id, bmi_cr_name=bmi_cr_name)
             assert bmh_name in host_by_name, f"BMI {bmi_id} was allocated to an unowned BMH: {bmh_name}"
             resources["bmis"][-1].update(cr_name=bmi_cr_name, bmh_name=bmh_name, bmh_namespace=bmh_ns)
             _write_private_json(_journal_path(), resources)
