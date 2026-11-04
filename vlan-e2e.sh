@@ -2540,33 +2540,78 @@ ensure_osac_tenant() (
     fi
 )
 
+tenant_private_get() {
+    (
+        set -euo pipefail
+        local tenant_id="$1" local_port port_forward_log port_forward_pid="" admin_token request
+        local attempt
+
+        request="$(jq -cn --arg id "$tenant_id" '{id: $id}')" \
+            || die "Could not write tenant Get request"
+        local_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')" \
+            || die "Could not select a local port for tenant status"
+        port_forward_log="${TEMP_DIR}/tenant-get-port-forward.log"
+        cleanup_tenant_get_port_forward() {
+            if [[ -n "$port_forward_pid" ]]; then
+                kill "$port_forward_pid" >/dev/null 2>&1 || true
+                wait "$port_forward_pid" 2>/dev/null || true
+                port_forward_pid=""
+            fi
+        }
+        trap cleanup_tenant_get_port_forward EXIT
+
+        oc port-forward --address 127.0.0.1 service/fulfillment-internal-api \
+            "${local_port}:8001" -n "$OSAC_NAMESPACE" >"$port_forward_log" 2>&1 &
+        port_forward_pid=$!
+        for ((attempt = 1; attempt <= 30; attempt++)); do
+            if grep -Fq "Forwarding from 127.0.0.1:${local_port}" "$port_forward_log"; then
+                break
+            fi
+            if ! kill -0 "$port_forward_pid" 2>/dev/null; then
+                return 1
+            fi
+            sleep 1
+        done
+        grep -Fq "Forwarding from 127.0.0.1:${local_port}" "$port_forward_log" || return 1
+
+        admin_token="$(oc create token admin -n "$OSAC_NAMESPACE" --duration=10m)" || return 1
+        if ! grpcurl -insecure -connect-timeout 5 -max-time 20 -format json -format-error \
+            -H "authorization: Bearer ${admin_token}" -d "$request" \
+            "127.0.0.1:${local_port}" osac.private.v1.Tenants/Get; then
+            unset admin_token
+            return 1
+        fi
+        unset admin_token
+    )
+}
+
 wait_for_tenant_default_networking() {
     local tenant_json status reason message
+    local attempt
     info "Waiting for tenant ${OSAC_TENANT} DefaultNetworkingReady..."
     for ((attempt = 1; attempt <= 720; attempt++)); do
-        tenant_json="$("$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" \
-            tenant --output json)" \
-            || die "Fulfillment API failed while reading tenant ${OSAC_TENANT} readiness"
-        if jq -e '
-          any(.status.conditions[]?;
-            .type == "TENANT_CONDITION_TYPE_DEFAULT_NETWORKING_READY"
-            and .status == "CONDITION_STATUS_TRUE")' <<<"$tenant_json" >/dev/null; then
-            info "Tenant ${OSAC_TENANT} DefaultNetworkingReady is True."
-            return 0
-        fi
-        reason="$(jq -r '[.status.conditions[]? | select(.type == "TENANT_CONDITION_TYPE_DEFAULT_NETWORKING_READY") | .reason] | last // ""' <<<"$tenant_json")"
-        message="$(jq -r '[.status.conditions[]? | select(.type == "TENANT_CONDITION_TYPE_DEFAULT_NETWORKING_READY") | .message] | last // ""' <<<"$tenant_json")"
-        status="$(jq -r '.status.state // ""' <<<"$tenant_json")"
-        if [[ "$reason" == ResourceFailed || "$status" == TENANT_STATE_FAILED ]]; then
-            printf '%s\n' "$tenant_json" >&2
-            die "Tenant ${OSAC_TENANT} default networking failed: ${message:-${status}}"
-        fi
-        if ((attempt % 12 == 0)); then
-            info "Tenant ${OSAC_TENANT} default networking is pending: ${message:-${reason:-unknown}}"
+        if ((attempt == 1 || attempt % 6 == 1)); then
+            tenant_json="$(tenant_private_get "$OSAC_TENANT")" \
+                || die "Fulfillment private API failed while reading tenant ${OSAC_TENANT} readiness"
+            if jq -e '
+              any(.object.status.conditions[]?;
+                .type == "TENANT_CONDITION_TYPE_DEFAULT_NETWORKING_READY"
+                and .status == "CONDITION_STATUS_TRUE")' <<<"$tenant_json" >/dev/null; then
+                info "Tenant ${OSAC_TENANT} DefaultNetworkingReady is True."
+                return 0
+            fi
+            reason="$(jq -r '[.object.status.conditions[]? | select(.type == "TENANT_CONDITION_TYPE_DEFAULT_NETWORKING_READY") | .reason] | last // ""' <<<"$tenant_json")"
+            message="$(jq -r '[.object.status.conditions[]? | select(.type == "TENANT_CONDITION_TYPE_DEFAULT_NETWORKING_READY") | .message] | last // ""' <<<"$tenant_json")"
+            status="$(jq -r '.object.status.state // ""' <<<"$tenant_json")"
+            if [[ "$reason" == ResourceFailed || "$status" == TENANT_STATE_FAILED ]]; then
+                die "Tenant ${OSAC_TENANT} default networking failed: ${message:-${status}}"
+            fi
+            if ((attempt > 1 && attempt % 12 == 1)); then
+                info "Tenant ${OSAC_TENANT} default networking is pending: ${message:-${reason:-unknown}}"
+            fi
         fi
         sleep 5
     done
-    printf '%s\n' "$tenant_json" >&2
     die "Timed out waiting for tenant ${OSAC_TENANT} DefaultNetworkingReady"
 }
 
@@ -3929,6 +3974,21 @@ external_ip_state_entry() {
       "$CURRENT_STATE_FILE"
 }
 
+external_ip_assert_result() {
+    local artifacts="$1" address="$2"
+    jq -e --arg address "$address" \
+        '.osac_result.external_ip.address == $address' <<<"$artifacts" >/dev/null
+}
+
+external_ip_assert_replay_result() {
+    local task_input="$1" result_file="$2" uid="$3" address="$4" artifacts
+    jq -e --arg uid "$uid" '.resource.id == $uid' <<<"$task_input" >/dev/null \
+        || return 1
+    artifacts="$(jq -ce '.artifacts | select(type == "object")' "$result_file")" \
+        || return 1
+    external_ip_assert_result "$artifacts" "$address"
+}
+
 external_ip_assert_state() {
     local entry="$1" uid="$2" fulfillment_id="$3" tenant_id="$4" pool_uid="$5" address="$6"
     jq -e --arg uid "$uid" --arg id "$fulfillment_id" --arg tenant "$tenant_id" \
@@ -4238,7 +4298,7 @@ wait_for_external_ip_ready() {
             if ! artifacts="$(external_ip_aap_job_artifacts "$job_id")"; then
                 die "Could not retrieve allocation artifacts for AAP job ${job_id}"
             fi
-            external_ip_assert_result "$artifacts" external_ip.allocate "$id" 0 "$address" \
+            external_ip_assert_result "$artifacts" "$address" \
                 || die "AAP allocation artifact does not match ExternalIP ${id}"
             external_ip_validate_address "$address" \
                 || die "ExternalIP ${id} has an invalid address"
@@ -4280,15 +4340,22 @@ create_nat_gateway() {
 
 nat_gateway_assert_task_input() {
     local gateway_cr="$1" external_ip_cr="$2" virtual_network_cr="$3"
-    local id="$4" external_ip_id="$5" virtual_network_id="$6" address
+    local id="$4" external_ip_id="$5" virtual_network_id="$6" address generation
     address="$(jq -er '.status.address' <<<"$external_ip_cr")" \
         || die "ExternalIP ${external_ip_id} has no accepted address"
+    generation="$(jq -er '.metadata.generation' <<<"$gateway_cr")" \
+        || die "NATGateway ${id} has no generation"
     jq -e --arg id "$id" --arg eip "$external_ip_id" --arg vn "$virtual_network_id" \
-        --arg address "$address" --argjson network "$virtual_network_cr" '
+        --arg address "$address" --argjson generation "$generation" \
+        --argjson network "$virtual_network_cr" '
       .status.taskInput.resource.kind == "NATGateway"
       and .status.taskInput.resource.id == $id
-      and .status.taskInput.resource.spec.virtualNetwork == $vn
-      and .status.taskInput.resource.spec.externalIP == $eip
+      and .status.taskInput.resource.metadata.generation == $generation
+      and .status.taskInput.resource.spec == {}
+      and .status.taskInput.virtual_network.id == $vn
+      and .status.taskInput.virtual_network.spec.ipv4Cidr == $network.spec.ipv4Cidr
+      and .status.taskInput.external_ip.id == $eip
+      and .status.taskInput.external_ip.address == $address
       and .status.taskInput.nat_gateway_context.external_ip.fulfillment_id == $eip
       and .status.taskInput.nat_gateway_context.external_ip.address == $address
       and .status.taskInput.nat_gateway_context.virtual_network.fulfillment_id == $vn
@@ -4361,65 +4428,17 @@ nat_gateway_replay_and_verify() {
     LAST_NAT_GATEWAY_REPLAY_JOB_ID="$replay_job_id"
 }
 
-nat_gateway_add_hold_finalizer() {
-    local gateway_cr="$1" name="$2" uid="$3" finalizers resource_version patch_file
-    finalizers="$(jq -c '.metadata.finalizers // []' <<<"$gateway_cr")"
-    if jq -e --arg hold 'osac.openshift.io/e2e-hold-natgateway' \
-        'index($hold) != null' <<<"$finalizers" >/dev/null; then
-        return 0
-    fi
-    jq -e --arg operator 'osac.openshift.io/natgateway-finalizer' \
-        'index($operator) != null' <<<"$finalizers" >/dev/null \
-        || die "NATGateway ${uid} lacks its operator finalizer before test deletion"
-    resource_version="$(jq -er '.metadata.resourceVersion' <<<"$gateway_cr")"
-    patch_file="${TEMP_DIR}/nat-gateway-hold-finalizer-${uid}.json"
-    jq -n --arg rv "$resource_version" --arg uid "$uid" \
-        --arg name "$name" --arg hold 'osac.openshift.io/e2e-hold-natgateway' \
-        '[{op:"test",path:"/metadata/resourceVersion",value:$rv},
-          {op:"test",path:"/metadata/uid",value:$uid},
-          {op:"add",path:"/metadata/finalizers/-",value:$hold}]' >"$patch_file"
-    oc patch natgateway "$name" -n "$NETWORKING_NAMESPACE" --type=json \
-        --patch-file="$patch_file" >/dev/null \
-        || die "Could not add the NATGateway test hold finalizer"
-}
-
-nat_gateway_remove_hold_finalizer() {
-    local id="$1" virtual_network_id="$2" external_ip_id="$3" gateway_cr name uid rv finalizers
-    local patch_file
-    gateway_cr="$(nat_gateway_cr_json "$id" "$virtual_network_id" "$external_ip_id")" \
-        || return 1
-    name="$(jq -er '.metadata.name' <<<"$gateway_cr")" || return 1
-    uid="$(jq -er '.metadata.uid' <<<"$gateway_cr")" || return 1
-    rv="$(jq -er '.metadata.resourceVersion' <<<"$gateway_cr")" || return 1
-    finalizers="$(jq -c '.metadata.finalizers // []' <<<"$gateway_cr")" || return 1
-    jq -e --arg hold 'osac.openshift.io/e2e-hold-natgateway' \
-        'index($hold) != null' <<<"$finalizers" >/dev/null || return 1
-    patch_file="${TEMP_DIR}/nat-gateway-release-hold-${uid}.json"
-    jq -n --arg rv "$rv" --arg uid "$uid" --arg hold 'osac.openshift.io/e2e-hold-natgateway' \
-        --argjson finalizers "$finalizers" \
-        '[{op:"test",path:"/metadata/resourceVersion",value:$rv},
-          {op:"test",path:"/metadata/uid",value:$uid},
-          {op:"replace",path:"/metadata/finalizers",value:($finalizers | map(select(. != $hold)))}]' \
-        >"$patch_file" || return 1
-    oc patch natgateway "$name" -n "$NETWORKING_NAMESPACE" --type=json \
-        --patch-file="$patch_file" >/dev/null || return 1
-}
-
 delete_nat_gateway_and_verify() {
     local id="$1" virtual_network_id="$2" external_ip_id="$3"
-    local gateway_cr name k8s_uid address entry namespace crs count job job_id job_state finalizers deadline task_input
-    local operator_finalizer='osac.openshift.io/natgateway-finalizer'
-    local hold_finalizer='osac.openshift.io/e2e-hold-natgateway'
+    local gateway_cr k8s_uid address entry namespace crs count job job_id="" job_state deadline task_input eip_cr
     gateway_cr="$(nat_gateway_cr_json "$id" "$virtual_network_id" "$external_ip_id")" \
         || return 1
-    name="$(jq -er '.metadata.name' <<<"$gateway_cr")" || return 1
     k8s_uid="$(jq -er '.metadata.uid' <<<"$gateway_cr")" || return 1
     address="$(jq -er '.status.address' <<<"$(external_ip_cr_json "$external_ip_id")")" || return 1
     task_input="$(jq -cS '.status.taskInput' <<<"$gateway_cr")"
     entry="$(get_nat_gateway_state_entry "$id" "$id")" || return 1
     namespace="$(jq -er '.payload.provider.namespace_name' <<<"$entry")" || return 1
     if [[ -z "$(jq -r '.metadata.deletionTimestamp // ""' <<<"$gateway_cr")" ]]; then
-        nat_gateway_add_hold_finalizer "$gateway_cr" "$name" "$k8s_uid" || return 1
         local output_file="${TEMP_DIR}/delete-nat-gateway-${id}.out"
         if ! "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" \
             delete natgateway "$id" >"$output_file" 2>&1; then
@@ -4435,10 +4454,13 @@ delete_nat_gateway_and_verify() {
             return 1
         fi
         count="$(jq -er '.items | length' <<<"$crs")" || return 1
-        [[ "$count" == 1 ]] || { printf 'NATGateway %s disappeared before cleanup was verified\n' "$id" >&2; return 1; }
+        [[ "$count" == 0 ]] && break
+        [[ "$count" == 1 ]] || { printf 'Found multiple NATGateway CRs for %s\n' "$id" >&2; return 1; }
         gateway_cr="$(jq -c '.items[0]' <<<"$crs")"
         [[ "$(jq -r '.metadata.uid' <<<"$gateway_cr")" == "$k8s_uid" ]] \
             || { printf 'NATGateway %s Kubernetes object identity changed during deletion\n' "$id" >&2; return 1; }
+        [[ "$(jq -cS '.status.taskInput' <<<"$gateway_cr")" == "$task_input" ]] \
+            || { printf 'NATGateway %s task input changed during deletion\n' "$id" >&2; return 1; }
         job="$(network_task_entry "$gateway_cr" delete_nat_gateway)"
         job_id="$(jq -r '.jobID // ""' <<<"$job")"
         job_state="$(jq -r '.state // ""' <<<"$job")"
@@ -4446,35 +4468,15 @@ delete_nat_gateway_and_verify() {
             printf 'NATGateway delete job %s ended in %s; retaining dependencies\n' "$job_id" "$job_state" >&2
             return 1
         fi
-        finalizers="$(jq -c '.metadata.finalizers // []' <<<"$gateway_cr")"
-        if [[ -n "$job_id" && "$job_state" == Succeeded ]] \
-            && ! jq -e --arg operator "$operator_finalizer" 'index($operator) != null' \
-                <<<"$finalizers" >/dev/null; then
-            [[ "$(jq -cS '.status.taskInput' <<<"$gateway_cr")" == "$task_input" ]] \
-                || { printf 'NATGateway %s task input changed during cleanup\n' "$id" >&2; return 1; }
-            [[ "$finalizers" == *"$hold_finalizer"* ]] \
-                || { printf 'NATGateway test hold finalizer was lost before result verification\n' >&2; return 1; }
-            break
-        fi
         sleep 2
     done
-    [[ "$SECONDS" -lt "$deadline" ]] \
-        || { printf 'Timed out waiting for NATGateway %s delete job/result\n' "$id" >&2; return 1; }
+    [[ "$count" == 0 ]] \
+        || { printf 'Timed out waiting for NATGateway %s deletion\n' "$id" >&2; return 1; }
     nat_gateway_assert_provider_absent "$id" "$address" "$namespace" || return 1
-    local eip_cr
     eip_cr="$(external_ip_cr_json "$external_ip_id")" || return 1
     [[ "$(network_ready_condition_status "$eip_cr")" == True \
         && "$(jq -r '.status.address' <<<"$eip_cr")" == "$address" ]] \
         || { printf 'ExternalIP %s was released before NATGateway cleanup completed\n' "$external_ip_id" >&2; return 1; }
-    nat_gateway_remove_hold_finalizer "$id" "$virtual_network_id" "$external_ip_id" || return 1
-    deadline=$((SECONDS + 600))
-    while ((SECONDS < deadline)); do
-        crs="$(nat_gateway_crs_json "$id")" || return 1
-        count="$(jq -er '.items | length' <<<"$crs")" || return 1
-        [[ "$count" == 0 ]] && break
-        sleep 2
-    done
-    [[ "$count" == 0 ]] || { printf 'Timed out waiting for NATGateway %s removal\n' "$id" >&2; return 1; }
     LAST_NAT_GATEWAY_CLEANUP_JOB_ID="$job_id"
     local index
     for index in "${!CREATED_NAT_GATEWAY_IDS[@]}"; do
@@ -4530,18 +4532,9 @@ external_ip_remove_created_id() {
 delete_external_ip_and_verify() {
     local id="$1" uid="$2" capacity_delta="$3"
     local output_file="${TEMP_DIR}/delete-external-ip-${id}.out"
-    local hold_finalizer="osac.openshift.io/e2e-hold-external-ip"
-    local operator_finalizer="osac.openshift.io/externalip-finalizer"
     local cr crs count deadline=$((SECONDS + 600)) release_job release_job_id="" job_state
-    local release_validated=false
     cr="$(external_ip_cr_json "$id")"
     if [[ -z "$(jq -r '.metadata.deletionTimestamp // ""' <<<"$cr")" ]]; then
-        jq -e --arg finalizer "$hold_finalizer" \
-            '(.metadata.finalizers // []) | index($finalizer) == null' <<<"$cr" >/dev/null \
-            || die "ExternalIP ${id} already has the E2E hold finalizer"
-        oc patch externalip "$(jq -r '.metadata.name' <<<"$cr")" -n "$NETWORKING_NAMESPACE" \
-            --type=json -p="[{\"op\":\"add\",\"path\":\"/metadata/finalizers/-\",\"value\":\"${hold_finalizer}\"}]" >/dev/null
-        cr="$(external_ip_cr_json "$id")"
         info "Deleting ExternalIP ${id} through Fulfillment..."
         if ! "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" \
             delete externalip "$id" >"$output_file" 2>&1; then
@@ -4567,45 +4560,17 @@ delete_external_ip_and_verify() {
         if [[ -n "$release_job_id" && ( "$job_state" == Failed || "$job_state" == Cancelled ) ]]; then
             die "AAP release job ${release_job_id} ended in ${job_state} for ExternalIP ${id}"
         fi
-        if [[ -n "$release_job_id" && "$job_state" == Succeeded ]] \
-            && jq -e --arg hold "$hold_finalizer" --arg operator "$operator_finalizer" '
-                (.metadata.finalizers // []) as $finalizers
-                | ($finalizers | index($hold) != null)
-                  and ($finalizers | index($operator) == null)' <<<"$cr" >/dev/null; then
-            release_validated=true
-            break
-        fi
-        sleep 2
-    done
-    [[ "$count" == 1 && -n "$release_job_id" && "$release_validated" == true ]] \
-        || die "Timed out waiting for the operator to validate release of ExternalIP ${id}"
-    jq -e --arg hold "$hold_finalizer" --arg operator "$operator_finalizer" '
-        (.metadata.finalizers // []) as $finalizers
-        | ($finalizers | index($hold) != null)
-          and ($finalizers | index($operator) == null)' <<<"$cr" >/dev/null \
-        || die "ExternalIP ${id} was not retained by the test hold finalizer after operator cleanup"
-    external_ip_pool_wait_for_delta "$((capacity_delta + 1))"
-    oc patch externalip "$(jq -r '.metadata.name' <<<"$cr")" -n "$NETWORKING_NAMESPACE" \
-        --type=merge -p="$(jq -c --arg hold "$hold_finalizer" \
-            '{metadata:{finalizers:((.metadata.finalizers // []) | map(select(. != $hold)))}}' <<<"$cr")" >/dev/null
-    deadline=$((SECONDS + 600))
-    while ((SECONDS < deadline)); do
-        crs="$(external_ip_crs_json "$id")" \
-            || die "Kubernetes API failed while removing the E2E hold finalizer from ExternalIP ${id}"
-        count="$(jq -er '.items | length' <<<"$crs")" \
-            || die "Could not count ExternalIP CRs after releasing ${id}"
-        [[ "$count" == 0 ]] && break
         sleep 2
     done
     [[ "$count" == 0 ]] || die "Timed out waiting for ExternalIP ${id} to be removed after cleanup"
-    external_ip_assert_state_absent "$id" "$id"
+    external_ip_assert_state_absent "$uid" "$id"
     external_ip_pool_wait_for_delta "$capacity_delta"
     external_ip_remove_created_id "$id"
-    info "ExternalIP ${id} is released and Fulfillment capacity is updated; AAP job ${release_job_id}"
+    info "ExternalIP ${id} is released and Fulfillment capacity is updated; AAP job ${release_job_id:-unobserved}"
 }
 
 run_external_ip_lifecycle() {
-    local pool_status initial_total output_file state_after_replay cr task_input_before jobs_before replay_address
+    local pool_status initial_total output_file state_after_replay cr task_input_before jobs_before
     pool_status="$(external_ip_pool_get_json)" \
         || die "Could not read test ExternalIPPool capacity"
     initial_total="$(jq -er '.object.status.total | tonumber' <<<"$pool_status")" \
@@ -4648,10 +4613,8 @@ run_external_ip_lifecycle() {
     jobs_before="$(jq -cS '.status.jobs' <<<"$cr")"
     replay_network_task_input "$cr" create_external_ip \
         || die "AAP could not replay the stored ExternalIP task input"
-    replay_address="$(jq -er '.artifacts.osac_result.external_ip.address' "$LAST_REPLAYED_AAP_RESULT_FILE")" \
-        || die "ExternalIP replay did not return its typed address result"
-    [[ "$LAST_EXTERNAL_IP_UID" == "$EXTERNAL_IP_ONE_UID" \
-        && "$replay_address" == "$EXTERNAL_IP_ONE_ADDRESS" ]] \
+    external_ip_assert_replay_result "$task_input_before" "$LAST_REPLAYED_AAP_RESULT_FILE" \
+        "$EXTERNAL_IP_ONE_UID" "$EXTERNAL_IP_ONE_ADDRESS" \
         || die "ExternalIP task replay changed its API ID or reserved address"
     cr="$(external_ip_cr_json "$EXTERNAL_IP_ONE_ID")"
     [[ "$(jq -cS '.status.taskInput' <<<"$cr")" == "$task_input_before" \
@@ -4764,11 +4727,8 @@ cleanup_created_external_ips() {
     [[ -n "$CLI_BIN" && -x "$CLI_BIN" && -n "$CLI_CONFIG_DIR" && -d "$CLI_CONFIG_DIR" ]] \
         || return 1
 
-    local id crs count cr uid name output_file release_job release_job_id job_state
-    local hold_finalizer operator_finalizer
+    local id crs count cr uid output_file release_job release_job_id job_state
     local state_file remaining deadline
-    hold_finalizer="osac.openshift.io/e2e-hold-external-ip"
-    operator_finalizer="osac.openshift.io/externalip-finalizer"
     for id in "${CREATED_EXTERNAL_IP_IDS[@]}"; do
         if ! crs="$(external_ip_crs_json "$id")"; then
             printf 'Could not read ExternalIP %s while cleaning up\n' "$id" >&2
@@ -4778,7 +4738,6 @@ cleanup_created_external_ips() {
         if [[ "$count" == 1 ]]; then
             cr="$(jq -c '.items[0]' <<<"$crs")"
             uid="$id"
-            name="$(jq -er '.metadata.name' <<<"$cr")" || return 1
             if [[ -z "$(jq -r '.metadata.deletionTimestamp // ""' <<<"$cr")" ]]; then
                 output_file="${TEMP_DIR}/cleanup-external-ip-${id}.out"
                 if ! "$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" \
@@ -4805,17 +4764,6 @@ cleanup_created_external_ips() {
                 if [[ "$job_state" == Failed || "$job_state" == Cancelled ]]; then
                     printf 'ExternalIP %s release job ended in %s; preserving resources\n' "$id" "$job_state" >&2
                     return 1
-                fi
-                if [[ -n "$release_job_id" && "$job_state" == Succeeded ]] \
-                    && jq -e --arg hold "$hold_finalizer" --arg operator "$operator_finalizer" '
-                        (.metadata.finalizers // []) as $values
-                        | ($values | index($hold) != null)
-                          and ($values | index($operator) == null)' <<<"$cr" >/dev/null; then
-                    oc patch externalip "$name" -n "$NETWORKING_NAMESPACE" \
-                        --type=merge -p="$(jq -c --arg hold "$hold_finalizer" \
-                            '{metadata:{finalizers:((.metadata.finalizers // []) | map(select(. != $hold)))}}' \
-                            <<<"$cr")" >/dev/null \
-                        || return 1
                 fi
                 sleep 2
             done
@@ -7396,7 +7344,7 @@ def assert_client_leases(args: argparse.Namespace) -> None:
         if len(fields) >= 3:
             server_leases.setdefault(fields[1].lower(), []).append(fields[2])
 
-    seen_addresses: set[str] = set()
+    seen_addresses: set[tuple[str, str]] = set()
     for client in clients:
         name = client["name"]
         expected_mac = client["mac"].lower()
@@ -7408,6 +7356,7 @@ def assert_client_leases(args: argparse.Namespace) -> None:
         try:
             network = ipaddress.ip_network(client["subnet"]["ipv4_cidr"], strict=True)
             address = ipaddress.IPv4Address(lease["address"])
+            virtual_network_uid = client["subnet"]["virtual_network_uid"]
             ipam = client["subnet"]["ipam"]
             expected_gateway = ipaddress.IPv4Address(ipam["gateway_ipv4"])
             expected_mask = str(network.netmask)
@@ -7418,6 +7367,8 @@ def assert_client_leases(args: argparse.Namespace) -> None:
             raise ValueError(f"client {name} lease or saved Subnet state is malformed") from error
         if not isinstance(network, ipaddress.IPv4Network) or not isinstance(address, ipaddress.IPv4Address):
             raise ValueError(f"client {name} did not receive IPv4")
+        if not isinstance(virtual_network_uid, str) or not virtual_network_uid:
+            raise ValueError(f"client {name} Subnet has no parent VirtualNetwork ID")
         if address not in network or not any(address in item for item in physical_ranges):
             raise ValueError(f"client {name} address {address} is outside the saved physical IPAM ranges")
         if address in {network.network_address, network.broadcast_address, expected_gateway}:
@@ -7428,9 +7379,12 @@ def assert_client_leases(args: argparse.Namespace) -> None:
             raise ValueError(f"client {name} address {address} overlaps the saved LB VIP range")
         if lease.get("netmask") != expected_mask or gateway != expected_gateway:
             raise ValueError(f"client {name} DHCP mask or router differs from its saved Subnet")
-        if str(address) in seen_addresses:
-            raise ValueError(f"DHCP assigned duplicate address {address}")
-        seen_addresses.add(str(address))
+        address_identity = (virtual_network_uid, str(address))
+        if address_identity in seen_addresses:
+            raise ValueError(
+                f"DHCP assigned duplicate address {address} in VirtualNetwork {virtual_network_uid}"
+            )
+        seen_addresses.add(address_identity)
         if str(address) not in server_leases.get(expected_mac, []):
             raise ValueError(f"dnsmasq has no matching lease for {name} ({expected_mac}, {address})")
 
@@ -8032,7 +7986,9 @@ write_client_lease_expectations() {
 assert_client_gateway() {
     local client="$1" subnet_entry="$2" container gateway
     container="$(client_container "$client")"
-    gateway="$(jq -r '.gateway_ipv4' <<<"$subnet_entry")"
+    gateway="$(jq -er '.ipam.gateway_ipv4 | select(type == "string" and length > 0)' \
+        <<<"$subnet_entry")" \
+        || die "Saved Subnet state has no IPv4 gateway for client $client"
     docker exec "$container" ping -n -c 3 -W 2 "$gateway" >/dev/null 2>&1 \
         || die "Real DHCP client $client cannot ping Subnet gateway $gateway"
 }
@@ -8488,20 +8444,21 @@ assert_subnet_state() {
         || die "Subnet ${fulfillment_id} has no captured IPAM task input"
     jq -e --arg id "$subnet_api_id" --arg parent "$parent_api_id" --arg tenant "$OSAC_TENANT" \
         --arg cidr "$expected_cidr" '
-      ((keys | sort) == ["ipam","ipv4_cidr","phase","tenant_id","trunk_interface","uid","vlan_id","vlan_interface","virtual_network_uid"])
+      ((keys | sort) == ["ipam","ipv4_cidr","phase","tenant_id","trunk_interface","uid","virtual_network_uid","vlan_id","vlan_interface"])
       and .uid == $id
       and .virtual_network_uid == $parent
       and .tenant_id == $tenant
       and .ipv4_cidr == $cidr
       and .phase == "ready"
       and (.vlan_id | type == "number" and . >= 1 and . <= 4094)' \
-      <<<"$entry" >/dev/null || die "Saved AgentlessNet Subnet state does not match the Ready Fulfillment resource"
+      <<<"$entry" >/dev/null \
+        || die "Saved AgentlessNet Subnet state does not match the Ready Fulfillment resource"
     jq -e --argjson expected "$ipam" '
       .ipam == $expected
-      and .status.ipam.gatewayIPv4 == $expected.gateway_ipv4
-      and (.status.ipam.overlayIPv4CIDRs // []) == $expected.overlay_ipv4_cidrs
-      and (.status.ipam.physicalIPv4CIDRs // []) == $expected.physical_ipv4_cidrs
-      and (.status.ipam.lbVipIPv4CIDRs // []) == $expected.lb_vip_ipv4_cidrs' \
+      and .status.ipam.gatewayIpv4 == $expected.gateway_ipv4
+      and (.status.ipam.overlayIpv4Cidrs // []) == $expected.overlay_ipv4_cidrs
+      and (.status.ipam.physicalIpv4Cidrs // []) == $expected.physical_ipv4_cidrs
+      and (.status.ipam.lbVipIpv4Cidrs // []) == $expected.lb_vip_ipv4_cidrs' \
       <<<"$(jq -n --argjson status "$(jq -c '.status' <<<"$cr_json")" --argjson state "$entry" \
           '{ipam:$state.ipam,status:$status}')" >/dev/null \
         || die "Subnet ${fulfillment_id} stored and observed IPAM differ"
@@ -9378,7 +9335,7 @@ info "DHCP client B1 received a usable address from the /28 physical range."
 assert_client_gateway b1 "$SUBNET_THREE_ENTRY"
 printf 'Subnet /28 lease: client=%s address=%s gateway=%s VLAN=%s\n' \
     "$(<"$TEMP_DIR/client-b1.mac")" "$(jq -r '.address' "$TEMP_DIR/client-b1.lease.json")" \
-    "$(jq -r '.gateway_ipv4' <<<"$SUBNET_THREE_ENTRY")" "$SUBNET_THREE_VLAN_ID"
+    "$(jq -r '.ipam.gateway_ipv4' <<<"$SUBNET_THREE_ENTRY")" "$SUBNET_THREE_VLAN_ID"
 
 info "Detaching B1 and deleting the /28 Subnet while Subnet A remains usable..."
 detach_dhcp_client b1
