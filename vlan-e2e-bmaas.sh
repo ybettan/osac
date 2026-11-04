@@ -277,6 +277,10 @@ PY
         local route token
         local infra_dir
         OSAC_BMH_NAMESPACE="${OSAC_BMH_NAMESPACE:-host-inventory}"
+        # The suite's private-API client creates tenants, users, disk images and
+        # instance types, which the private API authorizes only for its admin
+        # identity. The public CLI keeps the least-privilege runner identity.
+        OSAC_SERVICE_ACCOUNT="${OSAC_BMAAS_PRIVATE_SERVICE_ACCOUNT:-admin}"
         export OSAC_NAMESPACE OSAC_SERVICE_ACCOUNT
         export OSAC_BMH_NAMESPACE
         export OSAC_CLI_PATH="$CLI_BIN"
