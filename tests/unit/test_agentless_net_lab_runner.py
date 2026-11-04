@@ -1595,6 +1595,7 @@ def test_bmaas_host_setup_uses_valid_bridge_names_and_recovers_ci_inventory() ->
     assert 'bridge="br-bmaas-l2"' in helper
     assert 'elif [[ -f "$inventory_file" ]]' in helper
     assert "Adopting the two BareMetalHosts from the existing BMaaS CI inventory." in helper
+    assert 'bash "$setup_script" 9>&-' in helper
     assert helper.index('python3 - "$state_file" "${bmh_names[@]}"') < helper.index(
         'virsh domiflist "$bmh_name"'
     )

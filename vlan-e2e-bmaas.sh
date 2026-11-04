@@ -118,7 +118,7 @@ EOF
                     KUBECONFIG="$KUBECONFIG" \
                     BMH_NAMESPACE="$bmh_namespace" \
                     BMH_COUNT=2 \
-                    bash "$setup_script"
+                    bash "$setup_script" 9>&-
                 [[ -f "$inventory_file" ]] \
                     || die "BMaaS CI setup did not write its raw host inventory"
                 mapfile -t bmh_names < <(jq -r '.hosts[].name' "$inventory_file")
