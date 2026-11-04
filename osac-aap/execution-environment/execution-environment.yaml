@@ -68,6 +68,9 @@ additional_build_steps:
     - RUN dnf install -y git  # required to pull non-versioned git collections specified in collections/requirements.yaml
   append_final:
     - RUN chmod 0755 /opt/builder/bin/entrypoint
+    # Template discovery runs as UID 1000/GID 0. Ensure collection metadata
+    # remains readable when a source archive carries owner-only directory modes.
+    - RUN chmod -R g+rX /usr/share/ansible/collections/ansible_collections/osac/templates
     - COPY --from=quay.io/openshift/origin-cli:4.19 /usr/bin/oc /usr/local/bin/
     - COPY --from=quay.io/openshift/origin-cli:4.19 /usr/bin/kubectl /usr/local/bin/
     # Multi-stage COPY --from, same pattern and trust model as oc/kubectl
