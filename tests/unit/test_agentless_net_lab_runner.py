@@ -372,6 +372,51 @@ if external_ip_pool_list_items "$RESPONSE" >/dev/null 2>&1; then exit 1; fi
     assert result.returncode == 0, result.stderr
 
 
+def test_external_ip_result_matches_the_typed_address_artifact(tmp_path: Path) -> None:
+    helper = function_block("external_ip_assert_result", "external_ip_assert_state")
+    valid = json.dumps({"osac_result": {"external_ip": {"address": "198.18.1.10"}}})
+    invalid = json.dumps({"osac_result": {"external_ip": {"address": "198.18.1.11"}}})
+    script = f"""
+set -euo pipefail
+{helper}
+external_ip_assert_result {shlex.quote(valid)} 198.18.1.10
+if external_ip_assert_result {shlex.quote(invalid)} 198.18.1.10; then exit 1; fi
+if external_ip_assert_result '{{}}' 198.18.1.10; then exit 1; fi
+"""
+
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_external_ip_replay_checks_saved_api_id_and_typed_address(tmp_path: Path) -> None:
+    helper = function_block("external_ip_assert_result", "external_ip_assert_state")
+    task_input = json.dumps({"resource": {"id": "external-ip-api-id"}})
+    result_file = tmp_path / "replay-result.json"
+    result_file.write_text(
+        json.dumps(
+            {
+                "artifacts": {
+                    "osac_result": {"external_ip": {"address": "198.18.1.10"}}
+                }
+            }
+        )
+    )
+    script = f"""
+set -euo pipefail
+TASK_INPUT={shlex.quote(task_input)}
+RESULT_FILE={shlex.quote(str(result_file))}
+{helper}
+external_ip_assert_replay_result "$TASK_INPUT" "$RESULT_FILE" external-ip-api-id 198.18.1.10
+if external_ip_assert_replay_result "$TASK_INPUT" "$RESULT_FILE" other-id 198.18.1.10; then exit 1; fi
+if external_ip_assert_replay_result "$TASK_INPUT" "$RESULT_FILE" external-ip-api-id 198.18.1.11; then exit 1; fi
+"""
+
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_external_ip_pool_cidr_can_be_overridden_for_a_lab_run(tmp_path):
     assignment = next(
         line for line in SOURCE.splitlines() if line.startswith("EXTERNAL_IP_POOL_CIDR=")
@@ -1048,6 +1093,26 @@ def test_generic_network_attachment_tasks_need_no_aap_kubernetes_credential() ->
     assert 'status.jobs' in SOURCE
 
 
+def test_client_gateway_uses_the_saved_subnet_ipam_plan(tmp_path: Path) -> None:
+    helper = function_block("assert_client_gateway", "assert_same_subnet_l2")
+    capture = tmp_path / "gateway-ping.txt"
+    subnet = {"ipam": {"gateway_ipv4": "10.250.0.1"}}
+    script = f"""
+set -euo pipefail
+CAPTURE={shlex.quote(str(capture))}
+client_container() {{ printf 'container-%s' "$1"; }}
+docker() {{ printf '%s\\n' "$*" >"$CAPTURE"; }}
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+{helper}
+assert_client_gateway a1 {shlex.quote(json.dumps(subnet))}
+"""
+
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert capture.read_text().strip() == "exec container-a1 ping -n -c 3 -W 2 10.250.0.1"
+
+
 def test_repeated_dhcp_lease_queries_use_distinct_private_result_files(tmp_path: Path) -> None:
     helper = function_block("discover_client_dhcp_lease", "offboard_client_from_subnet")
     (tmp_path / "client-a1.mac").write_text("02:00:00:00:00:01\n")
@@ -1486,6 +1551,42 @@ def test_bootstrap_pool_precedes_default_networking_and_keeps_existing_rows() ->
     assert "assert_legacy_provider_state_unchanged" in SOURCE
 
 
+def test_tenant_default_networking_wait_reads_private_tenant_status(tmp_path: Path) -> None:
+    private_get = function_block("tenant_private_get", "wait_for_tenant_default_networking")
+    waiter = function_block("wait_for_tenant_default_networking", "external_ip_pool_list_items")
+    tenant = {
+        "object": {
+            "id": "osac-e2e-ci",
+            "status": {
+                "state": "TENANT_STATE_SYNCED",
+                "conditions": [
+                    {
+                        "type": "TENANT_CONDITION_TYPE_DEFAULT_NETWORKING_READY",
+                        "status": "CONDITION_STATUS_TRUE",
+                        "reason": "AllResourcesReady",
+                        "message": "All default networking resources are ready",
+                    }
+                ],
+            },
+        }
+    }
+    script = f"""
+set -euo pipefail
+OSAC_TENANT=osac-e2e-ci
+tenant_private_get() {{ printf '%s\\n' "$TENANT_RESPONSE"; }}
+info() {{ :; }}
+die() {{ printf '%s\\n' "$1" >&2; exit 1; }}
+{waiter}
+wait_for_tenant_default_networking
+"""
+    result = run_bash(tmp_path, script, {"TENANT_RESPONSE": json.dumps(tenant)})
+
+    assert result.returncode == 0, result.stderr
+    assert "osac.private.v1.Tenants/Get" in private_get
+    assert "--output json" not in waiter
+    assert '.object.status.conditions[]?' in waiter
+
+
 def test_networking_status_uses_conditions_and_task_jobs_without_resetting_history() -> None:
     assert ".status.phase" not in SOURCE
     assert ".status.provisioningJobs" not in SOURCE
@@ -1780,14 +1881,96 @@ def test_nat_gateway_cleanup_discovery_scopes_crs_and_provider_identity() -> Non
     assert "test NATGateway provider row without a matching test CR" in cleanup
 
 
-def test_nat_gateway_cleanup_validates_aap_success_when_cr_job_status_lags() -> None:
+def test_nat_gateway_cleanup_uses_fulfillment_and_checks_provider_state() -> None:
     cleanup = function_block("delete_nat_gateway_and_verify", "cleanup_created_nat_gateways")
 
     assert 'network_task_entry "$gateway_cr" delete_nat_gateway' in cleanup
     assert 'if [[ "$job_state" == Failed || "$job_state" == Cancelled ]]' in cleanup
-    assert '&& "$job_state" == Succeeded' in cleanup
     assert '.status.taskInput' in cleanup
+    assert 'delete natgateway "$id"' in cleanup
+    assert 'nat_gateway_assert_provider_absent' in cleanup
+    assert 'oc patch natgateway' not in cleanup
+    assert 'hold_finalizer' not in cleanup
     assert 'nat_gateway_aap_job_details' not in cleanup
+
+
+def test_external_ip_deletion_uses_fulfillment_without_direct_cr_patches() -> None:
+    delete = function_block("delete_external_ip_and_verify", "run_external_ip_lifecycle")
+    cleanup = function_block("cleanup_created_external_ips", "cleanup_created_external_ip_attachments")
+
+    assert 'delete externalip "$id"' in delete
+    assert 'external_ip_assert_state_absent "$uid" "$id"' in delete
+    assert 'delete externalip "$id"' in cleanup
+    assert 'oc patch externalip' not in delete
+    assert 'oc patch externalip' not in cleanup
+    assert 'hold_finalizer' not in delete
+    assert 'hold_finalizer' not in cleanup
+
+
+def test_nat_gateway_task_input_assertion_uses_dependency_snapshots(tmp_path: Path) -> None:
+    helper = function_block("nat_gateway_assert_task_input", "nat_gateway_wait_for_ready")
+    gateway_cr = {
+        "metadata": {"generation": 3},
+        "status": {
+            "taskInput": {
+                "resource": {
+                    "kind": "NATGateway",
+                    "id": "natgateway-id",
+                    "metadata": {"generation": 3},
+                    "spec": {},
+                },
+                "virtual_network": {
+                    "id": "virtualnetwork-id",
+                    "spec": {"ipv4Cidr": "10.250.0.0/16"},
+                },
+                "external_ip": {
+                    "id": "externalip-id",
+                    "address": "198.18.1.10",
+                },
+                "nat_gateway_context": {
+                    "external_ip": {
+                        "fulfillment_id": "externalip-id",
+                        "address": "198.18.1.10",
+                    },
+                    "virtual_network": {
+                        "fulfillment_id": "virtualnetwork-id",
+                        "ipv4_cidr": "10.250.0.0/16",
+                    },
+                },
+            }
+        },
+    }
+    external_ip_cr = {"status": {"address": "198.18.1.10"}}
+    virtual_network_cr = {"spec": {"ipv4Cidr": "10.250.0.0/16"}}
+    malformed_gateway_cr = json.loads(json.dumps(gateway_cr))
+    malformed_gateway_cr["status"]["taskInput"]["resource"]["spec"] = {
+        "externalIP": "externalip-id"
+    }
+    valid_script = f"""
+set -euo pipefail
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+{helper}
+nat_gateway_assert_task_input {shlex.quote(json.dumps(gateway_cr))} \\
+    {shlex.quote(json.dumps(external_ip_cr))} \\
+    {shlex.quote(json.dumps(virtual_network_cr))} natgateway-id externalip-id virtualnetwork-id
+"""
+    malformed_script = f"""
+set -euo pipefail
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+{helper}
+nat_gateway_assert_task_input {shlex.quote(json.dumps(malformed_gateway_cr))} \\
+    {shlex.quote(json.dumps(external_ip_cr))} \\
+    {shlex.quote(json.dumps(virtual_network_cr))} natgateway-id externalip-id virtualnetwork-id
+"""
+
+    result = run_bash(tmp_path, valid_script)
+
+    assert result.returncode == 0, result.stderr
+
+    malformed_result = run_bash(tmp_path, malformed_script)
+
+    assert malformed_result.returncode != 0
+    assert "stored task input does not match" in malformed_result.stderr
 
 
 def test_nat_gateway_endpoint_cleanup_matches_docker_resolved_router_id(tmp_path: Path) -> None:
@@ -2588,3 +2771,70 @@ def test_standalone_subnet_cleanup_offboards_saved_test_bmis_before_removing_cli
         "cleanup_interrupted_dhcp_clients"
     )
     assert '"${CLEANUP_CLIENTS_COMPLETE:-true}" != true' in on_exit
+
+
+def test_dhcp_lease_uniqueness_is_scoped_to_virtual_network(tmp_path):
+    helper_block = function_block("write_agentless_e2e_helpers", "nvue_interface_config")
+    source_start = helper_block.index("<<'PY'\n") + len("<<'PY'\n")
+    source_end = helper_block.index('\nPY\n    cat >"$DHCP_CLIENT_HOOK"', source_start)
+    helper_path = tmp_path / "dhcp_clients.py"
+    helper_path.write_text(helper_block[source_start:source_end])
+
+    client_macs = {
+        "a1": "02:00:00:00:00:01",
+        "b1": "02:00:00:00:00:02",
+    }
+    dnsmasq_leases = tmp_path / "dnsmasq.leases"
+    dnsmasq_leases.write_text(
+        "".join(f"0 {mac} 10.250.0.2 {name} *\n" for name, mac in client_macs.items())
+    )
+
+    def run_case(virtual_network_ids: dict[str, str]):
+        expected_clients = []
+        args = [
+            sys.executable,
+            str(helper_path),
+            "assert-client-leases",
+            "--expected",
+            str(tmp_path / "expected.json"),
+            "--dnsmasq-leases",
+            str(dnsmasq_leases),
+        ]
+        for name, mac in client_macs.items():
+            lease_path = tmp_path / f"{name}.json"
+            lease_path.write_text(
+                json.dumps(
+                    {
+                        "address": "10.250.0.2",
+                        "netmask": "255.255.255.0",
+                        "router": "10.250.0.1",
+                        "mac": mac,
+                    }
+                )
+            )
+            expected_clients.append(
+                {
+                    "name": name,
+                    "mac": mac,
+                    "subnet": {
+                        "uid": f"subnet-{name}",
+                        "virtual_network_uid": virtual_network_ids[name],
+                        "ipv4_cidr": "10.250.0.0/24",
+                        "ipam": {
+                            "gateway_ipv4": "10.250.0.1",
+                            "physical_ipv4_cidrs": ["10.250.0.0/24"],
+                            "lb_vip_ipv4_cidrs": [],
+                        },
+                    },
+                }
+            )
+            args.extend(["--lease", f"{name}={lease_path}"])
+        (tmp_path / "expected.json").write_text(json.dumps({"clients": expected_clients}))
+        return subprocess.run(args, capture_output=True, text=True, timeout=5)
+
+    overlapping_networks = run_case({"a1": "vn-a", "b1": "vn-b"})
+    assert overlapping_networks.returncode == 0, overlapping_networks.stderr
+
+    same_network = run_case({"a1": "vn-a", "b1": "vn-a"})
+    assert same_network.returncode != 0
+    assert "duplicate address 10.250.0.2 in VirtualNetwork vn-a" in same_network.stderr
