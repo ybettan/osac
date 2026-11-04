@@ -1730,9 +1730,17 @@ if original_inventory is not None and original_inventory.rstrip("\n") != expecte
             for key, value in expected_all.get("vars", {}).items()
             if key not in ("agentless_net_provisioning_network", "agentless_net_host_ports")
         }
+        # The runner manages the provisioning network and host ports itself, so
+        # an inventory it wrote earlier may already carry them. Compare only the
+        # switch inventory, which this upgrade must never change.
+        existing_legacy_vars = {
+            key: value
+            for key, value in existing_all.get("vars", {}).items()
+            if key not in ("agentless_net_provisioning_network", "agentless_net_host_ports")
+        }
         safe_upgrade = (
             set(existing) == {"all"}
-            and existing_all.get("vars", {}) == expected_legacy_vars
+            and existing_legacy_vars == expected_legacy_vars
             and set(old_children) in ({"net_nodes"}, {"net_nodes", "switches"})
             and old_net_nodes == new_net_nodes
             and (
@@ -1740,7 +1748,7 @@ if original_inventory is not None and original_inventory.rstrip("\n") != expecte
                 or old_children["switches"] == expected_children["switches"]
             )
         )
-    except (KeyError, TypeError):
+    except (AttributeError, KeyError, TypeError):
         safe_upgrade = False
     if not safe_upgrade:
         raise SystemExit("existing AgentlessNet inventory is not the known legacy inventory")
