@@ -1586,6 +1586,20 @@ def test_bmaas_upgrade_syncs_aap_before_template_publication() -> None:
     assert aap_sync.index("configure_aap_execution_environment") < upgrade
 
 
+def test_bmaas_host_setup_uses_valid_bridge_names_and_recovers_ci_inventory() -> None:
+    helper_start = BMAAS_SOURCE.index("    bmaas_prepare_hosts() {")
+    helper_end = BMAAS_SOURCE.index("    bmaas_configure_host_ports() {", helper_start)
+    helper = BMAAS_SOURCE[helper_start:helper_end]
+
+    assert 'bridge="br-bmaas-l1"' in helper
+    assert 'bridge="br-bmaas-l2"' in helper
+    assert 'elif [[ -f "$inventory_file" ]]' in helper
+    assert "Adopting the two BareMetalHosts from the existing BMaaS CI inventory." in helper
+    assert helper.index('python3 - "$state_file" "${bmh_names[@]}"') < helper.index(
+        'virsh domiflist "$bmh_name"'
+    )
+
+
 def test_agentless_overlay_is_bmaas_only_with_physical_ipam_and_fresh_state() -> None:
     overlay = yaml.safe_load((REPO_ROOT / "osac-installer/values/agentless-net-stub.yaml").read_text())
     profile = yaml.safe_load((REPO_ROOT / "osac-installer/values/bmaas-ci/instance.yaml").read_text())

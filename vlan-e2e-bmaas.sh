@@ -56,10 +56,11 @@ EOF
     }
 
     bmaas_prepare_hosts() {
-        local state_file infra_dir setup_script bmh_name bridge host_link fabric_mac switch vm_state
+        local state_file inventory_file infra_dir setup_script bmh_name bridge host_link fabric_mac switch vm_state
         local bmh_namespace="${OSAC_BMH_NAMESPACE:-host-inventory}"
         local -a bmh_names=("virtual-bmh-${MGMT_CLONE_NAME}-1" "virtual-bmh-${MGMT_CLONE_NAME}-2")
         state_file="$(bmaas_host_state_file)"
+        inventory_file="${HOME}/virtual-bmh-inventory-${MGMT_CLONE_NAME}.json"
         mkdir -p "$(dirname "$state_file")"
         chmod 0700 "$(dirname "$state_file")"
 
@@ -74,6 +75,18 @@ EOF
                 oc get bmh "$bmh_name" -n "$bmh_namespace" >/dev/null 2>&1 \
                     || die "Recorded BMaaS host ${bmh_name} is missing; inspect the lab before recovery"
             done < <(jq -r '.hosts[].name' "$state_file")
+        elif [[ -f "$inventory_file" ]]; then
+            mapfile -t bmh_names < <(jq -r '.hosts[].name' "$inventory_file")
+            [[ "${#bmh_names[@]}" == 2 ]] \
+                || die "BMaaS CI inventory must contain exactly two hosts"
+            while IFS= read -r bmh_name; do
+                [[ -n "$bmh_name" ]] || continue
+                virsh dominfo "$bmh_name" >/dev/null 2>&1 \
+                    || die "BMaaS inventory VM ${bmh_name} is missing; inspect the lab before recovery"
+                oc get bmh "$bmh_name" -n "$bmh_namespace" >/dev/null 2>&1 \
+                    || die "BMaaS inventory host ${bmh_name} is missing; inspect the lab before recovery"
+            done < <(jq -r '.hosts[].name' "$inventory_file")
+            info "Adopting the two BareMetalHosts from the existing BMaaS CI inventory."
         else
             local all_existing=true any_existing=false
             for bmh_name in "${bmh_names[@]}"; do
@@ -106,28 +119,53 @@ EOF
                     BMH_NAMESPACE="$bmh_namespace" \
                     BMH_COUNT=2 \
                     bash "$setup_script"
-                local inventory_file="${HOME}/virtual-bmh-inventory-${MGMT_CLONE_NAME}.json"
-                if [[ -f "$inventory_file" ]]; then
-                    mapfile -t bmh_names < <(jq -r '.hosts[].name' "$inventory_file")
-                    [[ "${#bmh_names[@]}" == 2 ]] \
-                        || die "BMaaS CI inventory must contain exactly two hosts"
-                fi
+                [[ -f "$inventory_file" ]] \
+                    || die "BMaaS CI setup did not write its raw host inventory"
+                mapfile -t bmh_names < <(jq -r '.hosts[].name' "$inventory_file")
+                [[ "${#bmh_names[@]}" == 2 ]] \
+                    || die "BMaaS CI inventory must contain exactly two hosts"
             else
                 info "Adopting the two existing BMaaS virtual hosts for this lab."
             fi
         fi
+
+        # Save host ownership before attaching the fabric NICs. If a later
+        # bridge or port setup step fails, the next run can adopt these hosts.
+        python3 - "$state_file" "${bmh_names[@]}" <<'PY'
+import json
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+names = sys.argv[2:]
+hosts = [
+    {
+        "name": name,
+        "interface": "data-0",
+        "switch": f"clab-agentless-net-lab-leaf-{index}",
+        "port": "swp5",
+        "fabric_mac": f"52:54:00:ba:aa:{index:02x}",
+    }
+    for index, name in enumerate(names, start=1)
+]
+tmp = path.with_suffix(".tmp")
+tmp.write_text(json.dumps({"hosts": hosts}, indent=2) + "\n")
+tmp.chmod(0o600)
+os.replace(tmp, path)
+PY
 
         local index=0
         for bmh_name in "${bmh_names[@]}"; do
             index=$((index + 1))
             if [[ "$index" == 1 ]]; then
                 host_link="bmaas-l1"
-                bridge="br-osac-bmaas-l1"
+                bridge="br-bmaas-l1"
                 switch="${CONTAINERLAB_PREFIX}-leaf-1"
                 fabric_mac="52:54:00:ba:aa:01"
             else
                 host_link="bmaas-l2"
-                bridge="br-osac-bmaas-l2"
+                bridge="br-bmaas-l2"
                 switch="${CONTAINERLAB_PREFIX}-leaf-2"
                 fabric_mac="52:54:00:ba:aa:02"
             fi
@@ -189,30 +227,6 @@ EOF
             grep -Fxq "$fabric_mac" <<<"$hardware_nics" \
                 || die "BMaaS host ${bmh_name} hardware inspection did not report its AgentlessNet NIC"
         done
-
-        python3 - "$state_file" "${bmh_names[@]}" <<'PY'
-import json
-import os
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-names = sys.argv[2:]
-hosts = [
-    {
-        "name": name,
-        "interface": "data-0",
-        "switch": f"clab-agentless-net-lab-leaf-{index}",
-        "port": "swp5",
-        "fabric_mac": f"52:54:00:ba:aa:{index:02x}",
-    }
-    for index, name in enumerate(names, start=1)
-]
-tmp = path.with_suffix(".tmp")
-tmp.write_text(json.dumps({"hosts": hosts}, indent=2) + "\n")
-tmp.chmod(0o600)
-os.replace(tmp, path)
-PY
 
         python3 - "$state_file" "$BMAAS_HOST_PORTS_FILE" <<'PY'
 import json
