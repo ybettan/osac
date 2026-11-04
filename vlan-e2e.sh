@@ -1293,28 +1293,33 @@ assert_containerlab_admin_nvue_key() {
 }
 
 discard_containerlab_stale_candidate() {
-    local switch="$1" pending_diff line
+    local switch="$1" pending_diff line attempt discarded=false
     # A pending NVUE revision that only stages per-run provider keys is runner
     # litter: an interrupted run can leave one behind, either removing its own
     # key or restoring the key set it saw when it started. Applying such a
     # revision reverts newer applied configuration, so discard it instead.
+    # Staging several commands and applying them leaves one pending revision
+    # per layer, so keep detaching until nothing runner-owned remains.
     local stale_candidate_re='^nv (set|unset) system aaa user cumulus ssh authorized-key osac_e2e_[0-9]+_[0-9]+( (key|type)( .*)?)?$'
-    pending_diff="$(switch_nvue_diff admin "$switch")" \
-        || die "Could not inspect pending NVUE changes on ${switch} before discarding a stale candidate"
-    [[ -n "$pending_diff" ]] || return 0
-    while IFS= read -r line; do
-        line="${line%$'\r'}"
-        [[ -z "$line" ]] && continue
-        [[ "$line" =~ $stale_candidate_re ]] \
-            || die "Switch ${switch} has unrelated pending NVUE changes; refusing to discard a provider-key candidate"
-    done <<<"$pending_diff"
-    switch_admin_user_exec "$switch" nv config detach \
-        || die "Could not discard the stale NVUE provider-key candidate on ${switch}"
-    pending_diff="$(switch_nvue_diff admin "$switch")" \
-        || die "Could not verify the discarded NVUE candidate on ${switch}"
-    [[ -z "$pending_diff" ]] \
-        || die "NVUE candidate changes remain on ${switch} after discarding a stale provider-key candidate"
-    info "Discarded a stale per-run NVUE provider-key candidate on ${switch}."
+    for ((attempt = 1; attempt <= 64; attempt++)); do
+        pending_diff="$(switch_nvue_diff admin "$switch")" \
+            || die "Could not inspect pending NVUE changes on ${switch} before discarding a stale candidate"
+        if [[ -z "$pending_diff" ]]; then
+            [[ "$discarded" == false ]] \
+                || info "Discarded stale per-run NVUE provider-key candidates on ${switch}."
+            return 0
+        fi
+        while IFS= read -r line; do
+            line="${line%$'\r'}"
+            [[ -z "$line" ]] && continue
+            [[ "$line" =~ $stale_candidate_re ]] \
+                || die "Switch ${switch} has unrelated pending NVUE changes; refusing to discard a provider-key candidate"
+        done <<<"$pending_diff"
+        switch_admin_user_exec "$switch" nv config detach \
+            || die "Could not discard a stale NVUE provider-key candidate on ${switch}"
+        discarded=true
+    done
+    die "Could not discard every stale NVUE provider-key candidate on ${switch}"
 }
 
 reclaim_containerlab_provider_keys() {
@@ -1450,6 +1455,9 @@ configure_containerlab_fabric() {
     local switch pending_diff playbook_log
     while IFS= read -r switch; do
         [[ -n "$switch" ]] || continue
+        # Staging the provider key can leave runner-owned pending revisions
+        # behind; discard those, but never unrelated candidate changes.
+        discard_containerlab_stale_candidate "$switch"
         if ! pending_diff="$(switch_nvue_diff provider "$switch")"; then
             die "Could not inspect pending NVUE changes on $switch"
         fi
