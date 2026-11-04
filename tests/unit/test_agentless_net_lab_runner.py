@@ -1507,6 +1507,62 @@ PY
     assert "not the known legacy inventory" in result.stderr
 
 
+def test_bmaas_pytest_env_uses_private_admin_service_account(tmp_path):
+    helper = BMAAS_SOURCE[
+        BMAAS_SOURCE.index("    bmaas_pytest_env() {") : BMAAS_SOURCE.index(
+            "    run_bmaas_suite() {"
+        )
+    ]
+    script = f"""
+set -euo pipefail
+OSAC_NAMESPACE=osac-e2e-ci
+OSAC_SERVICE_ACCOUNT=osac-operator
+OSAC_BMH_NAMESPACE=host-inventory
+OSAC_BMAAS_HOSTS_FILE=/tmp/hosts.json
+CLI_BIN=/tmp/osac-cli
+RUNTIME_SOURCE_COMMIT=abc123
+AAP_PROJECT_EXPECTED_REVISION=abc123
+AAP_IMAGE=quay.example/aap:tag
+BMF_IMAGE=quay.example/bmf:tag
+CONTAINER_TOOL=/bin/true
+AAP_API_CA_FILE=/tmp/ca.pem
+EXTERNAL_IP_TEST_LINK_CLIENT_ADDRESS=192.0.2.10
+NAT_GATEWAY_RESPONSE_PORT=18081
+NAT_GATEWAY_RESPONSE_TOKEN=token
+CONTAINERLAB_UPSTREAM_ROUTER=upstream
+EXTERNAL_IP_TEST_LINK_NODE_ADDRESS=192.0.2.1
+EXTERNAL_IP_CLIENT_ROUTE_INTERFACE=eth1
+VLAN_E2E_RUN_DIR={shlex.quote(str(tmp_path))}
+VLAN_E2E_REUSE_INFRA=false
+OSAC_BMAAS_PRIVATE_SERVICE_ACCOUNT="${{TEST_PRIVATE_SA:-}}"
+bmaas_test_infra_dir() {{ printf '/tmp'; }}
+bmaas_test_infra_ref() {{ printf 'ref'; }}
+bmaas_host_state_file() {{ printf '%s' "$OSAC_BMAAS_HOSTS_FILE"; }}
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+oc() {{
+    case "$*" in
+        *"get route osac-aap"*) printf 'aap.example\\n' ;;
+        *"exec deployment/osac-operator"*) printf 'aaptoken' ;;
+        *) return 2 ;;
+    esac
+}}
+{helper}
+bmaas_pytest_env
+printf 'SA=%s NS=%s\\n' "$OSAC_SERVICE_ACCOUNT" "$OSAC_NAMESPACE"
+"""
+    default_result = run_bash(tmp_path, script)
+
+    assert default_result.returncode == 0, default_result.stderr
+    assert "SA=admin NS=osac-e2e-ci" in default_result.stdout
+
+    override_result = run_bash(
+        tmp_path, script, env={"TEST_PRIVATE_SA": "osac-e2e-private"}
+    )
+
+    assert override_result.returncode == 0, override_result.stderr
+    assert "SA=osac-e2e-private NS=osac-e2e-ci" in override_result.stdout
+
+
 def test_aap_ca_bundle_combines_osac_and_default_ingress_cas(tmp_path):
     helper = function_block("prepare_aap_ca_bundle", "sync_aap_project_revision")
     osac_ca = "-----BEGIN CERTIFICATE-----\nOSAC-CA\n-----END CERTIFICATE-----\n"
