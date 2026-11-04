@@ -1292,34 +1292,35 @@ assert_containerlab_admin_nvue_key() {
         || die "The persistent administrator SSH key is not accepted on ${switch}"
 }
 
-reclaim_containerlab_provider_keys() {
-    local switch="$1" pending_diff key_config line key changed=false
+discard_containerlab_stale_candidate() {
+    local switch="$1" pending_diff line
     # A pending NVUE revision that only stages per-run provider keys is runner
     # litter: an interrupted run can leave one behind, either removing its own
-    # key or restoring the key set it saw when it started.
+    # key or restoring the key set it saw when it started. Applying such a
+    # revision reverts newer applied configuration, so discard it instead.
     local stale_candidate_re='^nv (set|unset) system aaa user cumulus ssh authorized-key osac_e2e_[0-9]+_[0-9]+( (key|type)( .*)?)?$'
-    local -a stale_keys=()
     pending_diff="$(switch_nvue_diff admin "$switch")" \
-        || die "Could not inspect pending NVUE changes on ${switch} before reclaiming stale provider keys"
-    if [[ -n "$pending_diff" ]]; then
-        while IFS= read -r line; do
-            line="${line%$'\r'}"
-            [[ -z "$line" ]] && continue
-            [[ "$line" =~ $stale_candidate_re ]] \
-                || die "Switch ${switch} has unrelated pending NVUE changes; refusing to reclaim stale provider keys"
-        done <<<"$pending_diff"
-        # Applying a stale candidate would revert whatever was applied after it
-        # was created, so discard the candidate and reclaim from the applied
-        # revision instead.
-        switch_admin_user_exec "$switch" nv config detach \
-            || die "Could not discard the stale NVUE provider-key candidate on ${switch}"
-        changed=true
-        pending_diff="$(switch_nvue_diff admin "$switch")" \
-            || die "Could not verify the discarded NVUE candidate on ${switch}"
-        [[ -z "$pending_diff" ]] \
-            || die "NVUE candidate changes remain on ${switch} after discarding a stale provider-key candidate"
-    fi
+        || die "Could not inspect pending NVUE changes on ${switch} before discarding a stale candidate"
+    [[ -n "$pending_diff" ]] || return 0
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        [[ -z "$line" ]] && continue
+        [[ "$line" =~ $stale_candidate_re ]] \
+            || die "Switch ${switch} has unrelated pending NVUE changes; refusing to discard a provider-key candidate"
+    done <<<"$pending_diff"
+    switch_admin_user_exec "$switch" nv config detach \
+        || die "Could not discard the stale NVUE provider-key candidate on ${switch}"
+    pending_diff="$(switch_nvue_diff admin "$switch")" \
+        || die "Could not verify the discarded NVUE candidate on ${switch}"
+    [[ -z "$pending_diff" ]] \
+        || die "NVUE candidate changes remain on ${switch} after discarding a stale provider-key candidate"
+    info "Discarded a stale per-run NVUE provider-key candidate on ${switch}."
+}
 
+reclaim_containerlab_provider_keys() {
+    local switch="$1" pending_diff key_config key changed=false
+    local -a stale_keys=()
+    discard_containerlab_stale_candidate "$switch"
     key_config="$(switch_admin_user_exec "$switch" nv show system aaa user cumulus ssh authorized-key --output json)" \
         || die "Could not inspect NVUE authorized keys on ${switch} while reclaiming stale provider keys"
     mapfile -t stale_keys < <(jq -r 'keys[] | select(startswith("osac_e2e_"))' <<<"$key_config")
@@ -1332,6 +1333,9 @@ reclaim_containerlab_provider_keys() {
         switch_admin_user_exec "$switch" nv config apply --assume-yes \
             || die "Could not apply the stale provider-key cleanup on ${switch}"
         changed=true
+        # An apply can leave an older pending revision reachable again, so the
+        # candidate must be re-checked before the fabric preflight runs.
+        discard_containerlab_stale_candidate "$switch"
         pending_diff="$(switch_nvue_diff admin "$switch")" \
             || die "Could not verify the stale provider-key cleanup on ${switch}"
         [[ -z "$pending_diff" ]] \
@@ -1425,6 +1429,7 @@ prepare_containerlab_switches() {
             reclaim_containerlab_provider_keys "$switch"
         fi
         install_containerlab_switch_provider_key "$switch" "$provider_key_type" "$provider_key_data"
+        discard_containerlab_stale_candidate "$switch"
     done < <(jq -r '.switches[].name' "$SWITCH_MANIFEST_FILE")
     while IFS= read -r switch; do
         [[ -n "$switch" ]] || continue
