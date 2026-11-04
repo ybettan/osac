@@ -3,6 +3,9 @@ all:
     agentless_net_provisioning_network:
       name: agentless-provisioning
       vlan_id: 1
+    agentless_net_bmaas_switch_ports:
+      clab-agentless-net-lab-leaf-1: [swp5]
+      clab-agentless-net-lab-leaf-2: [swp5]
     agentless_net_host_ports:
       osac-e2e-a1:
         eth0:

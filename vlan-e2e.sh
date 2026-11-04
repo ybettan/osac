@@ -12,6 +12,8 @@ umask 077
 
 VLAN_E2E_SUITE="full"
 CLEANUP_MODE=false
+BMAAS_MODE=false
+BMAAS_HOST_PORTS_FILE=""
 
 usage() {
     cat <<'USAGE'
@@ -75,6 +77,11 @@ argument_error() {
 SUITE_SELECTED=false
 while (($# > 0)); do
     case "$1" in
+        --bmaas)
+            [[ "${BMAAS_MODE:-false}" == false ]] || argument_error "--bmaas may be specified only once"
+            BMAAS_MODE=true
+            shift
+            ;;
         --help|-h)
             usage
             exit 0
@@ -105,6 +112,11 @@ while (($# > 0)); do
         *) argument_error "unexpected argument: $1" ;;
     esac
 done
+
+if [[ "${BMAAS_MODE:-false}" == true ]]; then
+    [[ "$SUITE_SELECTED" == false ]] || argument_error "--bmaas cannot be combined with --suite"
+    VLAN_E2E_SUITE="full"
+fi
 
 case "$VLAN_E2E_SUITE" in
     full)
@@ -175,6 +187,9 @@ if [[ "$SUITE_USES_EXTERNAL_IP_ATTACHMENT" == true || "$SUITE_USES_NAT_GATEWAY" 
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "$BMAAS_MODE" == true ]]; then
+    BMAAS_HOST_PORTS_FILE="${REPO_ROOT}/.artifacts/agentless-net-bmaas/host-ports.json"
+fi
 AAP_DIR="${REPO_ROOT}/osac-aap"
 INSTALLER_DIR="${REPO_ROOT}/osac-installer"
 FABRIC_DIR="${REPO_ROOT}/tests/e2e/agentless_net/lab"
@@ -218,12 +233,19 @@ VLAN_E2E_ARTIFACT_DIR="${VLAN_E2E_ARTIFACT_DIR:-}"
 VLAN_E2E_TAKE_OWNERSHIP="${VLAN_E2E_TAKE_OWNERSHIP:-false}"
 VLAN_E2E_REUSE_INFRA="${VLAN_E2E_REUSE_INFRA:-false}"
 DHCP_CLIENT_PREFIX="${DHCP_CLIENT_PREFIX:-osac6752-$(date -u +%Y%m%d%H%M%S)}"
-IMPLEMENTATION_BRANCH_NAME="osac-6752-agentless-contract"
+IMPLEMENTATION_BRANCH_NAME="${VLAN_E2E_RUNTIME_BRANCH:-e2e}"
 CURRENT_BRANCH="$(git -C "$REPO_ROOT" branch --show-current)"
 if [[ "$CURRENT_BRANCH" != e2e ]]; then
     printf 'ERROR: run vlan-e2e.sh from the e2e branch; current branch is %s\n' "$CURRENT_BRANCH" >&2
     exit 1
 fi
+LAB_STATE_DIR="${REPO_ROOT}/.artifacts/agentless-net-lab"
+mkdir -p "$LAB_STATE_DIR"
+exec 9>"${LAB_STATE_DIR}/runner.lock"
+flock -n 9 || {
+    printf 'ERROR: another VLAN or BMaaS E2E run is using this shared lab\n' >&2
+    exit 1
+}
 
 resolve_runtime_source() {
     local repo="$1" implementation_branch="$2" source_commit
@@ -283,13 +305,16 @@ for runtime_path in osac-aap osac-operator fulfillment-service proto osac-instal
 done
 IMAGE_SOURCE_COMMIT="$RUNTIME_SOURCE_COMMIT"
 IMAGE_SOURCE_SHORT="${IMAGE_SOURCE_COMMIT:0:12}"
-AAP_IMAGE="${AAP_IMAGE:-quay.io/ybettan/osac-aap:osac-6752-${IMAGE_SOURCE_SHORT}}"
-OPERATOR_IMAGE="${OPERATOR_IMAGE:-quay.io/ybettan/osac-operator:osac-6752-${IMAGE_SOURCE_SHORT}}"
-FULFILLMENT_IMAGE="${FULFILLMENT_IMAGE:-quay.io/ybettan/fulfillment-service:osac-6752-${IMAGE_SOURCE_SHORT}}"
+AAP_IMAGE="${AAP_IMAGE:-quay.io/ybettan/osac-aap:osac-bmaas-${IMAGE_SOURCE_SHORT}}"
+OPERATOR_IMAGE="${OPERATOR_IMAGE:-quay.io/ybettan/osac-operator:osac-bmaas-${IMAGE_SOURCE_SHORT}}"
+FULFILLMENT_IMAGE="${FULFILLMENT_IMAGE:-quay.io/ybettan/fulfillment-service:osac-bmaas-${IMAGE_SOURCE_SHORT}}"
+BMF_IMAGE="${BMF_IMAGE:-quay.io/ybettan/bare-metal-fulfillment-operator:osac-bmaas-${IMAGE_SOURCE_SHORT}}"
 OPERATOR_IMAGE_REPOSITORY="${OPERATOR_IMAGE%:*}"
 OPERATOR_IMAGE_TAG="${OPERATOR_IMAGE##*:}"
 FULFILLMENT_IMAGE_REPOSITORY="${FULFILLMENT_IMAGE%:*}"
 FULFILLMENT_IMAGE_TAG="${FULFILLMENT_IMAGE##*:}"
+BMF_IMAGE_REPOSITORY="${BMF_IMAGE%:*}"
+BMF_IMAGE_TAG="${BMF_IMAGE##*:}"
 AAP_PROJECT_GIT_URI="${AAP_PROJECT_GIT_URI:-https://github.com/ybettan/osac}"
 AAP_PROJECT_GIT_BRANCH="${AAP_PROJECT_GIT_BRANCH:-${RUNTIME_SOURCE_BRANCH}}"
 AAP_PREFIX="${AAP_PREFIX:-${AAP_ORGANIZATION_NAME:-osac}}"
@@ -1395,10 +1420,15 @@ write_provider_inventory() {
     local inventory_file="$TEMP_DIR/inventory.yml"
     local host_file="$TEMP_DIR/inventory-host"
     local user_file="$TEMP_DIR/inventory-user"
+    local dynamic_bmaas_ports_file=""
     local configmap_json configured_state_file expected_inventory patch_file existing_inventory
+    if [[ -f "$BMAAS_HOST_PORTS_FILE" ]]; then
+        dynamic_bmaas_ports_file="$BMAAS_HOST_PORTS_FILE"
+    fi
     MGMT_BRIDGE="$MGMT_BRIDGE" MGMT_GW="$MGMT_GW" \
         MGMT_PREFIX="$MGMT_PREFIX" MGMT_CIDR="$MGMT_CIDR" \
         MGMT_DHCP_RANGES="$MGMT_DHCP_RANGES" \
+        AGENTLESS_NET_BMAAS_HOST_PORTS_FILE="$dynamic_bmaas_ports_file" \
         "$AAP_DIR/.venv/bin/python" - "$CONTAINERLAB_INVENTORY" \
         "$CONTAINERLAB_TOPOLOGY" "$inventory_file" "$host_file" "$user_file" \
         "$SWITCH_MANIFEST_FILE" <<'PY'
@@ -1530,6 +1560,21 @@ if not isinstance(provisioning_vlan, int) or not 1 <= provisioning_vlan <= 4094:
 host_ports = all_vars.get("agentless_net_host_ports")
 if not isinstance(host_ports, dict) or not host_ports:
     raise SystemExit("local lab inventory must define AgentlessNet BMI host-port mappings")
+dynamic_bmaas_ports_path = os.environ.get("AGENTLESS_NET_BMAAS_HOST_PORTS_FILE", "")
+if dynamic_bmaas_ports_path:
+    try:
+        dynamic_bmaas_ports = json.loads(pathlib.Path(dynamic_bmaas_ports_path).read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit("dynamic BMaaS host-port inventory is unreadable") from error
+    if not isinstance(dynamic_bmaas_ports, dict):
+        raise SystemExit("dynamic BMaaS host-port inventory must be a mapping")
+    for host_name, interfaces in dynamic_bmaas_ports.items():
+        if host_name in host_ports:
+            raise SystemExit("dynamic BMaaS host-port inventory conflicts with a configured host")
+        host_ports[host_name] = interfaces
+bmaas_switch_ports = all_vars.get("agentless_net_bmaas_switch_ports", {})
+if not isinstance(bmaas_switch_ports, dict):
+    raise SystemExit("AgentlessNet BMaaS switch-port inventory must be a mapping")
 claimed_ports = set()
 for host_name, interfaces in host_ports.items():
     if not isinstance(host_name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,63}", host_name):
@@ -1561,6 +1606,7 @@ output = {
                 "vlan_id": provisioning_vlan,
             },
             "agentless_net_host_ports": host_ports,
+            "agentless_net_bmaas_switch_ports": bmaas_switch_ports,
         },
         "children": {
             "net_nodes": {
@@ -2304,6 +2350,7 @@ deployment_settings() {
         eeImage: .aap.configAsCode.eeImage,
         projectGitUri: .aap.configAsCode.projectGitUri,
         projectGitBranch: .aap.configAsCode.projectGitBranch,
+        publishTemplatesEnabled: .aap.instanceGroups.publishTemplates.enabled,
         stateFile: .aap.instanceGroups.networkFulfillment.config.AGENTLESS_NET_STATE_FILE
       },
       operator: {
@@ -2317,6 +2364,15 @@ deployment_settings() {
           repository: .service.images.service.repository,
           tag: .service.images.service.tag
         }
+      },
+      bmf: {
+        image: {
+          repository: .bmf.image.repository,
+          tag: .bmf.image.tag
+        },
+        replicaCount: .bmf.replicaCount,
+        metal3Enabled: .bmf.metal3.enabled,
+        metal3Namespace: .bmf.metal3.namespace
       },
       service: {
         eventPublisherEnabled: (.service.eventPublisher.enabled // false),
@@ -6386,12 +6442,18 @@ on_exit() {
     local stale_dir
     trap - EXIT
     set +e
+    if [[ "${BMAAS_MODE:-false}" == true && "$status" != 0 ]]; then
+        printf 'ERROR: preserving BMaaS provider access and test resources after a failed journey\n' >&2
+        provider_cleanup_allowed=false
+        PRESERVE_E2E_RECOVERY_ARTIFACTS=true
+    fi
     if [[ "$SUITE_USES_SUBNET_DHCP" == true && "$VLAN_E2E_DEBUG" == true ]] \
         && ! export_dhcp_debug_artifacts; then
         printf 'ERROR: could not preserve the requested DHCP debug artifacts\n' >&2
         cleanup_status=1
     fi
-    if [[ "${CLEANUP_MODE:-false}" != true && "$SUITE_USES_NAT_GATEWAY" == true ]]; then
+    if [[ "${CLEANUP_MODE:-false}" != true && "$SUITE_USES_NAT_GATEWAY" == true \
+        && "$provider_cleanup_allowed" == true ]]; then
         if ! cleanup_created_nat_gateways; then
             printf 'ERROR: NATGateway cleanup is incomplete; preserving clients, ExternalIPs, pool, Subnets, VirtualNetworks, endpoint, routes, and AAP configuration\n' >&2
             cleanup_status=1
@@ -6489,12 +6551,17 @@ on_exit() {
 }
 trap on_exit EXIT
 
+if [[ "$BMAAS_MODE" == true ]]; then
+    VLAN_E2E_BMAAS_LIBRARY=true
+    source "${REPO_ROOT}/vlan-e2e-bmaas.sh"
+fi
+
 if [[ "$CLEANUP_MODE" == true ]]; then
-    for tool in virsh oc helm go jq python3 awk sed grep sort cut sleep ssh-keygen base64 grpcurl docker sudo ssh stat tr; do
+    for tool in virsh oc helm go jq python3 awk sed grep sort cut sleep ssh-keygen base64 grpcurl docker sudo ssh stat tr flock ip; do
         require_cmd "$tool"
     done
 else
-    for tool in cluster-tool virsh oc helm go jq python3 awk sed grep sort cut sleep make ssh-keygen base64 grpcurl docker sudo ssh uv stat tr; do
+    for tool in cluster-tool virsh oc helm go jq python3 awk sed grep sort cut sleep make ssh-keygen base64 grpcurl docker sudo ssh uv stat tr flock ip; do
         require_cmd "$tool"
     done
     require_cmd "$CONTAINER_TOOL"
@@ -6558,6 +6625,8 @@ if [[ "$CLEANUP_MODE" != true ]]; then
         || die "OPERATOR_IMAGE must be a quay.io image reference with a tag"
     [[ "$FULFILLMENT_IMAGE" =~ ^quay\.io/[A-Za-z0-9._/-]+:[A-Za-z0-9._-]+$ ]] \
         || die "FULFILLMENT_IMAGE must be a quay.io image reference with a tag"
+    [[ "$BMF_IMAGE" =~ ^quay\.io/[A-Za-z0-9._/-]+:[A-Za-z0-9._-]+$ ]] \
+        || die "BMF_IMAGE must be a quay.io image reference with a tag"
     [[ "$REUSE_PREBUILT_OSAC_IMAGES" == auto || "$REUSE_PREBUILT_OSAC_IMAGES" == true \
         || "$REUSE_PREBUILT_OSAC_IMAGES" == false ]] \
         || die "REUSE_PREBUILT_OSAC_IMAGES must be auto, true, or false"
@@ -6573,7 +6642,7 @@ fi
 [[ "$AAP_PROJECT_EXPECTED_REVISION" == "$RUNTIME_SOURCE_COMMIT" ]] \
     || die "AAP_PROJECT_EXPECTED_REVISION must match selected source commit ${RUNTIME_SOURCE_COMMIT}"
 if [[ "$CLEANUP_MODE" != true ]]; then
-    for runtime_image in "$AAP_IMAGE" "$OPERATOR_IMAGE" "$FULFILLMENT_IMAGE"; do
+    for runtime_image in "$AAP_IMAGE" "$OPERATOR_IMAGE" "$FULFILLMENT_IMAGE" "$BMF_IMAGE"; do
         [[ "${runtime_image##*:}" == *-"$IMAGE_SOURCE_SHORT" ]] \
             || die "Runtime image tag must end in the selected source revision ${IMAGE_SOURCE_SHORT}: ${runtime_image}"
     done
@@ -6736,6 +6805,10 @@ done
 [[ "$api_ready" == true ]] || die "OpenShift API did not become available"
 oc wait nodes --all --for=condition=Ready --timeout=20m >/dev/null
 
+if [[ "$BMAAS_MODE" == true ]]; then
+    bmaas_activate_ironic
+fi
+
 # Step 2: prepare source-matched images and deploy or reuse OSAC.
 # ExternalIP capacity behavior and migration 125 ship in the Fulfillment image.
 step "STEP 2 OF 5: Deploying OSAC with source-pinned images"
@@ -6745,22 +6818,26 @@ if [[ "$REUSE_PREBUILT_OSAC_IMAGES" == true ]]; then
 elif [[ "$REUSE_PREBUILT_OSAC_IMAGES" == auto ]] \
     && "$CONTAINER_TOOL" image inspect "$AAP_IMAGE" >/dev/null 2>&1 \
     && "$CONTAINER_TOOL" image inspect "$OPERATOR_IMAGE" >/dev/null 2>&1 \
-    && "$CONTAINER_TOOL" image inspect "$FULFILLMENT_IMAGE" >/dev/null 2>&1; then
+    && "$CONTAINER_TOOL" image inspect "$FULFILLMENT_IMAGE" >/dev/null 2>&1 \
+    && "$CONTAINER_TOOL" image inspect "$BMF_IMAGE" >/dev/null 2>&1; then
     REUSE_IMAGES=true
 elif [[ "$REUSE_PREBUILT_OSAC_IMAGES" == auto ]] \
     && "$CONTAINER_TOOL" pull "$AAP_IMAGE" >/dev/null 2>&1 \
     && "$CONTAINER_TOOL" pull "$OPERATOR_IMAGE" >/dev/null 2>&1 \
-    && "$CONTAINER_TOOL" pull "$FULFILLMENT_IMAGE" >/dev/null 2>&1; then
+    && "$CONTAINER_TOOL" pull "$FULFILLMENT_IMAGE" >/dev/null 2>&1 \
+    && "$CONTAINER_TOOL" pull "$BMF_IMAGE" >/dev/null 2>&1; then
     REUSE_IMAGES=true
 fi
 if [[ "$REUSE_IMAGES" == true ]]; then
-    info "Reusing prebuilt images for source revision ${IMAGE_SOURCE_SHORT}: ${AAP_IMAGE}, ${OPERATOR_IMAGE}, ${FULFILLMENT_IMAGE}."
+    info "Reusing prebuilt images for source revision ${IMAGE_SOURCE_SHORT}."
     "$CONTAINER_TOOL" image inspect "$AAP_IMAGE" >/dev/null 2>&1 \
         || die "Prebuilt AAP image is not available locally: ${AAP_IMAGE}"
     "$CONTAINER_TOOL" image inspect "$OPERATOR_IMAGE" >/dev/null 2>&1 \
         || die "Prebuilt OSAC operator image is not available locally: ${OPERATOR_IMAGE}"
     "$CONTAINER_TOOL" image inspect "$FULFILLMENT_IMAGE" >/dev/null 2>&1 \
         || die "Prebuilt Fulfillment image is not available locally: ${FULFILLMENT_IMAGE}"
+    "$CONTAINER_TOOL" image inspect "$BMF_IMAGE" >/dev/null 2>&1 \
+        || die "Prebuilt BMF image is not available locally: ${BMF_IMAGE}"
 else
     info "Building and pushing images for source revision ${IMAGE_SOURCE_SHORT}."
     if ! "$CONTAINER_TOOL" login --get-login quay.io >/dev/null 2>&1; then
@@ -6769,7 +6846,8 @@ else
     AAP_BUILD_LOG="${TEMP_DIR}/aap-image-build.log"
     OPERATOR_BUILD_LOG="${TEMP_DIR}/operator-image-build.log"
     FULFILLMENT_BUILD_LOG="${TEMP_DIR}/fulfillment-image-build.log"
-    info "Building AAP, OSAC operator, and Fulfillment images in parallel..."
+    BMF_BUILD_LOG="${TEMP_DIR}/bmf-image-build.log"
+    info "Building AAP, OSAC operator, Fulfillment, and BMF images in parallel..."
     make -C "$AAP_DIR" execution-environment-build \
         "IMG=${AAP_IMAGE}" "CONTAINER_TOOL=${CONTAINER_TOOL}" >"$AAP_BUILD_LOG" 2>&1 &
     AAP_BUILD_PID=$!
@@ -6779,13 +6857,19 @@ else
     make -C "${REPO_ROOT}/fulfillment-service" image-build \
         "IMG=${FULFILLMENT_IMAGE}" "CONTAINER_TOOL=${CONTAINER_TOOL}" >"$FULFILLMENT_BUILD_LOG" 2>&1 &
     FULFILLMENT_BUILD_PID=$!
+    make -C "${REPO_ROOT}/bare-metal-fulfillment-operator" image-build \
+        "IMG=${BMF_IMAGE}" "CONTAINER_TOOL=${CONTAINER_TOOL}" >"$BMF_BUILD_LOG" 2>&1 &
+    BMF_BUILD_PID=$!
     AAP_BUILD_STATUS=0
     OPERATOR_BUILD_STATUS=0
     FULFILLMENT_BUILD_STATUS=0
     wait "$AAP_BUILD_PID" || AAP_BUILD_STATUS=$?
     wait "$OPERATOR_BUILD_PID" || OPERATOR_BUILD_STATUS=$?
     wait "$FULFILLMENT_BUILD_PID" || FULFILLMENT_BUILD_STATUS=$?
-    if [[ "$AAP_BUILD_STATUS" != 0 || "$OPERATOR_BUILD_STATUS" != 0 || "$FULFILLMENT_BUILD_STATUS" != 0 ]]; then
+    BMF_BUILD_STATUS=0
+    wait "$BMF_BUILD_PID" || BMF_BUILD_STATUS=$?
+    if [[ "$AAP_BUILD_STATUS" != 0 || "$OPERATOR_BUILD_STATUS" != 0 \
+        || "$FULFILLMENT_BUILD_STATUS" != 0 || "$BMF_BUILD_STATUS" != 0 ]]; then
         if [[ "$AAP_BUILD_STATUS" != 0 ]]; then
             tail -n 80 "$AAP_BUILD_LOG" >&2
         fi
@@ -6795,15 +6879,20 @@ else
         if [[ "$FULFILLMENT_BUILD_STATUS" != 0 ]]; then
             tail -n 80 "$FULFILLMENT_BUILD_LOG" >&2
         fi
-        die "Image build failed (AAP status ${AAP_BUILD_STATUS}, operator status ${OPERATOR_BUILD_STATUS}, Fulfillment status ${FULFILLMENT_BUILD_STATUS})"
+        if [[ "$BMF_BUILD_STATUS" != 0 ]]; then
+            tail -n 80 "$BMF_BUILD_LOG" >&2
+        fi
+        die "Image build failed (AAP ${AAP_BUILD_STATUS}, operator ${OPERATOR_BUILD_STATUS}, Fulfillment ${FULFILLMENT_BUILD_STATUS}, BMF ${BMF_BUILD_STATUS})"
     fi
-    info "All three images built successfully; pushing them to Quay..."
+    info "All four images built successfully; pushing them to Quay..."
     make -C "$AAP_DIR" execution-environment-push \
         "IMG=${AAP_IMAGE}" "CONTAINER_TOOL=${CONTAINER_TOOL}"
     make -C "${REPO_ROOT}/osac-operator" image-push \
         "IMG=${OPERATOR_IMAGE}" "CONTAINER_TOOL=${CONTAINER_TOOL}"
     make -C "${REPO_ROOT}/fulfillment-service" image-push \
         "IMG=${FULFILLMENT_IMAGE}" "CONTAINER_TOOL=${CONTAINER_TOOL}"
+    make -C "${REPO_ROOT}/bare-metal-fulfillment-operator" image-push \
+        "IMG=${BMF_IMAGE}" "CONTAINER_TOOL=${CONTAINER_TOOL}"
 fi
 
 # Phase 2 continues with the idempotent OSAC install or upgrade.
@@ -6812,9 +6901,8 @@ OVERLAY_FILE="${INSTALLER_DIR}/values/agentless-net-stub.yaml"
 CLUSTER_DOMAIN="$(oc get ingresses.config/cluster -o jsonpath='{.spec.domain}')"
 [[ -n "$CLUSTER_DOMAIN" ]] || die "Could not read the OpenShift cluster domain"
 OIDC_ISSUER_URL="https://keycloak-keycloak.${CLUSTER_DOMAIN}/realms/osac"
-# This lab invokes fixed networking task templates directly; the template
-# publication hook is not part of this BMaaS-only run.
-EXTRA_HELM_ARGS="-f ${OVERLAY_FILE} --set-string aap.bootstrap.image=${AAP_IMAGE} --set-string aap.configAsCode.eeImage=${AAP_IMAGE} --set-string aap.configAsCode.projectGitUri=${AAP_PROJECT_GIT_URI} --set-string aap.configAsCode.projectGitBranch=${AAP_PROJECT_GIT_BRANCH} --set-string operator.image.repository=${OPERATOR_IMAGE_REPOSITORY} --set-string operator.image.tag=${OPERATOR_IMAGE_TAG} --set-string service.images.service.repository=${FULFILLMENT_IMAGE_REPOSITORY} --set-string service.images.service.tag=${FULFILLMENT_IMAGE_TAG} --set service.eventPublisher.enabled=true --set aap.instanceGroups.publishTemplates.enabled=false"
+# The BMaaS suite needs the same published provisioning templates as CI.
+EXTRA_HELM_ARGS="-f ${OVERLAY_FILE} --set-string aap.bootstrap.image=${AAP_IMAGE} --set-string aap.configAsCode.eeImage=${AAP_IMAGE} --set-string aap.configAsCode.projectGitUri=${AAP_PROJECT_GIT_URI} --set-string aap.configAsCode.projectGitBranch=${AAP_PROJECT_GIT_BRANCH} --set-string operator.image.repository=${OPERATOR_IMAGE_REPOSITORY} --set-string operator.image.tag=${OPERATOR_IMAGE_TAG} --set-string service.images.service.repository=${FULFILLMENT_IMAGE_REPOSITORY} --set-string service.images.service.tag=${FULFILLMENT_IMAGE_TAG} --set-string bmf.image.repository=${BMF_IMAGE_REPOSITORY} --set-string bmf.image.tag=${BMF_IMAGE_TAG} --set service.eventPublisher.enabled=true --set aap.instanceGroups.publishTemplates.enabled=true"
 INFRA_HELM_ARGS=""
 if [[ "$VLAN_E2E_TAKE_OWNERSHIP" == true ]]; then
     EXTRA_HELM_ARGS+=" --take-ownership"
@@ -6830,11 +6918,16 @@ EXPECTED_DEPLOYMENT_SETTINGS="$(jq -ncS \
     --arg operator_tag "$OPERATOR_IMAGE_TAG" \
     --arg fulfillment_repository "$FULFILLMENT_IMAGE_REPOSITORY" \
     --arg fulfillment_tag "$FULFILLMENT_IMAGE_TAG" \
+    --arg bmf_repository "$BMF_IMAGE_REPOSITORY" \
+    --arg bmf_tag "$BMF_IMAGE_TAG" \
     --arg state_file "$AGENTLESS_NET_STATE_FILE" \
     '{aap:{bootstrapImage:$ee,eeImage:$ee,projectGitUri:$project_uri,projectGitBranch:$project_branch,
+        publishTemplatesEnabled:true,
         stateFile:$state_file},
       operator:{image:{repository:$operator_repository,tag:$operator_tag}},
       fulfillment:{image:{repository:$fulfillment_repository,tag:$fulfillment_tag}},
+      bmf:{image:{repository:$bmf_repository,tag:$bmf_tag},replicaCount:1,
+        metal3Enabled:true,metal3Namespace:"host-inventory"},
       service:{eventPublisherEnabled:true,caasEnabled:false,vmaasEnabled:false,bmaasEnabled:true},
       networking:{fabricManager:"agentless_net",k8sManager:"",
         addressPlan:{overlay:0,fabric:1,lbVip:0}}}')"
@@ -6872,7 +6965,7 @@ elif [[ -n "$EXISTING_OSAC_RELEASE" || "$OSAC_INSTALL_MODE" == upgrade ]]; then
         --values "$UPGRADE_VALUES_FILE" \
         --set aap.bootstrap.enabled=false \
         --set service.eventPublisher.enabled=true \
-        --set aap.instanceGroups.publishTemplates.enabled=false \
+        --set aap.instanceGroups.publishTemplates.enabled=true \
         --set-string "aap.bootstrap.image=${AAP_IMAGE}" \
         --set-string "aap.configAsCode.eeImage=${AAP_IMAGE}" \
         --set-string "aap.configAsCode.projectGitUri=${AAP_PROJECT_GIT_URI}" \
@@ -6881,6 +6974,8 @@ elif [[ -n "$EXISTING_OSAC_RELEASE" || "$OSAC_INSTALL_MODE" == upgrade ]]; then
         --set-string "operator.image.tag=${OPERATOR_IMAGE_TAG}" \
         --set-string "service.images.service.repository=${FULFILLMENT_IMAGE_REPOSITORY}" \
         --set-string "service.images.service.tag=${FULFILLMENT_IMAGE_TAG}" \
+        --set-string "bmf.image.repository=${BMF_IMAGE_REPOSITORY}" \
+        --set-string "bmf.image.tag=${BMF_IMAGE_TAG}" \
         --set-string "ui.auth.oidcIssuerURL=${OIDC_ISSUER_URL}" \
         --values "$OVERLAY_FILE" \
         --wait --timeout 40m
@@ -6914,6 +7009,8 @@ oc wait deployment/fulfillment-grpc-server -n "$OSAC_NAMESPACE" \
 oc wait deployment/osac-operator -n "$OSAC_NAMESPACE" \
     --for=condition=Available --timeout=300s >/dev/null
 oc wait deployment/osac-aap-controller-task -n "$OSAC_NAMESPACE" \
+    --for=condition=Available --timeout=300s >/dev/null
+oc wait deployment/bmf-operator-controller-manager -n "$OSAC_NAMESPACE" \
     --for=condition=Available --timeout=300s >/dev/null
 
 AAP_BRANCH="$(helm get values osac -n "$OSAC_NAMESPACE" --all -o json | jq -er '.aap.configAsCode.projectGitBranch')" \
@@ -9921,6 +10018,11 @@ if [[ "$CLEANUP_MODE" == true ]]; then
     oc wait deployment/osac-aap-controller-task -n "$OSAC_NAMESPACE" \
         --for=condition=Available --timeout=300s >/dev/null \
         || die "The existing AAP controller is not available for cleanup"
+    if [[ "$BMAAS_MODE" == true ]]; then
+        oc wait deployment/bmf-operator-controller-manager -n "$OSAC_NAMESPACE" \
+            --for=condition=Available --timeout=300s >/dev/null \
+            || die "The existing BMF controller is not available for cleanup"
+    fi
 
     CLUSTER_DOMAIN="$(oc get ingresses.config/cluster -o jsonpath='{.spec.domain}')"
     [[ -n "$CLUSTER_DOMAIN" ]] || die "Could not read the existing cluster domain"
@@ -9977,8 +10079,33 @@ if [[ "$CLEANUP_MODE" == true ]]; then
             || die "The existing E2E tenant is unavailable; cleanup will not create it"
     fi
 
+    if [[ "$BMAAS_MODE" == true ]]; then
+        if ! run_bmaas_cleanup; then
+            PRESERVE_E2E_RECOVERY_ARTIFACTS=true
+            die "BMaaS cleanup could not remove all test-owned resources"
+        fi
+        CLEANUP_DISCOVERY_COMPLETE=true
+        CLEANUP_CLIENTS_COMPLETE=true
+        info "BMaaS cleanup completed; reusable hosts and lab infrastructure were retained."
+        exit 0
+    fi
     prepare_suite_cleanup
     info "Cleanup is prepared; the exit handler will delete selected resources in dependency order."
+    exit 0
+fi
+if [[ "$BMAAS_MODE" == true ]]; then
+    step "STEP 5 OF 5: Running the BMaaS-to-AgentlessNet E2E"
+    HOST_IP_FORWARDING_BEFORE="$(netnode sysctl -n net.ipv4.ip_forward)"
+    if ! run_bmaas_suite; then
+        PRESERVE_E2E_RECOVERY_ARTIFACTS=true
+        die "BMaaS-to-AgentlessNet E2E failed; use bash ./vlan-e2e-bmaas.sh --cleanup after reviewing the evidence"
+    fi
+    HOST_IP_FORWARDING_AFTER="$(netnode sysctl -n net.ipv4.ip_forward)"
+    [[ "$HOST_IP_FORWARDING_AFTER" == "$HOST_IP_FORWARDING_BEFORE" ]] \
+        || die "The BMaaS E2E changed the Containerlab network-node forwarding sysctl"
+    assert_legacy_provider_state_unchanged \
+        || die "The BMaaS E2E changed legacy AgentlessNet provider state"
+    info "BMaaS-to-AgentlessNet E2E passed."
     exit 0
 fi
 step "STEP 5 OF 5: Running the ${VLAN_E2E_SUITE} E2E suite"

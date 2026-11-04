@@ -13,6 +13,8 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNNER = REPO_ROOT / "vlan-e2e.sh"
 SOURCE = RUNNER.read_text()
+BMAAS_RUNNER = REPO_ROOT / "vlan-e2e-bmaas.sh"
+BMAAS_SOURCE = BMAAS_RUNNER.read_text()
 
 
 def function_block(start: str, end: str) -> str:
@@ -34,7 +36,9 @@ def run_bash(tmp_path: Path, script: str, env: dict[str, str] | None = None):
     )
 
 
-def render_provider_inventory(tmp_path: Path, inventory_path: Path):
+def render_provider_inventory(
+    tmp_path: Path, inventory_path: Path, bmaas_ports_path: Path | None = None
+):
     helper = function_block("write_provider_inventory", "sync_aap_project_revision")
     heredoc_start = helper.index("<<'PY'\n") + len("<<'PY'\n")
     heredoc_end = helper.index("\nPY\n", heredoc_start)
@@ -51,6 +55,7 @@ def render_provider_inventory(tmp_path: Path, inventory_path: Path):
         MGMT_GW="192.168.162.1",
         MGMT_PREFIX="192.168.162",
         MGMT_DHCP_RANGES="192.168.162.100-192.168.162.200",
+        AGENTLESS_NET_BMAAS_HOST_PORTS_FILE="" if bmaas_ports_path is None else str(bmaas_ports_path),
     )
     return subprocess.run(
         [
@@ -929,6 +934,39 @@ def test_provider_inventory_rejects_duplicate_bmaas_port_claims(tmp_path):
     assert "must not be assigned more than once" in result.stderr
 
 
+def test_provider_inventory_merges_inspected_bmaas_hosts(tmp_path: Path) -> None:
+    bmaas_ports = tmp_path / "bmaas-host-ports.json"
+    bmaas_ports.write_text(
+        json.dumps(
+            {
+                "virtual-bmh-test-01": {
+                    "data-0": {"switch": "clab-agentless-net-lab-leaf-1", "port": "swp5"}
+                },
+                "virtual-bmh-test-02": {
+                    "data-0": {"switch": "clab-agentless-net-lab-leaf-2", "port": "swp5"}
+                },
+            }
+        )
+    )
+
+    result, output_path, _ = render_provider_inventory(
+        tmp_path, REPO_ROOT / "tests/e2e/agentless_net/lab/inventory.yml", bmaas_ports
+    )
+
+    assert result.returncode == 0, result.stderr
+    rendered = yaml.safe_load(output_path.read_text())
+    ports = rendered["all"]["vars"]["agentless_net_host_ports"]
+    assert ports["virtual-bmh-test-01"]["data-0"] == {
+        "switch": "clab-agentless-net-lab-leaf-1",
+        "port": "swp5",
+    }
+    assert ports["virtual-bmh-test-02"]["data-0"]["switch"] == "clab-agentless-net-lab-leaf-2"
+    assert rendered["all"]["vars"]["agentless_net_bmaas_switch_ports"] == {
+        "clab-agentless-net-lab-leaf-1": ["swp5"],
+        "clab-agentless-net-lab-leaf-2": ["swp5"],
+    }
+
+
 def test_provider_inventory_upgrade_accepts_matching_legacy_switch_inventory(tmp_path):
     source_inventory = REPO_ROOT / "tests/e2e/agentless_net/lab/inventory.yml"
     rendered_result, expected_path, _ = render_provider_inventory(tmp_path, source_inventory)
@@ -1510,8 +1548,28 @@ def test_runner_stages_are_ordered_and_source_revision_is_pinned():
     assert 'AAP_PROJECT_GIT_BRANCH" == "$RUNTIME_SOURCE_BRANCH"' in SOURCE
     assert 'AAP_PROJECT_EXPECTED_REVISION" == "$RUNTIME_SOURCE_COMMIT"' in SOURCE
     assert 'IMAGE_SOURCE_COMMIT="$RUNTIME_SOURCE_COMMIT"' in SOURCE
-    assert 'IMPLEMENTATION_BRANCH_NAME="osac-6752-agentless-contract"' in SOURCE
+    assert 'IMPLEMENTATION_BRANCH_NAME="${VLAN_E2E_RUNTIME_BRANCH:-e2e}"' in SOURCE
     assert 'OSAC_PROFILE="${OSAC_PROFILE:-bmaas-ci}"' in SOURCE
+
+
+def test_bmaas_activates_ironic_before_osac_install_preflight() -> None:
+    api_ready = SOURCE.index('oc wait nodes --all --for=condition=Ready')
+    bmaas_activation = SOURCE.index("    bmaas_activate_ironic\n", api_ready)
+    osac_install = SOURCE.index('step "STEP 2 OF 5:', bmaas_activation)
+    activation_helper = BMAAS_SOURCE[
+        BMAAS_SOURCE.index("    bmaas_activate_ironic() {"):BMAAS_SOURCE.index(
+            "    bmaas_host_state_file() {"
+        )
+    ]
+
+    assert api_ready < bmaas_activation < osac_install
+    assert "kind: Provisioning" in activation_helper
+    assert 'provisioningNetwork: "Disabled"' in activation_helper
+    assert "disableVirtualMediaTLS: true" in activation_helper
+    assert "watchAllNamespaces: true" in activation_helper
+    assert "for ((attempt = 1; attempt <= 60; attempt++))" in activation_helper
+    assert 'oc wait --for=condition=Ready pods' in activation_helper
+    assert "baremetal-operator-webhook-service" in activation_helper
 
 
 def test_agentless_overlay_is_bmaas_only_with_physical_ipam_and_fresh_state() -> None:
@@ -1528,8 +1586,10 @@ def test_agentless_overlay_is_bmaas_only_with_physical_ipam_and_fresh_state() ->
         "AGENTLESS_NET_EXTERNAL_INTERFACE": "eth2",
     }
     assert overlay["operator"]["tenants"] == [{"name": "shared"}]
-    assert overlay["bmf"]["replicaCount"] == 0
-    assert overlay["bmf"]["metal3"]["enabled"] is False
+    assert overlay["global"]["services"]["bmaas"]["enabled"] is True
+    assert overlay["bmf"]["replicaCount"] == 1
+    assert overlay["bmf"]["metal3"]["enabled"] is True
+    assert overlay["bmf"]["metal3"]["namespace"] == "host-inventory"
     assert profile["global"]["services"] == {
         "caas": {"enabled": False},
         "vmaas": {"enabled": False},
@@ -2605,6 +2665,7 @@ def test_suite_flags_select_the_same_scope_for_run_and_cleanup(tmp_path):
             "set -euo pipefail\n"
             "VLAN_E2E_SUITE=full\n"
             "CLEANUP_MODE=false\n"
+            "BMAAS_MODE=false\n"
             "usage() { :; }\n"
             "argument_error() { printf 'ERROR: %s\\n' \"$1\" >&2; exit 2; }\n"
             f"set -- {quoted_args}\n"
@@ -2714,7 +2775,7 @@ def test_cleanup_mode_is_standalone_and_skips_deployment_stages():
     ):
         assert marker in deployment_block
     assert "prepare_suite_cleanup" in cleanup_block
-    assert cleanup_block.index("prepare_suite_cleanup") < cleanup_block.index("exit 0")
+    assert cleanup_block.index("prepare_suite_cleanup") < cleanup_block.rindex("exit 0")
     assert "containerlab deploy" not in cleanup_block
     assert "configure_containerlab_fabric" not in cleanup_block
     assert "helm get values osac" in cleanup_block

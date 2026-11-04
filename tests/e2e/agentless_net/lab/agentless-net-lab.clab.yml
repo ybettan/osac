@@ -42,5 +42,7 @@ topology:
     - endpoints: ["leaf-2:swp2", "host:leaf2-swp2"]
     - endpoints: ["leaf-2:swp3", "host:leaf2-swp3"]
     - endpoints: ["leaf-1:swp4", "host:leaf1-swp4"]
+    - endpoints: ["leaf-1:swp5", "host:bmaas-l1"]
+    - endpoints: ["leaf-2:swp5", "host:bmaas-l2"]
     - endpoints: ["leaf-1:swp3", "net-node:eth1"]
     - endpoints: ["net-node:eth2", "upstream-router:eth1"]
