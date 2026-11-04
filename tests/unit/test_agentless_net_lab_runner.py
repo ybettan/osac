@@ -730,6 +730,7 @@ switch_admin_user_exec() {{
         'nv config diff --output commands')
             if [[ -f "$STATE/pending" ]]; then cat "$STATE/pending"; fi
             ;;
+        'nv config detach') rm -f "$STATE/pending" ;;
         'nv config apply --assume-yes') apply_pending ;;
         'nv show system aaa user cumulus ssh authorized-key --output json')
             jq -R -s 'split("\\n") | map(select(length > 0)) | map({{(.): {{type: "ssh-ed25519", key: "redacted"}}}}) | add // {{}}' "$STATE/keys"
@@ -750,9 +751,11 @@ reclaim_containerlab_provider_keys clab-agentless-net-lab-leaf-1
     assert not (state / "pending").exists()
     assert capture.read_text().splitlines() == [
         "nv config diff --output commands",
-        "nv config apply --assume-yes",
+        "nv config detach",
+        "nv config diff --output commands",
         "nv show system aaa user cumulus ssh authorized-key --output json",
         "nv unset system aaa user cumulus ssh authorized-key osac_e2e_1793803069_1899008",
+        "nv unset system aaa user cumulus ssh authorized-key osac_e2e_1793807380_2191235",
         "nv unset system aaa user cumulus ssh authorized-key osac_e2e_1793809370_2244559",
         "nv config apply --assume-yes",
         "nv config diff --output commands",
@@ -760,6 +763,62 @@ reclaim_containerlab_provider_keys clab-agentless-net-lab-leaf-1
     ]
     assert (tmp_path / "reclaim.log").read_text().splitlines() == [
         "INFO: Reclaimed stale per-run NVUE provider keys on clab-agentless-net-lab-leaf-1.",
+    ]
+
+
+def test_stale_provider_key_candidate_is_discarded_not_applied(tmp_path):
+    helper = (
+        function_block("switch_nvue_diff", "assert_provider_key_survived")
+        + "\n"
+        + function_block("reclaim_containerlab_provider_keys", "install_containerlab_switch_provider_key")
+    )
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "keys").write_text("osac-agentless-e2e-admin\n")
+    (state / "pending").write_text(
+        "nv unset system aaa user cumulus ssh authorized-key osac_e2e_1793809843_2294040\n"
+        "nv set system aaa user cumulus ssh authorized-key osac_e2e_1792485956_1564777 key '*'\n"
+        "nv set system aaa user cumulus ssh authorized-key osac_e2e_1792485956_1564777 type ssh-ed25519\n"
+    )
+    capture = tmp_path / "nvue-reclaim-commands.txt"
+    script = f"""
+set -euo pipefail
+PROVIDER_NVUE_KEY_ID=osac_e2e_test
+STATE={shlex.quote(str(state))}
+CAPTURE={shlex.quote(str(capture))}
+LOG_CAPTURE={shlex.quote(str(tmp_path / "reclaim.log"))}
+info() {{ printf 'INFO: %s\\n' "$*" >>"$LOG_CAPTURE"; }}
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+switch_admin_user_exec() {{
+    local switch="$1"
+    shift
+    [[ "$switch" == clab-agentless-net-lab-leaf-2 ]]
+    printf '%s\\n' "$*" >>"$CAPTURE"
+    case "$*" in
+        'nv config diff --output commands')
+            if [[ -f "$STATE/pending" ]]; then cat "$STATE/pending"; fi
+            ;;
+        'nv config detach') rm -f "$STATE/pending" ;;
+        'nv show system aaa user cumulus ssh authorized-key --output json')
+            jq -R -s 'split("\\n") | map(select(length > 0)) | map({{(.): {{type: "ssh-ed25519", key: "redacted"}}}}) | add // {{}}' "$STATE/keys"
+            ;;
+        'nv config apply --assume-yes') return 2 ;;
+        *) return 2 ;;
+    esac
+}}
+{helper}
+reclaim_containerlab_provider_keys clab-agentless-net-lab-leaf-2
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert not (state / "pending").exists()
+    assert capture.read_text().splitlines() == [
+        "nv config diff --output commands",
+        "nv config detach",
+        "nv config diff --output commands",
+        "nv show system aaa user cumulus ssh authorized-key --output json",
+        "nv show system aaa user cumulus ssh authorized-key --output json",
     ]
 
 
