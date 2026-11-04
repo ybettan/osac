@@ -689,6 +689,8 @@ def test_stale_provider_keys_are_reclaimed_before_key_installation(tmp_path):
     helper = (
         function_block("switch_nvue_diff", "assert_provider_key_survived")
         + "\n"
+        + function_block("discard_containerlab_stale_candidate", "reclaim_containerlab_provider_keys")
+        + "\n"
         + function_block("reclaim_containerlab_provider_keys", "install_containerlab_switch_provider_key")
     )
     state = tmp_path / "state"
@@ -759,9 +761,11 @@ reclaim_containerlab_provider_keys clab-agentless-net-lab-leaf-1
         "nv unset system aaa user cumulus ssh authorized-key osac_e2e_1793809370_2244559",
         "nv config apply --assume-yes",
         "nv config diff --output commands",
+        "nv config diff --output commands",
         "nv show system aaa user cumulus ssh authorized-key --output json",
     ]
     assert (tmp_path / "reclaim.log").read_text().splitlines() == [
+        "INFO: Discarded a stale per-run NVUE provider-key candidate on clab-agentless-net-lab-leaf-1.",
         "INFO: Reclaimed stale per-run NVUE provider keys on clab-agentless-net-lab-leaf-1.",
     ]
 
@@ -769,6 +773,8 @@ reclaim_containerlab_provider_keys clab-agentless-net-lab-leaf-1
 def test_stale_provider_key_candidate_is_discarded_not_applied(tmp_path):
     helper = (
         function_block("switch_nvue_diff", "assert_provider_key_survived")
+        + "\n"
+        + function_block("discard_containerlab_stale_candidate", "reclaim_containerlab_provider_keys")
         + "\n"
         + function_block("reclaim_containerlab_provider_keys", "install_containerlab_switch_provider_key")
     )
@@ -818,13 +824,64 @@ reclaim_containerlab_provider_keys clab-agentless-net-lab-leaf-2
         "nv config detach",
         "nv config diff --output commands",
         "nv show system aaa user cumulus ssh authorized-key --output json",
-        "nv show system aaa user cumulus ssh authorized-key --output json",
+    ]
+    assert (tmp_path / "reclaim.log").read_text().splitlines() == [
+        "INFO: Discarded a stale per-run NVUE provider-key candidate on clab-agentless-net-lab-leaf-2.",
+    ]
+
+
+def test_post_install_stale_candidate_is_discarded(tmp_path):
+    helper = (
+        function_block("switch_nvue_diff", "assert_provider_key_survived")
+        + "\n"
+        + function_block("discard_containerlab_stale_candidate", "reclaim_containerlab_provider_keys")
+    )
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "pending").write_text(
+        "nv unset system aaa user cumulus ssh authorized-key osac_e2e_1793811276_2457697\n"
+        "nv set system aaa user cumulus ssh authorized-key osac_e2e_1793810331_2352989 key '*'\n"
+        "nv set system aaa user cumulus ssh authorized-key osac_e2e_1793810331_2352989 type ssh-ed25519\n"
+    )
+    capture = tmp_path / "nvue-discard-commands.txt"
+    script = f"""
+set -euo pipefail
+STATE={shlex.quote(str(state))}
+CAPTURE={shlex.quote(str(capture))}
+info() {{ :; }}
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+switch_admin_user_exec() {{
+    local switch="$1"
+    shift
+    [[ "$switch" == clab-agentless-net-lab-leaf-1 ]]
+    printf '%s\\n' "$*" >>"$CAPTURE"
+    case "$*" in
+        'nv config diff --output commands')
+            if [[ -f "$STATE/pending" ]]; then cat "$STATE/pending"; fi
+            ;;
+        'nv config detach') rm -f "$STATE/pending" ;;
+        *) return 2 ;;
+    esac
+}}
+{helper}
+discard_containerlab_stale_candidate clab-agentless-net-lab-leaf-1
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert not (state / "pending").exists()
+    assert capture.read_text().splitlines() == [
+        "nv config diff --output commands",
+        "nv config detach",
+        "nv config diff --output commands",
     ]
 
 
 def test_clean_switch_needs_no_provider_key_reclaim(tmp_path):
     helper = (
         function_block("switch_nvue_diff", "assert_provider_key_survived")
+        + "\n"
+        + function_block("discard_containerlab_stale_candidate", "reclaim_containerlab_provider_keys")
         + "\n"
         + function_block("reclaim_containerlab_provider_keys", "install_containerlab_switch_provider_key")
     )
@@ -867,6 +924,8 @@ reclaim_containerlab_provider_keys clab-agentless-net-lab-leaf-1
 def test_unrelated_nvue_candidate_blocks_provider_key_reclaim(tmp_path):
     helper = (
         function_block("switch_nvue_diff", "assert_provider_key_survived")
+        + "\n"
+        + function_block("discard_containerlab_stale_candidate", "reclaim_containerlab_provider_keys")
         + "\n"
         + function_block("reclaim_containerlab_provider_keys", "install_containerlab_switch_provider_key")
     )
