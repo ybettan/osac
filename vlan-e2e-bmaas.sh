@@ -170,6 +170,15 @@ PY
                 fabric_mac="52:54:00:ba:aa:02"
             fi
 
+            local existing_link_details
+            if ip link show "$host_link" >/dev/null 2>&1; then
+                existing_link_details="$(ip -d link show "$host_link" 2>/dev/null || true)"
+                if [[ "$existing_link_details" != *"link-netns ${switch}"* ]]; then
+                    info "Replacing stale BMaaS host link ${host_link} connected to another switch."
+                    sudo ip link del "$host_link" \
+                        || die "Could not remove stale BMaaS host link ${host_link}"
+                fi
+            fi
             if ! ip link show "$host_link" >/dev/null 2>&1; then
                 sudo "$CONTAINERLAB" tools veth create \
                     --a-endpoint "${switch}:swp5" \
@@ -307,9 +316,9 @@ PY
         if [[ -f "$journal" ]] && [[ "$(jq -r '.cleaned // false' "$journal")" != true ]]; then
             die "Uncleaned BMaaS resources are recorded in ${journal}; run --cleanup first"
         fi
+        bmaas_configure_host_ports
         bmaas_prepare_hosts
         write_provider_inventory
-        bmaas_configure_host_ports
         prepare_external_ip_test_link
         configure_nat_gateway_uplink
         prepare_nat_gateway_endpoint
