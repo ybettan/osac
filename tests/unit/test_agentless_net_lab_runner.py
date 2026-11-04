@@ -1572,6 +1572,20 @@ def test_bmaas_activates_ironic_before_osac_install_preflight() -> None:
     assert "baremetal-operator-webhook-service" in activation_helper
 
 
+def test_bmaas_upgrade_syncs_aap_before_template_publication() -> None:
+    setup_start = SOURCE.index(
+        'if [[ "$BMAAS_MODE" == true && -n "$EXISTING_OSAC_RELEASE"'
+    )
+    setup_end = SOURCE.index('if [[ "$OSAC_DEPLOYMENT_NEEDED" == false ]]', setup_start)
+    aap_sync = SOURCE[setup_start:setup_end]
+    upgrade = SOURCE.index('helm upgrade osac "${INSTALLER_DIR}/charts/osac"', setup_end)
+
+    assert '"$OSAC_DEPLOYMENT_NEEDED" == true' in aap_sync
+    assert aap_sync.index("prepare_aap_ca_bundle") < aap_sync.index("sync_aap_project_revision")
+    assert aap_sync.index("sync_aap_project_revision") < aap_sync.index("configure_aap_execution_environment")
+    assert aap_sync.index("configure_aap_execution_environment") < upgrade
+
+
 def test_agentless_overlay_is_bmaas_only_with_physical_ipam_and_fresh_state() -> None:
     overlay = yaml.safe_load((REPO_ROOT / "osac-installer/values/agentless-net-stub.yaml").read_text())
     profile = yaml.safe_load((REPO_ROOT / "osac-installer/values/bmaas-ci/instance.yaml").read_text())

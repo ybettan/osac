@@ -6950,6 +6950,18 @@ if [[ "$OSAC_INSTALL_MODE" == upgrade && -z "$EXISTING_OSAC_RELEASE" ]]; then
     die "OSAC_INSTALL_MODE=upgrade but no OSAC release exists"
 fi
 
+if [[ "$BMAAS_MODE" == true && -n "$EXISTING_OSAC_RELEASE" \
+    && "$OSAC_DEPLOYMENT_NEEDED" == true ]]; then
+    # The Helm publisher hook runs during upgrade, before Step 4. On an
+    # existing AAP instance, sync its project and EE first so the hook uses
+    # the source-pinned image and role metadata.
+    info "Synchronizing AAP before BMaaS template publication..."
+    AAP_API_CA_FILE="$TEMP_DIR/aap-api-ca.pem"
+    prepare_aap_ca_bundle
+    sync_aap_project_revision
+    configure_aap_execution_environment
+fi
+
 if [[ "$OSAC_DEPLOYMENT_NEEDED" == false ]]; then
     info "Skipping the OSAC Helm operation because the desired release is already deployed."
 elif [[ -n "$EXISTING_OSAC_RELEASE" || "$OSAC_INSTALL_MODE" == upgrade ]]; then
