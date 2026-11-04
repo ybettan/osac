@@ -765,7 +765,7 @@ reclaim_containerlab_provider_keys clab-agentless-net-lab-leaf-1
         "nv show system aaa user cumulus ssh authorized-key --output json",
     ]
     assert (tmp_path / "reclaim.log").read_text().splitlines() == [
-        "INFO: Discarded a stale per-run NVUE provider-key candidate on clab-agentless-net-lab-leaf-1.",
+        "INFO: Discarded stale per-run NVUE provider-key candidates on clab-agentless-net-lab-leaf-1.",
         "INFO: Reclaimed stale per-run NVUE provider keys on clab-agentless-net-lab-leaf-1.",
     ]
 
@@ -826,7 +826,73 @@ reclaim_containerlab_provider_keys clab-agentless-net-lab-leaf-2
         "nv show system aaa user cumulus ssh authorized-key --output json",
     ]
     assert (tmp_path / "reclaim.log").read_text().splitlines() == [
-        "INFO: Discarded a stale per-run NVUE provider-key candidate on clab-agentless-net-lab-leaf-2.",
+        "INFO: Discarded stale per-run NVUE provider-key candidates on clab-agentless-net-lab-leaf-2.",
+    ]
+
+
+def test_stacked_stale_candidates_are_discarded_until_empty(tmp_path):
+    helper = (
+        function_block("switch_nvue_diff", "assert_provider_key_survived")
+        + "\n"
+        + function_block("discard_containerlab_stale_candidate", "reclaim_containerlab_provider_keys")
+    )
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "layer-2").write_text(
+        "nv unset system aaa user cumulus ssh authorized-key osac_e2e_1793810331_2352989\n"
+        "nv set system aaa user cumulus ssh authorized-key osac_e2e_1793809843_2294040 key '*'\n"
+    )
+    (state / "layer-1").write_text(
+        "nv unset system aaa user cumulus ssh authorized-key osac_e2e_1793811963_2530731\n"
+        "nv set system aaa user cumulus ssh authorized-key osac_e2e_1793810331_2352989 key '*'\n"
+        "nv set system aaa user cumulus ssh authorized-key osac_e2e_1793810331_2352989 type ssh-ed25519\n"
+    )
+    (state / "top").write_text("layer-1\n")
+    capture = tmp_path / "nvue-discard-commands.txt"
+    script = f"""
+set -euo pipefail
+STATE={shlex.quote(str(state))}
+CAPTURE={shlex.quote(str(capture))}
+LOG_CAPTURE={shlex.quote(str(tmp_path / "discard.log"))}
+info() {{ printf 'INFO: %s\\n' "$*" >>"$LOG_CAPTURE"; }}
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+switch_admin_user_exec() {{
+    local switch="$1"
+    shift
+    [[ "$switch" == clab-agentless-net-lab-leaf-1 ]]
+    printf '%s\\n' "$*" >>"$CAPTURE"
+    case "$*" in
+        'nv config diff --output commands')
+            top="$(cat "$STATE/top" 2>/dev/null || true)"
+            if [[ -n "$top" ]]; then cat "$STATE/$top"; fi
+            ;;
+        'nv config detach')
+            top="$(cat "$STATE/top" 2>/dev/null || true)"
+            case "$top" in
+                layer-1) printf 'layer-2\\n' >"$STATE/top" ;;
+                layer-2) rm -f "$STATE/top" ;;
+                *) return 2 ;;
+            esac
+            ;;
+        *) return 2 ;;
+    esac
+}}
+{helper}
+discard_containerlab_stale_candidate clab-agentless-net-lab-leaf-1
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert not (state / "top").exists()
+    assert capture.read_text().splitlines() == [
+        "nv config diff --output commands",
+        "nv config detach",
+        "nv config diff --output commands",
+        "nv config detach",
+        "nv config diff --output commands",
+    ]
+    assert (tmp_path / "discard.log").read_text().splitlines() == [
+        "INFO: Discarded stale per-run NVUE provider-key candidates on clab-agentless-net-lab-leaf-1.",
     ]
 
 
