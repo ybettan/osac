@@ -7462,14 +7462,45 @@ from typing import TypeVar, cast
 _JSON = TypeVar("_JSON")
 
 
-def _load_runtime_vlan_parser() -> Callable[[str, str, str | None], set[int]]:
+def _load_runtime_vlan_modules() -> tuple[Callable[..., set[int]], Callable[..., dict] | None]:
+    """Import the runtime parser and, when available, the runner normalizer.
+
+    The lab collects raw switch output over SSH for its baseline snapshot.  On a
+    runtime that ships the network-runner switch filter, normalize that output
+    through the vendored ``cumulus_vlans`` filter before calling
+    ``parse_switch_vlan_exclusions``, which then consumes the runner's
+    normalized ``list_vlans`` result exactly like the provisioned AAP runtime.
+    Runtimes that predate the filter keep parsing the raw output, so the same
+    E2E branch can be rebased on either base.
+    """
     repo_root = Path(os.environ["OSAC_REPO_ROOT"]).resolve()
     sys.path.insert(0, str(repo_root / "osac-aap" / "collections"))
     from ansible_collections.osac.templates.plugins.module_utils.agentless_net_subnet import (
         parse_switch_vlan_exclusions,
     )
+    from importlib.util import module_from_spec, spec_from_file_location
 
-    return parse_switch_vlan_exclusions
+    vendored = (
+        repo_root
+        / "osac-aap"
+        / "vendor"
+        / "ansible_collections"
+        / "ansible_network"
+        / "network_runner"
+        / "plugins"
+        / "filter"
+        / "switch_state.py"
+    )
+    if not vendored.is_file():
+        return parse_switch_vlan_exclusions, None
+    spec = spec_from_file_location("network_runner_switch_state", vendored)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"vendored network-runner filter plugin is unreadable: {vendored}")
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not callable(getattr(module, "cumulus_vlans", None)):
+        raise ValueError("vendored network-runner filter plugin lacks cumulus_vlans")
+    return parse_switch_vlan_exclusions, module.cumulus_vlans
 
 
 def _read_json(path: str) -> _JSON:
@@ -7483,7 +7514,7 @@ def snapshot_vlan_ids(args: argparse.Namespace) -> None:
     switches = _read_json(args.input)
     if not isinstance(switches, list) or not switches:
         raise ValueError("switch snapshot must contain at least one switch")
-    parser = _load_runtime_vlan_parser()
+    parser, normalize_vlan_state = _load_runtime_vlan_modules()
     seen: set[str] = set()
     excluded: set[int] = set()
     for switch in switches:
@@ -7492,13 +7523,15 @@ def snapshot_vlan_ids(args: argparse.Namespace) -> None:
         if switch["name"] in seen:
             raise ValueError(f"switch snapshot repeats {switch['name']}")
         seen.add(switch["name"])
-        excluded.update(
-            parser(
-                switch.get("bridge_vlan_output"),
-                switch.get("reserved_vlan_output"),
-                switch.get("switchd_reserved_vlan_output"),
-            )
+        raw_state = (
+            switch.get("bridge_vlan_output"),
+            switch.get("reserved_vlan_output"),
+            switch.get("switchd_reserved_vlan_output"),
         )
+        # Older runtimes accept the raw provider output; newer ones accept only
+        # the normalized list_vlans result.
+        state = raw_state if normalize_vlan_state is None else (normalize_vlan_state(*raw_state),)
+        excluded.update(parser(*state))
     Path(args.output).write_text(
         json.dumps({"switches": switches, "excluded_vlan_ids": sorted(excluded)}, sort_keys=True) + "\n"
     )
