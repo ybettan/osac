@@ -6927,6 +6927,11 @@ else
     OPERATOR_BUILD_LOG="${TEMP_DIR}/operator-image-build.log"
     FULFILLMENT_BUILD_LOG="${TEMP_DIR}/fulfillment-image-build.log"
     BMF_BUILD_LOG="${TEMP_DIR}/bmf-image-build.log"
+    # ansible-builder creates the execution-environment context directories.
+    # Under the runner's 077 umask they land 0700 and the non-root execution
+    # environment user cannot load collection plugins from them, so build the
+    # images with the permissions a CI build would produce.
+    umask 022
     info "Building AAP, OSAC operator, Fulfillment, and BMF images in parallel..."
     make -C "$AAP_DIR" execution-environment-build \
         "IMG=${AAP_IMAGE}" "CONTAINER_TOOL=${CONTAINER_TOOL}" >"$AAP_BUILD_LOG" 2>&1 &
@@ -6973,6 +6978,7 @@ else
         "IMG=${FULFILLMENT_IMAGE}" "CONTAINER_TOOL=${CONTAINER_TOOL}"
     make -C "${REPO_ROOT}/bare-metal-fulfillment-operator" image-push \
         "IMG=${BMF_IMAGE}" "CONTAINER_TOOL=${CONTAINER_TOOL}"
+    umask 077
 fi
 
 # Phase 2 continues with the idempotent OSAC install or upgrade.
@@ -7744,7 +7750,8 @@ create_dhcp_client_container() {
         --label "io.osac.e2e.prefix=${DHCP_CLIENT_PREFIX}" \
         --label "io.osac.e2e.run-dir=${TEMP_DIR}" \
         --network none \
-        --cap-add NET_ADMIN --cap-add NET_RAW "$CLIENT_IMAGE" sleep 3600 >/dev/null
+        --cap-add NET_ADMIN --cap-add NET_RAW "$CLIENT_IMAGE" \
+        sh -c 'while true; do sleep 3600; done' >/dev/null
     DHCP_CLIENT_CONTAINERS+=("$container")
     sudo ip link add link "$CLIENT_HOST_PARENT" name "$macvlan" type macvlan mode bridge
     DHCP_CLIENT_HOST_LINKS+=("$macvlan")
@@ -9748,6 +9755,7 @@ nat_gateway_assert_client_leases() {
 run_nat_gateway_lifecycle() {
     local pool_status total output_file before_state after_state
     local gateway_cr gateway_entry ip_cr peer_entry peer_address peer_eip_state_before_a_delete
+    local peer_namespace_name
     configure_nat_gateway_uplink
     prepare_nat_gateway_endpoint
 
@@ -9945,8 +9953,12 @@ run_nat_gateway_lifecycle() {
         || die "Could not remove the peer NATGateway test-only return route"
     delete_external_ip_and_verify "$EXTERNAL_IP_TWO_ID" "$EXTERNAL_IP_TWO_UID" 0
     delete_subnet_by_id "$NAT_GATEWAY_PEER_SUBNET_ID"
+    # The full suite creates both VirtualNetworks before this lifecycle, so
+    # derive the peer namespace here instead of relying on the suite that
+    # created it.
+    peer_namespace_name="$(jq -er '.namespace_name' <<<"$(get_state_entry "$SECOND_API_ID")")"
     assert_uid_subnet_state_absent "$NAT_GATEWAY_PEER_SUBNET_UID" "$SECOND_API_ID" \
-        "$SECOND_NAMESPACE_NAME" \
+        "$peer_namespace_name" \
         "$(jq -er '.vlan_interface' <<<"$NAT_GATEWAY_PEER_SUBNET_ENTRY")" \
         "$(jq -er '.vlan_id' <<<"$NAT_GATEWAY_PEER_SUBNET_ENTRY")"
     cleanup_nat_gateway_endpoint \
@@ -10005,8 +10017,9 @@ wait_for_virtual_network_ready "$SECOND_FULFILLMENT_ID"
 assert_provider_key_survived "concurrent VirtualNetwork provisioning"
 FIRST_CR="$(virtual_network_cr_json "$FIRST_FULFILLMENT_ID")"
 SECOND_CR="$(virtual_network_cr_json "$SECOND_FULFILLMENT_ID")"
-    FIRST_API_ID="$(jq -er '.metadata.labels["osac.openshift.io/virtualnetwork-uuid"]' <<<"$FIRST_CR")"
-    SECOND_API_ID="$(jq -er '.metadata.labels["osac.openshift.io/virtualnetwork-uuid"]' <<<"$SECOND_CR")"
+FIRST_API_ID="$(jq -er '.metadata.labels["osac.openshift.io/virtualnetwork-uuid"]' <<<"$FIRST_CR")"
+FIRST_CR_NAME="$(jq -er '.metadata.name' <<<"$FIRST_CR")"
+SECOND_API_ID="$(jq -er '.metadata.labels["osac.openshift.io/virtualnetwork-uuid"]' <<<"$SECOND_CR")"
 FIRST_AAP_JOB_ID="$(network_task_job_id "$FIRST_CR" create_virtual_network)"
 SECOND_AAP_JOB_ID="$(network_task_job_id "$SECOND_CR" create_virtual_network)"
 info "AAP create job IDs: ${FIRST_AAP_JOB_ID}, ${SECOND_AAP_JOB_ID}"
