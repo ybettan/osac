@@ -254,6 +254,22 @@ PY
             sudo ip link set "$host_link" master "$bridge"
             sudo ip link set "$bridge" up
 
+            # Docker sets the host FORWARD policy to DROP and
+            # bridge-nf-call-iptables routes bridged IPv4 through it, so the
+            # guest's DHCP broadcast (0.0.0.0 to 255.255.255.255) is dropped
+            # before it reaches the switch. Allow only this lab bridge's own
+            # frames, matched by its switch-side port.
+            if [[ "$(sysctl -n net.bridge.bridge-nf-call-iptables 2>/dev/null || printf 0)" == 1 ]]; then
+                local direction
+                for direction in --physdev-in --physdev-out; do
+                    sudo iptables -C FORWARD -m physdev --physdev-is-bridged \
+                        "$direction" "$host_link" -j ACCEPT >/dev/null 2>&1 \
+                        || sudo iptables -I FORWARD 1 -m physdev --physdev-is-bridged \
+                            "$direction" "$host_link" -j ACCEPT >/dev/null \
+                        || die "Could not allow bridged traffic on ${host_link}"
+                done
+            fi
+
             if ! virsh domiflist "$bmh_name" | awk -v bridge="$bridge" '$3 == bridge { found=1 } END { exit !found }'; then
                 vm_state="$(virsh domstate "$bmh_name" 2>/dev/null)" \
                     || die "Could not inspect BMaaS host VM ${bmh_name}"
