@@ -2283,6 +2283,22 @@ bmaas_wire_host_link_to_switch_guest clab-agentless-net-lab-leaf-2 swp5
     assert "refusing to wire a dead BMaaS link" in result.stderr
 
 
+def test_bmaas_host_bridge_traffic_bypasses_the_host_forward_drop() -> None:
+    helper = BMAAS_SOURCE[
+        BMAAS_SOURCE.index("    bmaas_prepare_hosts() {") : BMAAS_SOURCE.index(
+            "    bmaas_configure_host_ports() {"
+        )
+    ]
+
+    assert "net.bridge.bridge-nf-call-iptables" in helper
+    assert "-m physdev --physdev-is-bridged" in helper
+    assert "iptables -C FORWARD" in helper
+    assert "iptables -I FORWARD 1" in helper
+    assert "for direction in --physdev-in --physdev-out" in helper
+    # The allow rules must exist before the guest NIC can carry traffic.
+    assert helper.index("iptables -I FORWARD 1") < helper.index("virsh attach-interface")
+
+
 def test_bmaas_switch_ports_are_ready_before_host_inspection() -> None:
     suite_start = BMAAS_SOURCE.index("    run_bmaas_suite() {")
     suite_end = BMAAS_SOURCE.index("    run_bmaas_cleanup() {", suite_start)
