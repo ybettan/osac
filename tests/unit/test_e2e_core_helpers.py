@@ -48,6 +48,31 @@ def test_wait_helpers_pass_resource_identity_to_poll_until(monkeypatch: pytest.M
     assert bmi_call.kwargs["resource_id"] == "bmi-one"
 
 
+def test_network_grpc_removal_waits_track_their_own_records(monkeypatch: pytest.MonkeyPatch) -> None:
+    poll = Mock(return_value=True)
+    monkeypatch.setattr(helpers, "poll_until", poll)
+    grpc = Mock(spec=GRPCClient)
+    grpc.list_subnet_ids.return_value = ["subnet-one"]
+    grpc.list_security_group_ids.return_value = ["security-group-one"]
+    grpc.list_virtual_network_ids.return_value = ["virtual-network-one"]
+
+    helpers.wait_for_subnet_grpc_removal(grpc=grpc, uuid="subnet-one")
+    helpers.wait_for_security_group_grpc_removal(grpc=grpc, uuid="security-group-one")
+    helpers.wait_for_virtual_network_grpc_removal(grpc=grpc, uuid="virtual-network-one")
+
+    subnet_call, security_group_call, virtual_network_call = poll.call_args_list
+    assert subnet_call.kwargs["resource_kind"] is WaitResourceKind.SUBNET
+    assert subnet_call.kwargs["resource_id"] == "subnet-one"
+    assert security_group_call.kwargs["resource_kind"] is WaitResourceKind.SECURITY_GROUP
+    assert security_group_call.kwargs["resource_id"] == "security-group-one"
+    assert virtual_network_call.kwargs["resource_kind"] is WaitResourceKind.VIRTUAL_NETWORK
+    assert virtual_network_call.kwargs["resource_id"] == "virtual-network-one"
+
+    assert subnet_call.kwargs["fn"]() is False
+    grpc.list_subnet_ids.return_value = []
+    assert subnet_call.kwargs["fn"]() is True
+
+
 def test_delete_instance_type_if_present_ignores_not_found() -> None:
     grpc = Mock(spec=GRPCClient)
     grpc.delete_instance_type.side_effect = subprocess.CalledProcessError(

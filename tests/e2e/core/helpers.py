@@ -333,6 +333,18 @@ def wait_for_virtual_network_deletion(*, k8s: K8sClient, name: str) -> None:
     )
 
 
+def wait_for_virtual_network_grpc_removal(*, grpc: GRPCClient, uuid: str) -> None:
+    poll_until(
+        fn=lambda: uuid not in grpc.list_virtual_network_ids(),
+        until=lambda v: v is True,
+        retries=120,
+        delay=5,
+        description=f"{uuid} removed from gRPC VirtualNetwork list",
+        resource_kind=WaitResourceKind.VIRTUAL_NETWORK,
+        resource_id=uuid,
+    )
+
+
 def wait_for_subnet_cr(*, k8s: K8sClient, uuid: str) -> str:
     return poll_until(
         fn=lambda: k8s.get_subnet_name(uuid=uuid, checked=False),
@@ -445,6 +457,20 @@ def wait_for_subnet_deletion(*, k8s: K8sClient, name: str) -> None:
         description=f"{name} Subnet deletion",
         resource_kind=WaitResourceKind.SUBNET,
         resource_id=name,
+    )
+
+
+def wait_for_subnet_grpc_removal(*, grpc: GRPCClient, uuid: str) -> None:
+    # Subnet CRs are generated (subnet-xxxxx), so the API record is the only
+    # identity a caller can wait on when it only knows the recorded name.
+    poll_until(
+        fn=lambda: uuid not in grpc.list_subnet_ids(),
+        until=lambda v: v is True,
+        retries=120,
+        delay=5,
+        description=f"{uuid} removed from gRPC Subnet list",
+        resource_kind=WaitResourceKind.SUBNET,
+        resource_id=uuid,
     )
 
 
@@ -1496,6 +1522,18 @@ def wait_for_security_group_deletion(*, k8s: K8sClient, name: str) -> None:
         description=f"{name} SecurityGroup deletion",
         resource_kind=WaitResourceKind.SECURITY_GROUP,
         resource_id=name,
+    )
+
+
+def wait_for_security_group_grpc_removal(*, grpc: GRPCClient, uuid: str) -> None:
+    poll_until(
+        fn=lambda: uuid not in grpc.list_security_group_ids(),
+        until=lambda v: v is True,
+        retries=120,
+        delay=5,
+        description=f"{uuid} removed from gRPC SecurityGroup list",
+        resource_kind=WaitResourceKind.SECURITY_GROUP,
+        resource_id=uuid,
     )
 
 

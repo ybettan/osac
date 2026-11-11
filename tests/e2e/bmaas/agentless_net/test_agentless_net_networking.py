@@ -25,13 +25,13 @@ from tests.e2e.core.helpers import (
     wait_for_grpc_subnet_ready,
     wait_for_grpc_virtual_network_ready,
     wait_for_security_group_cr,
-    wait_for_security_group_deletion,
+    wait_for_security_group_grpc_removal,
     wait_for_security_group_ready,
     wait_for_subnet_cr,
-    wait_for_subnet_deletion,
+    wait_for_subnet_grpc_removal,
     wait_for_subnet_ready,
     wait_for_virtual_network_cr,
-    wait_for_virtual_network_deletion,
+    wait_for_virtual_network_grpc_removal,
     wait_for_virtual_network_ready,
 )
 from tests.e2e.core.k8s_client import K8sClient
@@ -448,19 +448,19 @@ def _cleanup_run(
         if subnet.get("metadata", {}).get("name") != resources.get("subnet_name"):
             raise RuntimeError("Subnet id no longer resolves to the recorded test-owned name")
         grpc.delete_subnet(subnet_id=resources["subnet_id"])
-        wait_for_subnet_deletion(k8s=k8s, name=resources["subnet_name"])
+        wait_for_subnet_grpc_removal(grpc=grpc, uuid=resources["subnet_id"])
     if resources.get("security_group_id") and resources["security_group_id"] in grpc.list_security_group_ids():
         group = grpc.get_security_group(sg_id=resources["security_group_id"]).get("object", {})
         if group.get("metadata", {}).get("name") != resources.get("security_group_name"):
             raise RuntimeError("SecurityGroup id no longer resolves to the recorded test-owned name")
         grpc.delete_security_group(sg_id=resources["security_group_id"])
-        wait_for_security_group_deletion(k8s=k8s, name=resources["security_group_name"])
+        wait_for_security_group_grpc_removal(grpc=grpc, uuid=resources["security_group_id"])
     if resources.get("virtual_network_id") and resources["virtual_network_id"] in grpc.list_virtual_network_ids():
         network = grpc.get_virtual_network(vn_id=resources["virtual_network_id"]).get("object", {})
         if network.get("metadata", {}).get("name") != resources.get("virtual_network_name"):
             raise RuntimeError("VirtualNetwork id no longer resolves to the recorded test-owned name")
         grpc.delete_virtual_network(vn_id=resources["virtual_network_id"])
-        wait_for_virtual_network_deletion(k8s=k8s, name=resources["virtual_network_name"])
+        wait_for_virtual_network_grpc_removal(grpc=grpc, uuid=resources["virtual_network_id"])
     if resources.get("catalog_id"):
         grpc.delete_baremetal_instance_catalog_item(item_id=resources["catalog_id"])
     if resources.get("disk_image_id"):
