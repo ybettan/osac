@@ -55,6 +55,68 @@ EOF
         printf '%s\n' "${REPO_ROOT}/.artifacts/agentless-net-bmaas/hosts.json"
     }
 
+    # The lab leaves run Cumulus inside a boxen QEMU guest, so the switch ports
+    # live in the guest and the container only holds tap devices. Containerlab
+    # wires the ports it deploys with ingress redirect filters; a veth created
+    # after deployment (as the BMaaS host links are) is a dead end until the
+    # same two-way wiring exists. Without it the host's frames stop inside the
+    # switch container and no DHCP request ever reaches the fabric.
+    bmaas_wire_host_link_to_switch_guest() {
+        local switch="$1" switch_port="$2"
+        local guest_nic guest_args tap
+        docker inspect "$switch" >/dev/null 2>&1 \
+            || die "The Containerlab switch ${switch} is missing"
+        if ! docker exec "$switch" sh -c 'pgrep qemu-system >/dev/null'; then
+            # A container-based switch terminates the port in the container.
+            return 0
+        fi
+        guest_args="$(docker exec "$switch" sh -c \
+            'tr "\0" "\n" < /proc/$(pgrep qemu-system | head -n 1)/cmdline')" \
+            || die "Could not read the ${switch} guest command line"
+        guest_nic="$(printf 'p%03d' "${switch_port#swp}")"
+        grep -Eq "^virtio-net-pci,netdev=${guest_nic}," <<<"$guest_args" \
+            || die "The ${switch} guest has no ${switch_port} port; refusing to wire a dead BMaaS link"
+        tap="$(awk -F, -v id="${guest_nic}" '
+            $1 == "tap" && $2 == "id=" id {
+                for (field = 3; field <= NF; field++) {
+                    if ($field ~ /^ifname=/) {
+                        sub(/^ifname=/, "", $field)
+                        print $field
+                        exit
+                    }
+                }
+            }
+        ' <<<"$guest_args")"
+        [[ -n "$tap" ]] \
+            || die "Could not resolve the ${switch} guest tap for ${switch_port}"
+        docker exec "$switch" ip link show "$tap" >/dev/null 2>&1 \
+            || die "The ${switch} guest tap ${tap} for ${switch_port} is missing"
+        docker exec "$switch" sh -c '
+            set -eu
+            port=$1
+            tap=$2
+            wire() {
+                from=$1
+                to=$2
+                if tc filter show dev "$from" ingress 2>/dev/null | grep -q mirred; then
+                    if tc filter show dev "$from" ingress 2>/dev/null \
+                        | grep -Eq "device ${to}([^0-9]|$)"; then
+                        return 0
+                    fi
+                    tc filter del dev "$from" ingress
+                fi
+                tc qdisc add dev "$from" ingress 2>/dev/null || true
+                tc filter add dev "$from" ingress matchall action mirred egress redirect dev "$to"
+            }
+            ip link set dev "$port" up
+            ip link set dev "$tap" up
+            wire "$port" "$tap"
+            wire "$tap" "$port"
+            ' bmaas-switch-port "$switch_port" "$tap" \
+            || die "Could not wire ${switch}/${switch_port} into guest port ${tap}"
+        info "Wired the ${switch}/${switch_port} BMaaS link into guest port ${tap}."
+    }
+
     bmaas_prepare_hosts() {
         local state_file inventory_file infra_dir setup_script bmh_name bridge host_link fabric_mac switch vm_state
         local bmh_namespace="${OSAC_BMH_NAMESPACE:-host-inventory}"
@@ -185,6 +247,7 @@ PY
                     --b-endpoint "host:${host_link}" \
                     || die "Could not add the dedicated BMaaS host link ${switch}/swp5"
             fi
+            bmaas_wire_host_link_to_switch_guest "$switch" swp5
             if ! ip link show "$bridge" >/dev/null 2>&1; then
                 sudo ip link add "$bridge" type bridge
             fi

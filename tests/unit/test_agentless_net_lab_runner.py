@@ -2137,6 +2137,152 @@ def test_bmaas_host_setup_uses_valid_bridge_names_and_recovers_ci_inventory() ->
     )
 
 
+def test_bmaas_host_link_is_wired_into_the_boxen_switch_guest(tmp_path) -> None:
+    log_path = tmp_path / "docker.log"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_docker = bin_dir / "docker"
+    fake_docker.write_text(
+        """#!/bin/sh
+printf '%s\\n' "$*" >> "$FAKE_DOCKER_LOG"
+case "$1" in
+  inspect) exit 0 ;;
+  exec)
+    shift
+    shift
+    case "$*" in
+      *cmdline*) printf '%s\\n' "$FAKE_QEMU_ARGS"; exit 0 ;;
+      *pgrep*) exit "${FAKE_PGREP_STATUS:-0}" ;;
+      *"ip link show"*) exit "${FAKE_TAP_STATUS:-0}" ;;
+      *) exit 0 ;;
+    esac ;;
+esac
+exit 0
+"""
+    )
+    fake_docker.chmod(0o755)
+
+    qemu_args = "\n".join(
+        [
+            "-device",
+            "virtio-net-pci,netdev=p005,bus=pci.1,addr=0x6,mac=52:54:00:c5:49:05",
+            "-netdev",
+            "tap,id=p005,ifname=tap5,script=no,downscript=no",
+            "-device",
+            "virtio-net-pci,netdev=p006,bus=pci.1,addr=0x7,mac=52:54:00:9d:b4:06",
+            "-netdev",
+            "tap,id=p006,ifname=tap6,script=no,downscript=no",
+        ]
+    )
+    result = run_bash(
+        tmp_path,
+        f"""
+set -euo pipefail
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+info() {{ printf 'INFO: %s\\n' "$*" >&2; }}
+source {shlex.quote(str(BMAAS_RUNNER))}
+bmaas_wire_host_link_to_switch_guest clab-agentless-net-lab-leaf-2 swp5
+""",
+        env={
+            "VLAN_E2E_BMAAS_LIBRARY": "true",
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "FAKE_DOCKER_LOG": str(log_path),
+            "FAKE_QEMU_ARGS": qemu_args,
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    commands = log_path.read_text()
+    # The guest tap is resolved from the QEMU device pair, not assumed.
+    assert commands.count("bmaas-switch-port") == 1
+    assert commands.rstrip().endswith("bmaas-switch-port swp5 tap5")
+    # Both directions are redirected and the port is brought up first.
+    assert 'wire "$port" "$tap"' in commands
+    assert 'wire "$tap" "$port"' in commands
+    assert "tc filter add dev" in commands
+    assert "action mirred egress redirect" in commands
+
+
+def test_bmaas_host_link_skips_a_container_switch_without_a_guest(tmp_path) -> None:
+    log_path = tmp_path / "docker.log"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_docker = bin_dir / "docker"
+    fake_docker.write_text(
+        """#!/bin/sh
+printf '%s\\n' "$*" >> "$FAKE_DOCKER_LOG"
+if [ "$1" = exec ]; then exit "$FAKE_PGREP_STATUS"; fi
+exit 0
+"""
+    )
+    fake_docker.chmod(0o755)
+
+    result = run_bash(
+        tmp_path,
+        f"""
+set -euo pipefail
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+info() {{ printf 'INFO: %s\\n' "$*" >&2; }}
+source {shlex.quote(str(BMAAS_RUNNER))}
+bmaas_wire_host_link_to_switch_guest clab-agentless-net-lab-leaf-2 swp5
+""",
+        env={
+            "VLAN_E2E_BMAAS_LIBRARY": "true",
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "FAKE_DOCKER_LOG": str(log_path),
+            "FAKE_PGREP_STATUS": "1",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "bmaas-switch-port" not in log_path.read_text()
+    assert "Wired the" not in result.stderr
+
+
+def test_bmaas_host_link_refuses_an_unresolvable_guest_port(tmp_path) -> None:
+    log_path = tmp_path / "docker.log"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_docker = bin_dir / "docker"
+    fake_docker.write_text(
+        """#!/bin/sh
+printf '%s\\n' "$*" >> "$FAKE_DOCKER_LOG"
+case "$1" in
+  inspect) exit 0 ;;
+  exec)
+    shift
+    shift
+    case "$*" in
+      *cmdline*) printf '%s\\n' "-netdev" "tap,id=p005,ifname=tap5"; exit 0 ;;
+      *pgrep*) exit 0 ;;
+      *) exit 0 ;;
+    esac ;;
+esac
+exit 0
+"""
+    )
+    fake_docker.chmod(0o755)
+
+    result = run_bash(
+        tmp_path,
+        f"""
+set -euo pipefail
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+info() {{ printf 'INFO: %s\\n' "$*" >&2; }}
+source {shlex.quote(str(BMAAS_RUNNER))}
+bmaas_wire_host_link_to_switch_guest clab-agentless-net-lab-leaf-2 swp5
+""",
+        env={
+            "VLAN_E2E_BMAAS_LIBRARY": "true",
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "FAKE_DOCKER_LOG": str(log_path),
+        },
+    )
+
+    assert result.returncode != 0
+    assert "refusing to wire a dead BMaaS link" in result.stderr
+
+
 def test_bmaas_switch_ports_are_ready_before_host_inspection() -> None:
     suite_start = BMAAS_SOURCE.index("    run_bmaas_suite() {")
     suite_end = BMAAS_SOURCE.index("    run_bmaas_cleanup() {", suite_start)
