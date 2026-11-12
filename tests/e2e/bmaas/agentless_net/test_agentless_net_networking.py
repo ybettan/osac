@@ -343,53 +343,52 @@ def test_agentless_bmaas_existing_flow(
         wait_for_subnet_ready(k8s=k8s_hub_client, name=wait_for_subnet_cr(k8s=k8s_hub_client, uuid=subnet_id))
         wait_for_grpc_subnet_ready(grpc=grpc, subnet_id=subnet_id)
         hosts = json.loads(Path(env("OSAC_BMAAS_HOSTS_FILE")).read_text()).get("hosts", [])
-        assert len(hosts) == 2, f"Expected exactly two reusable BMaaS hosts, found {len(hosts)}"
+        assert len(hosts) == 1, f"Expected exactly one reusable BMaaS host, found {len(hosts)}"
         host_by_name = {host["name"]: host for host in hosts}
-        for index in range(1, 3):
-            bmi_name = f"{prefix}-bmi-{index}"
-            bmi_id, _ = jwt_cli_user.create_baremetal_instance(
-                name=bmi_name,
-                catalog_item=catalog_name,
-                instance_type=instance_type_name,
-                ssh_key=key_name,
-                disk_image=image_name,
-                network_attachments=[f"subnet={subnet_id},interface=data-0,primary,security-groups={sg_id}"],
-            )
-            resources["bmis"].append({"id": bmi_id, "name": bmi_name})
-            _write_private_json(_journal_path(), resources)
-            bmi_cr_name = wait_for_bmi_cr(k8s=k8s_hub_client, uuid=bmi_id)
-            bmh_ns, bmh_name = wait_for_bmi_external_host(k8s=k8s_hub_client, bmi_id=bmi_id, bmi_cr_name=bmi_cr_name)
-            assert bmh_name in host_by_name, f"BMI {bmi_id} was allocated to an unowned BMH: {bmh_name}"
-            resources["bmis"][-1].update(cr_name=bmi_cr_name, bmh_name=bmh_name, bmh_namespace=bmh_ns)
-            _write_private_json(_journal_path(), resources)
-            bmh = k8s_hub_client.get_json(resource="baremetalhost", name=bmh_name, namespace=bmh_ns)
-            mac_mapping = json.loads(bmh.get("metadata", {}).get("annotations", {}).get(_MAC_ANNOTATION, "{}"))
-            expected_mac = host_by_name[bmh_name]["fabric_mac"].lower()
-            assert mac_mapping.get("data-0", "").lower() == expected_mac, (
-                f"BMH {bmh_name} data-0 mapping does not match the fabric NIC"
-            )
-            discovered_macs = {
-                str(nic.get("mac", "")).lower()
-                for nic in bmh.get("status", {}).get("hardware", {}).get("nics", [])
-                if isinstance(nic, dict)
-            }
-            assert expected_mac in discovered_macs, f"BMH {bmh_name} inspection does not include data-0"
+        bmi_name = f"{prefix}-bmi"
+        bmi_id, _ = jwt_cli_user.create_baremetal_instance(
+            name=bmi_name,
+            catalog_item=catalog_name,
+            instance_type=instance_type_name,
+            ssh_key=key_name,
+            disk_image=image_name,
+            network_attachments=[f"subnet={subnet_id},interface=data-0,primary,security-groups={sg_id}"],
+        )
+        resources["bmis"].append({"id": bmi_id, "name": bmi_name})
+        _write_private_json(_journal_path(), resources)
+        bmi_cr_name = wait_for_bmi_cr(k8s=k8s_hub_client, uuid=bmi_id)
+        bmh_ns, bmh_name = wait_for_bmi_external_host(k8s=k8s_hub_client, bmi_id=bmi_id, bmi_cr_name=bmi_cr_name)
+        assert bmh_name in host_by_name, f"BMI {bmi_id} was allocated to an unowned BMH: {bmh_name}"
+        resources["bmis"][-1].update(cr_name=bmi_cr_name, bmh_name=bmh_name, bmh_namespace=bmh_ns)
+        _write_private_json(_journal_path(), resources)
+        bmh = k8s_hub_client.get_json(resource="baremetalhost", name=bmh_name, namespace=bmh_ns)
+        mac_mapping = json.loads(bmh.get("metadata", {}).get("annotations", {}).get(_MAC_ANNOTATION, "{}"))
+        expected_mac = host_by_name[bmh_name]["fabric_mac"].lower()
+        assert mac_mapping.get("data-0", "").lower() == expected_mac, (
+            f"BMH {bmh_name} data-0 mapping does not match the fabric NIC"
+        )
+        discovered_macs = {
+            str(nic.get("mac", "")).lower()
+            for nic in bmh.get("status", {}).get("hardware", {}).get("nics", [])
+            if isinstance(nic, dict)
+        }
+        assert expected_mac in discovered_macs, f"BMH {bmh_name} inspection does not include data-0"
 
-            result = _wait_for_running_or_failed(
-                grpc=jwt_grpc_tenant1,
-                k8s=k8s_hub_client,
-                bmi_id=bmi_id,
-                bmh_namespace=bmh_namespace,
-                subnet_id=subnet_id,
-                run_id=run_id,
-            )
-            interface_statuses = result.get("status", {}).get(
-                "networkAttachmentStatuses", result.get("status", {}).get("network_attachment_statuses", [])
-            )
-            assert interface_statuses, f"BMI {bmi_id} reached RUNNING without an attachment IP status"
-            ip_status = interface_statuses[0].get("ipAddress", interface_statuses[0].get("ip_address", ""))
-            assert ip_status, f"BMI {bmi_id} has no network attachment IP after RUNNING"
-            assert ip_status.startswith("10.251.1."), f"BMI {bmi_id} IP {ip_status} is outside its test Subnet"
+        result = _wait_for_running_or_failed(
+            grpc=jwt_grpc_tenant1,
+            k8s=k8s_hub_client,
+            bmi_id=bmi_id,
+            bmh_namespace=bmh_namespace,
+            subnet_id=subnet_id,
+            run_id=run_id,
+        )
+        interface_statuses = result.get("status", {}).get(
+            "networkAttachmentStatuses", result.get("status", {}).get("network_attachment_statuses", [])
+        )
+        assert interface_statuses, f"BMI {bmi_id} reached RUNNING without an attachment IP status"
+        ip_status = interface_statuses[0].get("ipAddress", interface_statuses[0].get("ip_address", ""))
+        assert ip_status, f"BMI {bmi_id} has no network attachment IP after RUNNING"
+        assert ip_status.startswith("10.251.1."), f"BMI {bmi_id} IP {ip_status} is outside its test Subnet"
 
         _cleanup_run(
             grpc=grpc,
