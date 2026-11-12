@@ -1521,60 +1521,412 @@ PY
     assert "not the known legacy inventory" in result.stderr
 
 
-def test_bmaas_pytest_env_uses_private_admin_service_account(tmp_path):
-    helper = BMAAS_SOURCE[
-        BMAAS_SOURCE.index("    bmaas_pytest_env() {") : BMAAS_SOURCE.index(
-            "    run_bmaas_suite() {"
-        )
-    ]
-    script = f"""
+BMAAS_SUITE_HARNESS = r"""
 set -euo pipefail
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+info() { :; }
+sleep() { :; }
+ssh-keygen() {
+    local path=""
+    while (($#)); do case "$1" in -f) path="$2"; shift 2 ;; *) shift ;; esac; done
+    printf 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITESTKEY test\n' >"${path}.pub"
+    : >"$path"
+}
+source @@RUNNER@@
+OSAC_TENANT=osac-e2e-ci
 OSAC_NAMESPACE=osac-e2e-ci
-OSAC_SERVICE_ACCOUNT=osac-operator
-OSAC_BMH_NAMESPACE=host-inventory
-OSAC_BMAAS_HOSTS_FILE=/tmp/hosts.json
-CLI_BIN=/tmp/osac-cli
-RUNTIME_SOURCE_COMMIT=abc123
-AAP_PROJECT_EXPECTED_REVISION=abc123
-AAP_IMAGE=quay.example/aap:tag
-BMF_IMAGE=quay.example/bmf:tag
-CONTAINER_TOOL=/bin/true
-AAP_API_CA_FILE=/tmp/ca.pem
-EXTERNAL_IP_TEST_LINK_CLIENT_ADDRESS=192.0.2.10
-NAT_GATEWAY_RESPONSE_PORT=18081
-NAT_GATEWAY_RESPONSE_TOKEN=token
-CONTAINERLAB_UPSTREAM_ROUTER=upstream
-EXTERNAL_IP_TEST_LINK_NODE_ADDRESS=192.0.2.1
-EXTERNAL_IP_CLIENT_ROUTE_INTERFACE=eth1
-VLAN_E2E_RUN_DIR={shlex.quote(str(tmp_path))}
-VLAN_E2E_REUSE_INFRA=false
-OSAC_BMAAS_PRIVATE_SERVICE_ACCOUNT="${{TEST_PRIVATE_SA:-}}"
-bmaas_test_infra_dir() {{ printf '/tmp'; }}
-bmaas_test_infra_ref() {{ printf 'ref'; }}
-bmaas_host_state_file() {{ printf '%s' "$OSAC_BMAAS_HOSTS_FILE"; }}
-die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
-oc() {{
+TEMP_DIR="$(mktemp -d)"
+CLI_BIN=/bin/true
+CLI_CONFIG_DIR="$(mktemp -d)"
+CALLS=@@CALLS@@
+SUBNET_JSON=@@SUBNET_JSON@@
+BMI_JSON=@@BMI_JSON@@
+CR_JSON=@@CR_JSON@@
+BMH_JSON=@@BMH_JSON@@
+HOSTS_JSON=@@HOSTS_JSON@@
+BMI_ID=@@BMI_ID@@
+IMAGE_ID=bm-image-1
+TYPE_ID=bm-type-1
+CATALOG_ID=bm-catalog-1
+BMAAS_INSTANCE_WAIT_ATTEMPTS=2
+BMAAS_REMOVAL_WAIT_ATTEMPTS=2
+BMAAS_INSTANCE_WAIT_DELAY=0
+BMAAS_REMOVAL_WAIT_DELAY=0
+hosts_file="$(mktemp)"
+printf '%s\n' "$HOSTS_JSON" >"$hosts_file"
+bmaas_host_state_file() { printf '%s\n' "$hosts_file"; }
+bmi_gone="$(mktemp)"
+rm -f "$bmi_gone"
+bmaas_private_cli_login() { printf 'private-login\n' >>"$CALLS"; }
+bmaas_private_cli() {
+    printf 'private|%s\n' "$*" >>"$CALLS"
     case "$*" in
-        *"get route osac-aap"*) printf 'aap.example\\n' ;;
-        *"exec deployment/osac-operator"*) printf 'aaptoken' ;;
-        *) return 2 ;;
+        *"create diskimage"*) printf "Created disk image '%s'.\n" "$IMAGE_ID" ;;
+        *"create baremetalinstancetype"*) printf "Created bare metal instance type '%s'.\n" "$TYPE_ID" ;;
+        *"create baremetalinstancecatalogitem"*)
+            printf "Created bare metal instance catalog item '%s'.\n" "$CATALOG_ID" ;;
+        *" get baremetalinstancecatalogitem "*) printf '{"metadata":{"name":"agentless-bmaas-fixed-catalog"}}\n' ;;
+        *" get baremetalinstancetype "*) printf '{"metadata":{"name":"agentless-bmaas-fixed-type"}}\n' ;;
+        *" get diskimage "*) printf '{"metadata":{"name":"agentless-bmaas-fixed-image"}}\n' ;;
+        *" delete "*) : ;;
+        *) return 1 ;;
     esac
-}}
-{helper}
-bmaas_pytest_env
-printf 'SA=%s NS=%s\\n' "$OSAC_SERVICE_ACCOUNT" "$OSAC_NAMESPACE"
+}
+bmaas_cli() {
+    printf 'public|%s\n' "$*" >>"$CALLS"
+    case "$*" in
+        "get subnets -o json") printf '%s\n' "$SUBNET_JSON" ;;
+        "create secret "*) printf "Created secret 'agentless-bmaas-fixed-key' (ID: secret-1).\n" ;;
+        "create baremetalinstance "*) printf "Created bare metal instance '%s'.\n" "$BMI_ID" ;;
+        "get baremetalinstances $BMI_ID -o json")
+            if [[ -f "$bmi_gone" ]]; then printf '[]\n'; else printf '%s\n' "$BMI_JSON"; fi ;;
+        "delete baremetalinstance $BMI_ID") : >"$bmi_gone" ;;
+        "get secret "*) printf '{"metadata":{"name":"agentless-bmaas-fixed-key"}}\n' ;;
+        "delete secret "*) : ;;
+        *) return 1 ;;
+    esac
+}
+oc() {
+    printf 'oc|%s\n' "$*" >>"$CALLS"
+    case "$*" in
+        *"label baremetalhost "*) : ;;
+        *"get baremetalhost "*)
+            if [[ "$*" == *jsonpath* ]]; then printf 'available'; else printf '%s\n' "$BMH_JSON"; fi ;;
+        *"get baremetalinstances -A"*)
+            if [[ "$*" == *jsonpath* ]]; then :; else printf '%s\n' "$CR_JSON"; fi ;;
+        *) return 1 ;;
+    esac
+}
+bmaas_write_evidence() { printf 'evidence|%s\n' "$1" >>"$CALLS"; }
+run_bmaas_suite
+cat "$VLAN_E2E_RUN_DIR/agentless-bmaas.json"
 """
-    default_result = run_bash(tmp_path, script)
 
-    assert default_result.returncode == 0, default_result.stderr
-    assert "SA=admin NS=osac-e2e-ci" in default_result.stdout
 
-    override_result = run_bash(
-        tmp_path, script, env={"TEST_PRIVATE_SA": "osac-e2e-private"}
+def bmaas_suite_script(
+    tmp_path: Path,
+    *,
+    instance_ip: str = "10.200.1.5",
+    subnet_ref: str = "subnet-1",
+) -> tuple[str, Path, dict[str, str]]:
+    calls = tmp_path / "calls.log"
+    subnet = {
+        "id": "subnet-1",
+        "metadata": {"name": "default-ipv4"},
+        "spec": {"ipv4_cidr": "10.200.0.0/20", "virtual_network": {"name": "default"}},
+        "status": {"state": "SUBNET_STATE_READY"},
+    }
+    instance = [
+        {
+            "metadata": {"name": "agentless-bmaas-fixed-bmi", "tenant": "osac-e2e-ci"},
+            "status": {
+                "state": "BARE_METAL_INSTANCE_STATE_RUNNING",
+                "network_attachment_statuses": [
+                    {"interface": "data-0", "subnet_ref": subnet_ref, "ip_address": instance_ip}
+                ],
+            },
+        }
+    ]
+    cr = {
+        "items": [
+            {
+                "metadata": {
+                    "name": "bmi-bm-bmi-1",
+                    "labels": {"osac.openshift.io/baremetalinstance-uuid": "bm-bmi-1"},
+                    "annotations": {"osac.openshift.io/tenant": "osac-e2e-ci"},
+                },
+                "spec": {"externalHostID": "host-inventory/virtual-bmh-test"},
+            }
+        ]
+    }
+    bmh = {
+        "metadata": {
+            "annotations": {
+                "osac.openshift.io/interface-macs": json.dumps({"data-0": "52:54:00:aa:bb:01"})
+            }
+        },
+        "status": {"hardware": {"nics": [{"name": "data-0", "mac": "52:54:00:aa:bb:01"}]}},
+    }
+    hosts = {"hosts": [{"name": "virtual-bmh-test", "fabric_mac": "52:54:00:aa:bb:01"}]}
+    replacements = {
+        "@@RUNNER@@": shlex.quote(str(BMAAS_RUNNER)),
+        "@@CALLS@@": shlex.quote(str(calls)),
+        "@@SUBNET_JSON@@": shlex.quote(json.dumps(subnet)),
+        "@@BMI_JSON@@": shlex.quote(json.dumps(instance)),
+        "@@CR_JSON@@": shlex.quote(json.dumps(cr)),
+        "@@BMH_JSON@@": shlex.quote(json.dumps(bmh)),
+        "@@HOSTS_JSON@@": shlex.quote(json.dumps(hosts)),
+        "@@BMI_ID@@": shlex.quote("bm-bmi-1"),
+    }
+    script = BMAAS_SUITE_HARNESS
+    for marker, value in replacements.items():
+        script = script.replace(marker, value)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    environment = {
+        "VLAN_E2E_BMAAS_LIBRARY": "true",
+        "OSAC_BMAAS_RUN_LABEL": "fixed",
+        "VLAN_E2E_RUN_DIR": str(run_dir),
+    }
+    return script, calls, environment
+
+
+def test_bmaas_ipv4_cidr_helpers_accept_only_the_tenant_subnet(tmp_path):
+    result = run_bash(
+        tmp_path,
+        f"""
+set -euo pipefail
+die() {{ printf 'ERROR: %s\n' "$*" >&2; exit 1; }}
+info() {{ :; }}
+source {shlex.quote(str(BMAAS_RUNNER))}
+for address in 10.200.0.1 10.200.15.254 10.200.7.7; do
+    bmaas_ipv4_in_cidr "$address" 10.200.0.0/20 || {{ echo "rejected $address"; exit 1; }}
+done
+for address in 10.199.255.255 10.208.0.0 10.200.0.0/33 300.200.0.1 not-an-address; do
+    if bmaas_ipv4_in_cidr "$address" 10.200.0.0/20; then echo "accepted $address"; exit 1; fi
+done
+bmaas_ipv4_to_int 10.200.0.1 >/dev/null
+if bmaas_ipv4_to_int 10.200.0.256 >/dev/null; then echo "accepted invalid octet"; exit 1; fi
+echo helpers-ok
+""",
+        env={"VLAN_E2E_BMAAS_LIBRARY": "true"},
     )
 
-    assert override_result.returncode == 0, override_result.stderr
-    assert "SA=osac-e2e-private NS=osac-e2e-ci" in override_result.stdout
+    assert result.returncode == 0, result.stderr
+    assert "helpers-ok" in result.stdout
+
+
+def test_bmaas_runner_uses_the_tenant_default_subnet_and_no_pytest_tenants():
+    assert "uv run pytest" not in BMAAS_SOURCE
+    assert "tenant1" not in BMAAS_SOURCE
+    assert "tenant2" not in BMAAS_SOURCE
+    assert "get subnets -o json" in BMAAS_SOURCE
+    assert '--network-attachment "subnet=${BMAAS_SUBNET_ID},interface=data-0,primary"' in BMAAS_SOURCE
+    assert "BARE_METAL_INSTANCE_STATE_RUNNING" in BMAAS_SOURCE
+    assert "bmaas_ipv4_in_cidr" in BMAAS_SOURCE
+    assert "bmaas_private_cli_login" in BMAAS_SOURCE
+    assert "predates the shell-runner schema" in BMAAS_SOURCE
+
+
+def test_bmaas_runner_defines_suite_functions_outside_library_mode():
+    guard = BMAAS_SOURCE.index('if [[ "${VLAN_E2E_BMAAS_LIBRARY:-false}" == true ]]; then')
+    for definition in (
+        "\nbmaas_journal_path() {",
+        "\nbmaas_create_instance() {",
+        "\nrun_bmaas_suite() {",
+        "\nrun_bmaas_cleanup() {",
+    ):
+        assert definition in BMAAS_SOURCE, definition
+        assert BMAAS_SOURCE.index(definition) < guard, definition
+
+
+def test_bmaas_private_session_is_limited_to_the_shared_inputs():
+    assert "oc create token admin -n ${OSAC_NAMESPACE} --duration=1h --as system:admin" in BMAAS_SOURCE
+    assert 'login --private "$api"' in BMAAS_SOURCE
+    # The public tenant identity keeps the least privilege for the instance.
+    assert '"$CLI_BIN" --config "$CLI_CONFIG_DIR" --tenant "$OSAC_TENANT" "$@"' in BMAAS_SOURCE
+
+
+def test_bmaas_suite_provisions_one_instance_on_the_default_subnet(tmp_path):
+    script, calls, environment = bmaas_suite_script(tmp_path)
+
+    result = run_bash(tmp_path, script, env=environment)
+
+    assert result.returncode == 0, result.stderr
+    lines = calls.read_text().splitlines()
+    create_instance = next(line for line in lines if "create baremetalinstance " in line)
+    assert "public|create baremetalinstance " in create_instance
+    assert "--catalog-item agentless-bmaas-fixed-catalog" in create_instance
+    assert "--instance-type agentless-bmaas-fixed-type" in create_instance
+    assert "--ssh-key agentless-bmaas-fixed-key" in create_instance
+    assert "--disk-image agentless-bmaas-fixed-image" in create_instance
+    assert "--set disk_image.shared=true" in create_instance
+    pin = next(line for line in lines if "label baremetalhost " in line)
+    assert "osac.openshift.io/vlan-e2e-host=agentless-lab" in pin
+    create_type = next(line for line in lines if "create baremetalinstancetype " in line)
+    assert "--host-label osac.openshift.io/vlan-e2e-host=agentless-lab" in create_type
+    assert "--published" in BMAAS_SOURCE
+    assert "--network-attachment subnet=subnet-1,interface=data-0,primary" in create_instance
+    assert "--security-groups" not in create_instance
+
+    deletes = [line for line in lines if "delete " in line]
+    deleted_kinds = [line.split("delete ", 1)[1].split()[0] for line in deletes]
+    assert deleted_kinds == [
+        "baremetalinstance",
+        "baremetalinstancecatalogitem",
+        "secret",
+        "baremetalinstancetype",
+        "diskimage",
+    ]
+
+    journal = json.loads(result.stdout[result.stdout.index("{") :])
+    assert journal["prefix"] == "agentless-bmaas-fixed"
+    assert journal["tenant"] == "osac-e2e-ci"
+    assert journal["subnet"] == {"id": "subnet-1", "name": "default-ipv4", "cidr": "10.200.0.0/20"}
+    assert journal["bmi"]["ip_address"] == "10.200.1.5"
+    assert journal["cleaned"] is True
+    assert journal["cleanup_errors"] == []
+
+
+def test_bmaas_suite_accepts_a_subnet_name_in_the_attachment_status(tmp_path):
+    script, _, environment = bmaas_suite_script(tmp_path, subnet_ref="default-ipv4")
+
+    result = run_bash(tmp_path, script, env=environment)
+
+    assert result.returncode == 0, result.stderr
+    assert '"ip_address": "10.200.1.5"' in result.stdout
+
+
+def test_bmaas_suite_preserves_resources_when_the_address_is_outside_the_subnet(tmp_path):
+    script, calls, environment = bmaas_suite_script(tmp_path, instance_ip="10.208.0.9")
+
+    result = run_bash(tmp_path, script, env=environment)
+
+    assert result.returncode != 0
+    assert "outside the tenant Subnet 10.200.0.0/20" in result.stderr
+    assert "delete " not in calls.read_text()
+
+
+def test_bmaas_journal_load_reads_an_uncleaned_journal(tmp_path):
+    journal = tmp_path / "agentless-bmaas.json"
+    journal.write_text(
+        json.dumps(
+            {
+                "prefix": "agentless-bmaas-fixed",
+                "run_label": "fixed",
+                "subnet": {"id": "subnet-1", "name": "default-ipv4", "cidr": "10.200.0.0/20"},
+                "inputs": {
+                    "disk_image": {"id": "image-1", "name": "agentless-bmaas-fixed-image"},
+                    "instance_type": {"id": "type-1", "name": "agentless-bmaas-fixed-type"},
+                    "secret": {"name": "agentless-bmaas-fixed-key"},
+                    "catalog_item": {"id": "catalog-1", "name": "agentless-bmaas-fixed-catalog"},
+                },
+                "bmi": {"id": "bmi-1"},
+                "cleaned": False,
+                "cleanup_errors": ["previous failure"],
+            }
+        )
+    )
+    result = run_bash(
+        tmp_path,
+        f"""
+set -euo pipefail
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+info() {{ :; }}
+source {shlex.quote(str(BMAAS_RUNNER))}
+bmaas_journal_load {shlex.quote(str(journal))}
+printf 'cleaned=%s label=%s image=%s errors=%s\\n' \
+    "$BMAAS_CLEANED" "$BMAAS_RUN_LABEL" "$BMAAS_DISK_IMAGE_ID" "${{BMAAS_CLEANUP_ERRORS[*]}}"
+""",
+        env={"VLAN_E2E_BMAAS_LIBRARY": "true"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "cleaned=false" in result.stdout
+    assert "label=fixed" in result.stdout
+    assert "image=image-1" in result.stdout
+    assert "errors=previous failure" in result.stdout
+
+
+def test_bmaas_cleanup_refuses_an_instance_outside_the_run_prefix(tmp_path):
+    result = run_bash(
+        tmp_path,
+        f"""
+set -euo pipefail
+die() {{ printf 'ERROR: %s\n' "$*" >&2; exit 1; }}
+info() {{ :; }}
+source {shlex.quote(str(BMAAS_RUNNER))}
+OSAC_TENANT=osac-e2e-ci
+BMAAS_PREFIX=agentless-bmaas-fixed
+CALLS="$(mktemp)"
+bmaas_instance_json() {{ printf '%s\n' '{{"metadata":{{"name":"another-tenant-bmi","tenant":"osac-e2e-ci"}}}}'; }}
+bmaas_cli() {{ printf 'delete|%s\n' "$*" >>"$CALLS"; }}
+if bmaas_delete_instance bm-bmi-1; then echo "accepted foreign instance"; exit 1; fi
+if [[ -s "$CALLS" ]]; then echo "deleted foreign instance"; exit 1; fi
+echo guard-ok
+""",
+        env={"VLAN_E2E_BMAAS_LIBRARY": "true"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "guard-ok" in result.stdout
+
+
+def test_bmaas_cleanup_attempts_every_input_and_records_all_leftovers(tmp_path):
+    result = run_bash(
+        tmp_path,
+        f"""
+set -euo pipefail
+die() {{ printf 'ERROR: %s\\n' "$*" >&2; exit 1; }}
+info() {{ :; }}
+source {shlex.quote(str(BMAAS_RUNNER))}
+BMAAS_PREFIX=agentless-bmaas-fixed
+BMAAS_BMI_ID=bm-bmi-1
+BMAAS_CATALOG_NAME=agentless-bmaas-fixed-catalog
+BMAAS_SECRET_NAME=agentless-bmaas-fixed-key
+BMAAS_INSTANCE_TYPE_NAME=agentless-bmaas-fixed-type
+BMAAS_DISK_IMAGE_NAME=agentless-bmaas-fixed-image
+BMAAS_CLEANED=false
+CALLS="$(mktemp)"
+bmaas_delete_instance() {{ printf 'delete|instance\\n' >>"$CALLS"; return 0; }}
+bmaas_wait_for_bmh_available() {{ return 0; }}
+bmaas_delete_shared_input() {{
+    printf 'delete|shared-%s\\n' "$1" >>"$CALLS"
+    [[ "$1" != baremetalinstancecatalogitem ]]
+}}
+bmaas_delete_tenant_input() {{ printf 'delete|tenant-%s\\n' "$1" >>"$CALLS"; return 0; }}
+bmaas_journal_write() {{ :; }}
+if bmaas_cleanup_resources; then echo "cleanup reported success"; exit 1; fi
+cat "$CALLS"
+printf 'errors:%s\\n' "${{BMAAS_CLEANUP_ERRORS[*]}}"
+""",
+        env={"VLAN_E2E_BMAAS_LIBRARY": "true"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "delete|instance" in result.stdout
+    assert "delete|shared-baremetalinstancecatalogitem" in result.stdout
+    assert "delete|tenant-secret" in result.stdout
+    assert "delete|shared-baremetalinstancetype" in result.stdout
+    assert "delete|shared-diskimage" in result.stdout
+    assert "catalog item agentless-bmaas-fixed-catalog remains" in result.stdout
+
+
+def test_bmaas_cleanup_stops_after_the_instance_when_deletion_fails(tmp_path):
+    result = run_bash(
+        tmp_path,
+        f"""
+set -euo pipefail
+die() {{ printf 'ERROR: %s\n' "$*" >&2; exit 1; }}
+info() {{ :; }}
+source {shlex.quote(str(BMAAS_RUNNER))}
+BMAAS_PREFIX=agentless-bmaas-fixed
+BMAAS_BMI_ID=bm-bmi-1
+BMAAS_BMH_NAME=virtual-bmh-test
+BMAAS_BMH_NAMESPACE=host-inventory
+BMAAS_CATALOG_NAME=agentless-bmaas-fixed-catalog
+BMAAS_SECRET_NAME=agentless-bmaas-fixed-key
+BMAAS_INSTANCE_TYPE_NAME=agentless-bmaas-fixed-type
+BMAAS_DISK_IMAGE_NAME=agentless-bmaas-fixed-image
+BMAAS_CLEANED=false
+CALLS="$(mktemp)"
+bmaas_delete_instance() {{ printf 'delete|instance\n' >>"$CALLS"; return 1; }}
+bmaas_wait_for_bmh_available() {{ printf 'delete|bmh\n' >>"$CALLS"; return 0; }}
+bmaas_delete_shared_input() {{ printf 'delete|shared-%s\n' "$1" >>"$CALLS"; return 0; }}
+bmaas_delete_tenant_input() {{ printf 'delete|tenant-%s\n' "$1" >>"$CALLS"; return 0; }}
+bmaas_journal_write() {{ :; }}
+if bmaas_cleanup_resources; then echo "cleanup reported success"; exit 1; fi
+cat "$CALLS"
+echo errors:",${{BMAAS_CLEANUP_ERRORS[*]}}"
+""",
+        env={"VLAN_E2E_BMAAS_LIBRARY": "true"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "delete|instance" in result.stdout
+    assert "delete|shared-" not in result.stdout
+    assert "delete|tenant-" not in result.stdout
+    assert "BareMetalInstance bm-bmi-1 did not finish deleting" in result.stdout
 
 
 def test_aap_ca_bundle_combines_osac_and_default_ingress_cas(tmp_path):
