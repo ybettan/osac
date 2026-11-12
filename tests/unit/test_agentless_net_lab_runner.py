@@ -11,16 +11,28 @@ import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-RUNNER = REPO_ROOT / "vlan-e2e.sh"
-SOURCE = RUNNER.read_text()
+INFRA_RUNNER = REPO_ROOT / "vlan-infra.sh"
+INFRA_SOURCE = INFRA_RUNNER.read_text()
+AGENTLESS_RUNNER = REPO_ROOT / "vlan-e2e-agentless.sh"
+AGENTLESS_SOURCE = AGENTLESS_RUNNER.read_text()
+RUNNER = AGENTLESS_RUNNER
+SOURCE = INFRA_SOURCE + "\n" + AGENTLESS_SOURCE
 BMAAS_RUNNER = REPO_ROOT / "vlan-e2e-bmaas.sh"
 BMAAS_SOURCE = BMAAS_RUNNER.read_text()
 
 
 def function_block(start: str, end: str) -> str:
-    start_index = SOURCE.index(f"\n{start}() {{") + 1
-    end_index = SOURCE.index(f"\n{end}() {{", start_index)
-    return SOURCE[start_index:end_index]
+    for source in (INFRA_SOURCE, AGENTLESS_SOURCE):
+        start_marker = f"\n{start}() {{"
+        if start_marker not in source:
+            continue
+        start_index = source.index(start_marker) + 1
+        end_marker = f"\n{end}() {{"
+        if end_marker not in source[start_index:]:
+            continue
+        end_index = source.index(end_marker, start_index)
+        return source[start_index:end_index]
+    raise ValueError(f"function block {start}..{end} not found in a single runner")
 
 
 def run_bash(tmp_path: Path, script: str, env: dict[str, str] | None = None):
@@ -703,6 +715,8 @@ def test_stale_provider_keys_are_reclaimed_before_key_installation(tmp_path):
         "osac_e2e_1793809370_2244559\n"
     )
     (state / "pending").write_text(
+        "nv set system aaa user cumulus ssh authorized-key osac_e2e_cleanup_1794480521 key '*'\n"
+        "nv set system aaa user cumulus ssh authorized-key osac_e2e_cleanup_1794480521 type ssh-ed25519\n"
         "nv unset system aaa user cumulus ssh authorized-key osac_e2e_1793807380_2191235\n"
     )
     capture = tmp_path / "nvue-reclaim-commands.txt"
@@ -1134,7 +1148,7 @@ jq -e '.switches[0].switchd_reserved_vlan_output == "resv_vlan_range = 3725-3999
 
 
 def test_run_evidence_is_retained_after_failed_suite(tmp_path):
-    helpers = function_block("write_run_evidence", "on_exit")
+    helpers = function_block("write_run_evidence", "vlan_infra_init")
     run_dir = tmp_path / "evidence"
     run_dir.mkdir(mode=0o700)
     repo_root = str(REPO_ROOT)
@@ -1951,8 +1965,8 @@ def test_runtime_source_pins_the_implementation_commit_and_requires_it_as_ancest
     git("commit", "-am", "implementation")
     implementation_commit = git("rev-parse", "HEAD")
     git("checkout", "-b", "e2e")
-    (repository / "vlan-e2e.sh").write_text("runner update\n")
-    git("add", "vlan-e2e.sh")
+    (repository / "vlan-e2e-agentless.sh").write_text("runner update\n")
+    git("add", "vlan-e2e-agentless.sh")
     git("commit", "-m", "runner")
 
     helper_start = SOURCE.index("resolve_runtime_source() {")
@@ -2078,20 +2092,193 @@ def test_runner_stages_are_ordered_and_source_revision_is_pinned():
     positions = [SOURCE.index(marker) for marker in stage_markers]
 
     assert positions == sorted(positions)
-    assert 'AAP_PROJECT_GIT_BRANCH" == "$RUNTIME_SOURCE_BRANCH"' in SOURCE
-    assert 'AAP_PROJECT_EXPECTED_REVISION" == "$RUNTIME_SOURCE_COMMIT"' in SOURCE
     assert 'IMAGE_SOURCE_COMMIT="$RUNTIME_SOURCE_COMMIT"' in SOURCE
     assert 'IMPLEMENTATION_BRANCH_NAME="${VLAN_E2E_RUNTIME_BRANCH:-e2e}"' in SOURCE
     assert 'OSAC_PROFILE="${OSAC_PROFILE:-bmaas-ci}"' in SOURCE
 
 
+def test_agentless_jobs_pin_the_aap_project_revision():
+    assert '--project-revision "$AAP_PROJECT_EXPECTED_REVISION"' in SOURCE
+    assert '--project-revision "$RUNTIME_SOURCE_COMMIT"' not in SOURCE
+
+
+def test_aap_project_follows_upstream_unless_the_branch_changes_aap():
+    assert 'AAP_UPSTREAM_GIT_URI="${AAP_UPSTREAM_GIT_URI:-https://github.com/osac-project/osac}"' in SOURCE
+    assert 'AAP_FORK_GIT_URI="${AAP_FORK_GIT_URI:-https://github.com/ybettan/osac}"' in SOURCE
+    assert (
+        'if aap_source_differs_from "$REPO_ROOT" "$AAP_MAIN_BASE_COMMIT" '
+        '"$RUNTIME_SOURCE_COMMIT"; then' in SOURCE
+    )
+    assert 'AAP_PROJECT_GIT_BRANCH="${AAP_PROJECT_GIT_BRANCH:-${AAP_MAIN_BASE_COMMIT}}"' in SOURCE
+    assert (
+        'AAP_PROJECT_EXPECTED_REVISION="${AAP_PROJECT_EXPECTED_REVISION:-${AAP_MAIN_BASE_COMMIT}}"'
+        in SOURCE
+    )
+    assert 'AAP_PROJECT_GIT_BRANCH="${AAP_PROJECT_GIT_BRANCH:-${RUNTIME_SOURCE_BRANCH}}"' in SOURCE
+    assert (
+        'AAP_PROJECT_EXPECTED_REVISION="${AAP_PROJECT_EXPECTED_REVISION:-${RUNTIME_SOURCE_COMMIT}}"'
+        in SOURCE
+    )
+    assert (
+        "AAP_PROJECT_GIT_URI points at the upstream project but osac-aap differs" in SOURCE
+    )
+
+
+def test_runner_accepts_caller_provided_images():
+    for image_name in ("AAP_IMAGE", "OPERATOR_IMAGE", "FULFILLMENT_IMAGE", "BMF_IMAGE"):
+        assert f'{image_name}_OVERRIDE="${{{image_name}:-}}"' in SOURCE
+    assert '[[ -n "${!override_name}" ]] && continue' in SOURCE
+    assert (
+        "Caller-provided ${runtime_image_name} is unavailable locally and could not be pulled"
+        in SOURCE
+    )
+
+
+def test_runner_verifies_reused_images_are_pullable():
+    assert 'VLAN_E2E_VERIFY_IMAGE_PULL="${VLAN_E2E_VERIFY_IMAGE_PULL:-true}"' in SOURCE
+    assert 'VLAN_E2E_VERIFY_IMAGE_PULL must be true or false' in SOURCE
+    assert '"$CONTAINER_TOOL" pull -q "$runtime_image"' in SOURCE
+    assert "is not pullable from its registry" in SOURCE
+
+
+def test_aap_source_differs_only_when_osac_aap_changes(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "-C", str(repository), "init", "--initial-branch=main"], check=True)
+    subprocess.run(["git", "-C", str(repository), "config", "user.name", "E2E Test"], check=True)
+    subprocess.run(["git", "-C", str(repository), "config", "user.email", "e2e@example.invalid"], check=True)
+    source = repository / "osac-aap" / "source.py"
+    source.parent.mkdir()
+    source.write_text("base\n")
+    subprocess.run(["git", "-C", str(repository), "add", "osac-aap/source.py"], check=True)
+    subprocess.run(["git", "-C", str(repository), "commit", "-m", "base"], check=True)
+    base_commit = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    other = repository / "docs" / "note.md"
+    other.parent.mkdir()
+    other.write_text("runner only\n")
+    subprocess.run(["git", "-C", str(repository), "add", "docs/note.md"], check=True)
+    subprocess.run(["git", "-C", str(repository), "commit", "-m", "docs"], check=True)
+    docs_commit = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    source.write_text("changed\n")
+    subprocess.run(["git", "-C", str(repository), "add", "osac-aap/source.py"], check=True)
+    subprocess.run(["git", "-C", str(repository), "commit", "-m", "aap"], check=True)
+    aap_commit = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    helper_start = INFRA_SOURCE.index("aap_source_differs_from() {")
+    helper_end = INFRA_SOURCE.index("\n}\n", helper_start) + 3
+    helper = INFRA_SOURCE[helper_start:helper_end]
+    script = f"""
+set -euo pipefail
+{helper}
+for candidate in {base_commit} {docs_commit} {aap_commit}; do
+    if aap_source_differs_from {shlex.quote(str(repository))} {base_commit} "$candidate"; then
+        printf '%s differs\\n' "$candidate"
+    else
+        printf '%s same\\n' "$candidate"
+    fi
+done
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        f"{base_commit} same",
+        f"{docs_commit} same",
+        f"{aap_commit} differs",
+    ]
+
+
+def test_aap_main_base_is_resolved_by_upstream_remote_url(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(["git", "-C", str(repository), "init", "--initial-branch=main"], check=True)
+    subprocess.run(["git", "-C", str(repository), "config", "user.name", "E2E Test"], check=True)
+    subprocess.run(["git", "-C", str(repository), "config", "user.email", "e2e@example.invalid"], check=True)
+    readme = repository / "README.md"
+    readme.write_text("base\n")
+    subprocess.run(["git", "-C", str(repository), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(repository), "commit", "-m", "base"], check=True)
+    base_commit = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "remote",
+            "add",
+            "upstream",
+            "git@github.com:osac-project/osac.git",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "update-ref", "refs/remotes/upstream/main", base_commit],
+        check=True,
+    )
+    readme.write_text("fork main moved\n")
+    subprocess.run(["git", "-C", str(repository), "commit", "-am", "fork main"], check=True)
+
+    helper_start = INFRA_SOURCE.index("normalize_git_uri() {")
+    helper_end = INFRA_SOURCE.index("\n}\n", INFRA_SOURCE.index("resolve_aap_main_base() {")) + 3
+    helper = INFRA_SOURCE[helper_start:helper_end]
+    script = f"""
+set -euo pipefail
+AAP_UPSTREAM_GIT_URI=https://github.com/osac-project/osac
+{helper}
+resolve_aap_main_base {shlex.quote(str(repository))}
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == base_commit
+
+
+def test_git_uri_normalization_matches_https_and_ssh_forms(tmp_path: Path) -> None:
+    helper_start = INFRA_SOURCE.index("normalize_git_uri() {")
+    helper_end = INFRA_SOURCE.index("\n}\n", helper_start) + 3
+    helper = INFRA_SOURCE[helper_start:helper_end]
+    script = f"""
+set -euo pipefail
+{helper}
+normalize_git_uri https://github.com/osac-project/osac.git
+normalize_git_uri git@github.com:osac-project/osac.git
+normalize_git_uri ssh://git@github.com/osac-project/osac
+"""
+    result = run_bash(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["github.com/osac-project/osac"] * 3
+
+
 def test_bmaas_activates_ironic_before_osac_install_preflight() -> None:
     api_ready = SOURCE.index('oc wait nodes --all --for=condition=Ready')
-    bmaas_activation = SOURCE.index("    bmaas_activate_ironic\n", api_ready)
+    bmaas_activation = SOURCE.index("\nbmaas_activate_ironic\n", api_ready)
     osac_install = SOURCE.index('step "STEP 2 OF 5:', bmaas_activation)
-    activation_helper = BMAAS_SOURCE[
-        BMAAS_SOURCE.index("    bmaas_activate_ironic() {"):BMAAS_SOURCE.index(
-            "    bmaas_host_state_file() {"
+    activation_helper = INFRA_SOURCE[
+        INFRA_SOURCE.index("\nbmaas_activate_ironic() {") : INFRA_SOURCE.index(
+            "\nbmaas_wire_host_link_to_switch_guest() {"
         )
     ]
 
@@ -2106,9 +2293,7 @@ def test_bmaas_activates_ironic_before_osac_install_preflight() -> None:
 
 
 def test_bmaas_upgrade_syncs_aap_before_template_publication() -> None:
-    setup_start = SOURCE.index(
-        'if [[ "$BMAAS_MODE" == true && -n "$EXISTING_OSAC_RELEASE"'
-    )
+    setup_start = SOURCE.index('if [[ -n "$EXISTING_OSAC_RELEASE" \\\n')
     setup_end = SOURCE.index('if [[ "$OSAC_DEPLOYMENT_NEEDED" == false ]]', setup_start)
     aap_sync = SOURCE[setup_start:setup_end]
     upgrade = SOURCE.index('helm upgrade osac "${INSTALLER_DIR}/charts/osac"', setup_end)
@@ -2120,19 +2305,19 @@ def test_bmaas_upgrade_syncs_aap_before_template_publication() -> None:
 
 
 def test_bmaas_host_setup_uses_valid_bridge_names_and_recovers_ci_inventory() -> None:
-    helper_start = BMAAS_SOURCE.index("    bmaas_prepare_hosts() {")
-    helper_end = BMAAS_SOURCE.index("    bmaas_configure_host_ports() {", helper_start)
-    helper = BMAAS_SOURCE[helper_start:helper_end]
+    helper_start = INFRA_SOURCE.index("\nbmaas_prepare_hosts() {")
+    helper_end = INFRA_SOURCE.index("\nbmaas_configure_host_ports() {", helper_start)
+    helper = INFRA_SOURCE[helper_start:helper_end]
 
     assert 'bridge="br-bmaas-l1"' in helper
-    assert 'bridge="br-bmaas-l2"' in helper
+    assert 'bridge="br-bmaas-l2"' not in helper
     assert 'elif [[ -f "$inventory_file" ]]' in helper
-    assert "Adopting the two BareMetalHosts from the existing BMaaS CI inventory." in helper
+    assert "Adopting one BareMetalHost from the existing BMaaS CI inventory." in helper
     assert 'bash "$setup_script" 9>&-' in helper
     assert 'ip -d link show "$host_link"' in helper
     assert '"link-netns ${switch}"' in helper
     assert 'sudo ip link del "$host_link"' in helper
-    assert helper.index('python3 - "$state_file" "${bmh_names[@]}"') < helper.index(
+    assert helper.index('python3 - "$state_file" "$bmh_name"') < helper.index(
         'virsh domiflist "$bmh_name"'
     )
 
@@ -2284,9 +2469,9 @@ bmaas_wire_host_link_to_switch_guest clab-agentless-net-lab-leaf-2 swp5
 
 
 def test_bmaas_host_bridge_traffic_bypasses_the_host_forward_drop() -> None:
-    helper = BMAAS_SOURCE[
-        BMAAS_SOURCE.index("    bmaas_prepare_hosts() {") : BMAAS_SOURCE.index(
-            "    bmaas_configure_host_ports() {"
+    helper = INFRA_SOURCE[
+        INFRA_SOURCE.index("\nbmaas_prepare_hosts() {") : INFRA_SOURCE.index(
+            "\nbmaas_configure_host_ports() {"
         )
     ]
 
@@ -2300,15 +2485,17 @@ def test_bmaas_host_bridge_traffic_bypasses_the_host_forward_drop() -> None:
 
 
 def test_bmaas_switch_ports_are_ready_before_host_inspection() -> None:
-    suite_start = BMAAS_SOURCE.index("    run_bmaas_suite() {")
-    suite_end = BMAAS_SOURCE.index("    run_bmaas_cleanup() {", suite_start)
-    suite = BMAAS_SOURCE[suite_start:suite_end]
+    up = INFRA_SOURCE[
+        INFRA_SOURCE.index("\nvlan_infra_up() {") : INFRA_SOURCE.index(
+            "\nvlan_infra_prepare_cleanup() {"
+        )
+    ]
     playbook = yaml.safe_load(
         (REPO_ROOT / "tests/e2e/agentless_net/lab/configure_bmaas_access_ports.yml").read_text()
     )
     task = playbook[0]["tasks"][0]
 
-    assert suite.index("bmaas_configure_host_ports") < suite.index("bmaas_prepare_hosts")
+    assert up.index("bmaas_configure_host_ports") < up.index("bmaas_prepare_hosts")
     assert task["ansible.builtin.include_role"]["name"] == "ansible_network.network_runner.switch"
     assert task["ansible.builtin.include_role"]["tasks_from"] == "conf_access_port"
     assert task["vars"]["port_description"] == "OSAC BMaaS provisioning port"
@@ -2558,7 +2745,7 @@ def test_full_suite_runs_attachment_lifecycle_after_creating_its_network_and_cli
 
 def test_external_ip_suite_selects_attachment_dependencies_but_pool_suite_stays_scoped(tmp_path: Path) -> None:
     start = SOURCE.index('case "$VLAN_E2E_SUITE" in')
-    end = SOURCE.index("\nREPO_ROOT=", start)
+    end = SOURCE.index("\nnetnode() {", start)
     suite_flags = SOURCE[start:end]
 
     def resolve(suite: str) -> subprocess.CompletedProcess[str]:
@@ -2614,7 +2801,7 @@ add_external_ip_client_route 198.51.100.21
 
 
 def test_external_ip_cleanup_orders_detach_before_dependent_resources() -> None:
-    cleanup = function_block("cleanup_created_virtual_networks", "on_exit")
+    cleanup = function_block("cleanup_created_virtual_networks", "export_dhcp_debug_artifacts")
 
     positions = [
         cleanup.index("cleanup_created_external_ip_attachments"),
@@ -3177,7 +3364,7 @@ if cleanup_created_virtual_networks 0; then exit 1; fi
 
 
 def test_failed_attachment_detach_preserves_all_dependent_resources(tmp_path: Path) -> None:
-    cleanup = function_block("cleanup_created_virtual_networks", "on_exit")
+    cleanup = function_block("cleanup_created_virtual_networks", "export_dhcp_debug_artifacts")
     events = tmp_path / "failed-attachment-cleanup.log"
     script = f"""
 set -euo pipefail
@@ -3407,7 +3594,6 @@ def test_suite_flags_select_the_same_scope_for_run_and_cleanup(tmp_path):
             "set -euo pipefail\n"
             "VLAN_E2E_SUITE=full\n"
             "CLEANUP_MODE=false\n"
-            "BMAAS_MODE=false\n"
             "usage() { :; }\n"
             "argument_error() { printf 'ERROR: %s\\n' \"$1\" >&2; exit 2; }\n"
             f"set -- {quoted_args}\n"
@@ -3498,16 +3684,12 @@ def test_cleanup_subnet_parent_id_accepts_fulfillment_and_kubernetes_field_names
 
 
 def test_cleanup_mode_is_standalone_and_skips_deployment_stages():
-    setup_start = SOURCE.index(
-        'if [[ "$CLEANUP_MODE" != true ]]; then\n# Step 1: deploy or reuse the SNO'
-    )
-    setup_end = SOURCE.index("\nfi\n\nnetnode() {", setup_start)
-    deployment_block = SOURCE[setup_start:setup_end]
-    cleanup_start = SOURCE.index(
-        "# Standalone cleanup uses the current deployment and fabric only."
-    )
-    cleanup_end = SOURCE.index('step "STEP 5 OF 5: Running', cleanup_start)
-    cleanup_block = SOURCE[cleanup_start:cleanup_end]
+    up_start = INFRA_SOURCE.index("\nvlan_infra_up() {")
+    up_end = INFRA_SOURCE.index("\nvlan_infra_prepare_cleanup() {", up_start)
+    deployment_block = INFRA_SOURCE[up_start:up_end]
+    cleanup_start = INFRA_SOURCE.index("\nvlan_infra_prepare_cleanup() {")
+    cleanup_end = INFRA_SOURCE.index("\nvlan_infra_on_exit_tail() {", cleanup_start)
+    cleanup_block = INFRA_SOURCE[cleanup_start:cleanup_end]
 
     for marker in (
         'step "STEP 1 OF 5:',
@@ -3516,14 +3698,15 @@ def test_cleanup_mode_is_standalone_and_skips_deployment_stages():
         'step "STEP 4 OF 5:',
     ):
         assert marker in deployment_block
-    assert "prepare_suite_cleanup" in cleanup_block
-    assert cleanup_block.index("prepare_suite_cleanup") < cleanup_block.rindex("exit 0")
+    assert "prepare_suite_cleanup" in AGENTLESS_SOURCE
+    prepare_call = AGENTLESS_SOURCE.index("vlan_infra_prepare_cleanup")
+    assert AGENTLESS_SOURCE.index("prepare_suite_cleanup", prepare_call) > prepare_call
     assert "containerlab deploy" not in cleanup_block
     assert "configure_containerlab_fabric" not in cleanup_block
     assert "helm get values osac" in cleanup_block
     assert "configure_aap_execution_environment" not in cleanup_block
-    assert 'step "STEP 5 OF 5: Running' in SOURCE
-    assert 'IMAGE_SOURCE_COMMIT="$RUNTIME_SOURCE_COMMIT"' in SOURCE
+    assert 'step "STEP 5 OF 5: Running' in AGENTLESS_SOURCE
+    assert 'IMAGE_SOURCE_COMMIT="$RUNTIME_SOURCE_COMMIT"' in INFRA_SOURCE
 
 
 def test_cleanup_provider_verifier_resolves_dynamic_state_collections():

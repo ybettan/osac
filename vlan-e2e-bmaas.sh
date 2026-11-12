@@ -1,364 +1,37 @@
 #!/usr/bin/env bash
 # Run the real BMaaS-to-AgentlessNet journey on the shared VLAN development lab.
+#
+# The shared vlan-infra.sh prepares the SNO, OSAC with BMF, the Containerlab
+# fabric, one reusable virtual BareMetalHost, the bootstrap ExternalIPPool, and
+# the single osac-e2e-ci installation tenant. This runner then creates one
+# BareMetalInstance in that tenant, verifies its provisioning, fabric network
+# attachment, and tenant IP feedback, and deletes it with ordered cleanup.
 set -euo pipefail
+umask 077
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=vlan-infra.sh
+source "${REPO_ROOT}/vlan-infra.sh"
+
+VLAN_E2E_SUITE="bmaas"
+SUITE_USES_VN=false
+SUITE_USES_SUBNET=false
+SUITE_USES_SUBNET_DHCP=true
+SUITE_USES_POOL=false
+SUITE_USES_CLI=true
+SUITE_USES_EXTERNAL_IP=false
+SUITE_USES_EXTERNAL_IP_ATTACHMENT=false
+SUITE_USES_NAT_GATEWAY=false
+CLEANUP_MODE=false
 
 if [[ "${VLAN_E2E_BMAAS_LIBRARY:-false}" == true ]]; then
-    bmaas_test_infra_dir() {
-        printf '%s\n' "${OSAC_TEST_INFRA_DIR:-${REPO_ROOT}/../osac-test-infra}"
-    }
-
-    bmaas_test_infra_ref() {
-        printf '%s\n' "${OSAC_TEST_INFRA_REF:-4cacab7f7afe56ed111465e096c0331771edfda9}"
-    }
-
-    bmaas_activate_ironic() {
-        local attempt provisioning_pods webhook_ips
-        info "Activating Ironic before the OSAC BMaaS preflight..."
-        oc apply -f - <<'EOF'
-apiVersion: metal3.io/v1alpha1
-kind: Provisioning
-metadata:
-  name: provisioning-configuration
-spec:
-  provisioningNetwork: "Disabled"
-  disableVirtualMediaTLS: true
-  watchAllNamespaces: true
-EOF
-
-        # `oc wait --for=create` fails when the selector has no matches yet;
-        # the Provisioning resource starts these pods asynchronously.
-        provisioning_pods=""
-        for ((attempt = 1; attempt <= 60; attempt++)); do
-            provisioning_pods="$(oc get pods -n openshift-machine-api \
-                -l baremetal.openshift.io/cluster-baremetal-operator=metal3-state -o name)"
-            [[ -n "$provisioning_pods" ]] && break
-            sleep 5
-        done
-        [[ -n "$provisioning_pods" ]] \
-            || die "Metal3 pods did not appear after BMaaS Ironic activation"
-        oc wait --for=condition=Ready pods \
-            -l baremetal.openshift.io/cluster-baremetal-operator=metal3-state \
-            -n openshift-machine-api --timeout=600s >/dev/null
-
-        webhook_ips=""
-        for ((attempt = 1; attempt <= 60; attempt++)); do
-            webhook_ips="$(oc get endpoints baremetal-operator-webhook-service \
-                -n openshift-machine-api -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)"
-            [[ -n "$webhook_ips" ]] && break
-            sleep 5
-        done
-        [[ -n "$webhook_ips" ]] \
-            || die "Metal3 BareMetalHost webhook did not become ready after Ironic activation"
-    }
-
-    bmaas_host_state_file() {
-        printf '%s\n' "${REPO_ROOT}/.artifacts/agentless-net-bmaas/hosts.json"
-    }
-
-    # The lab leaves run Cumulus inside a boxen QEMU guest, so the switch ports
-    # live in the guest and the container only holds tap devices. Containerlab
-    # wires the ports it deploys with ingress redirect filters; a veth created
-    # after deployment (as the BMaaS host links are) is a dead end until the
-    # same two-way wiring exists. Without it the host's frames stop inside the
-    # switch container and no DHCP request ever reaches the fabric.
-    bmaas_wire_host_link_to_switch_guest() {
-        local switch="$1" switch_port="$2"
-        local guest_nic guest_args tap
-        docker inspect "$switch" >/dev/null 2>&1 \
-            || die "The Containerlab switch ${switch} is missing"
-        if ! docker exec "$switch" sh -c 'pgrep qemu-system >/dev/null'; then
-            # A container-based switch terminates the port in the container.
-            return 0
-        fi
-        guest_args="$(docker exec "$switch" sh -c \
-            'tr "\0" "\n" < /proc/$(pgrep qemu-system | head -n 1)/cmdline')" \
-            || die "Could not read the ${switch} guest command line"
-        guest_nic="$(printf 'p%03d' "${switch_port#swp}")"
-        grep -Eq "^virtio-net-pci,netdev=${guest_nic}," <<<"$guest_args" \
-            || die "The ${switch} guest has no ${switch_port} port; refusing to wire a dead BMaaS link"
-        tap="$(awk -F, -v id="${guest_nic}" '
-            $1 == "tap" && $2 == "id=" id {
-                for (field = 3; field <= NF; field++) {
-                    if ($field ~ /^ifname=/) {
-                        sub(/^ifname=/, "", $field)
-                        print $field
-                        exit
-                    }
-                }
-            }
-        ' <<<"$guest_args")"
-        [[ -n "$tap" ]] \
-            || die "Could not resolve the ${switch} guest tap for ${switch_port}"
-        docker exec "$switch" ip link show "$tap" >/dev/null 2>&1 \
-            || die "The ${switch} guest tap ${tap} for ${switch_port} is missing"
-        docker exec "$switch" sh -c '
-            set -eu
-            port=$1
-            tap=$2
-            wire() {
-                from=$1
-                to=$2
-                if tc filter show dev "$from" ingress 2>/dev/null | grep -q mirred; then
-                    if tc filter show dev "$from" ingress 2>/dev/null \
-                        | grep -Eq "device ${to}([^0-9]|$)"; then
-                        return 0
-                    fi
-                    tc filter del dev "$from" ingress
-                fi
-                tc qdisc add dev "$from" ingress 2>/dev/null || true
-                tc filter add dev "$from" ingress matchall action mirred egress redirect dev "$to"
-            }
-            ip link set dev "$port" up
-            ip link set dev "$tap" up
-            wire "$port" "$tap"
-            wire "$tap" "$port"
-            ' bmaas-switch-port "$switch_port" "$tap" \
-            || die "Could not wire ${switch}/${switch_port} into guest port ${tap}"
-        info "Wired the ${switch}/${switch_port} BMaaS link into guest port ${tap}."
-    }
-
-    bmaas_prepare_hosts() {
-        local state_file inventory_file infra_dir setup_script bmh_name bridge host_link fabric_mac switch vm_state
-        local bmh_namespace="${OSAC_BMH_NAMESPACE:-host-inventory}"
-        local -a bmh_names=("virtual-bmh-${MGMT_CLONE_NAME}-1" "virtual-bmh-${MGMT_CLONE_NAME}-2")
-        state_file="$(bmaas_host_state_file)"
-        inventory_file="${HOME}/virtual-bmh-inventory-${MGMT_CLONE_NAME}.json"
-        mkdir -p "$(dirname "$state_file")"
-        chmod 0700 "$(dirname "$state_file")"
-
-        if [[ -f "$state_file" ]]; then
-            mapfile -t bmh_names < <(jq -r '.hosts[].name' "$state_file")
-            [[ "${#bmh_names[@]}" == 2 ]] \
-                || die "Recorded BMaaS host inventory must contain exactly two hosts"
-            while IFS= read -r bmh_name; do
-                [[ -n "$bmh_name" ]] || continue
-                virsh domstate "$bmh_name" >/dev/null 2>&1 \
-                    || die "Recorded BMaaS host VM ${bmh_name} is missing; inspect the lab before recovery"
-                oc get bmh "$bmh_name" -n "$bmh_namespace" >/dev/null 2>&1 \
-                    || die "Recorded BMaaS host ${bmh_name} is missing; inspect the lab before recovery"
-            done < <(jq -r '.hosts[].name' "$state_file")
-        elif [[ -f "$inventory_file" ]]; then
-            mapfile -t bmh_names < <(jq -r '.hosts[].name' "$inventory_file")
-            [[ "${#bmh_names[@]}" == 2 ]] \
-                || die "BMaaS CI inventory must contain exactly two hosts"
-            while IFS= read -r bmh_name; do
-                [[ -n "$bmh_name" ]] || continue
-                virsh dominfo "$bmh_name" >/dev/null 2>&1 \
-                    || die "BMaaS inventory VM ${bmh_name} is missing; inspect the lab before recovery"
-                oc get bmh "$bmh_name" -n "$bmh_namespace" >/dev/null 2>&1 \
-                    || die "BMaaS inventory host ${bmh_name} is missing; inspect the lab before recovery"
-            done < <(jq -r '.hosts[].name' "$inventory_file")
-            info "Adopting the two BareMetalHosts from the existing BMaaS CI inventory."
-        else
-            local all_existing=true any_existing=false
-            for bmh_name in "${bmh_names[@]}"; do
-                local vm_exists=false bmh_exists=false
-                virsh dominfo "$bmh_name" >/dev/null 2>&1 && vm_exists=true
-                oc get bmh "$bmh_name" -n "$bmh_namespace" >/dev/null 2>&1 && bmh_exists=true
-                if [[ "$vm_exists" == true || "$bmh_exists" == true ]]; then
-                    any_existing=true
-                fi
-                if [[ "$vm_exists" != true || "$bmh_exists" != true ]]; then
-                    all_existing=false
-                fi
-            done
-            if [[ "$all_existing" != true ]]; then
-                [[ "$any_existing" == false ]] \
-                    || die "Partial BMaaS host state exists; inspect the lab before setup"
-                infra_dir="$(bmaas_test_infra_dir)"
-                setup_script="${infra_dir}/.github/scripts/setup-virtual-bmh.sh"
-                [[ -f "$setup_script" ]] \
-                    || die "BMaaS host setup script is missing: ${setup_script}; set OSAC_TEST_INFRA_DIR to the current osac-test-infra checkout"
-                local expected_infra_ref actual_infra_ref
-                expected_infra_ref="$(bmaas_test_infra_ref)"
-                actual_infra_ref="$(git -C "$infra_dir" rev-parse HEAD 2>/dev/null)" \
-                    || die "Could not resolve the osac-test-infra revision"
-                [[ "$actual_infra_ref" == "$expected_infra_ref" ]] \
-                    || die "BMaaS host setup requires osac-test-infra ${expected_infra_ref}; got ${actual_infra_ref}"
-                info "Creating the two reusable virtual BareMetalHosts using BMaaS CI setup..."
-                CLONE_NAME="$MGMT_CLONE_NAME" \
-                    KUBECONFIG="$KUBECONFIG" \
-                    BMH_NAMESPACE="$bmh_namespace" \
-                    BMH_COUNT=2 \
-                    bash "$setup_script" 9>&-
-                [[ -f "$inventory_file" ]] \
-                    || die "BMaaS CI setup did not write its raw host inventory"
-                mapfile -t bmh_names < <(jq -r '.hosts[].name' "$inventory_file")
-                [[ "${#bmh_names[@]}" == 2 ]] \
-                    || die "BMaaS CI inventory must contain exactly two hosts"
-            else
-                info "Adopting the two existing BMaaS virtual hosts for this lab."
-            fi
-        fi
-
-        # Save host ownership before attaching the fabric NICs. If a later
-        # bridge or port setup step fails, the next run can adopt these hosts.
-        python3 - "$state_file" "${bmh_names[@]}" <<'PY'
-import json
-import os
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-names = sys.argv[2:]
-hosts = [
-    {
-        "name": name,
-        "interface": "data-0",
-        "switch": f"clab-agentless-net-lab-leaf-{index}",
-        "port": "swp5",
-        "fabric_mac": f"52:54:00:ba:aa:{index:02x}",
-    }
-    for index, name in enumerate(names, start=1)
-]
-tmp = path.with_suffix(".tmp")
-tmp.write_text(json.dumps({"hosts": hosts}, indent=2) + "\n")
-tmp.chmod(0o600)
-os.replace(tmp, path)
-PY
-
-        local index=0
-        for bmh_name in "${bmh_names[@]}"; do
-            index=$((index + 1))
-            if [[ "$index" == 1 ]]; then
-                host_link="bmaas-l1"
-                bridge="br-bmaas-l1"
-                switch="${CONTAINERLAB_PREFIX}-leaf-1"
-                fabric_mac="52:54:00:ba:aa:01"
-            else
-                host_link="bmaas-l2"
-                bridge="br-bmaas-l2"
-                switch="${CONTAINERLAB_PREFIX}-leaf-2"
-                fabric_mac="52:54:00:ba:aa:02"
-            fi
-
-            local existing_link_details
-            if ip link show "$host_link" >/dev/null 2>&1; then
-                existing_link_details="$(ip -d link show "$host_link" 2>/dev/null || true)"
-                if [[ "$existing_link_details" != *"link-netns ${switch}"* ]]; then
-                    info "Replacing stale BMaaS host link ${host_link} connected to another switch."
-                    sudo ip link del "$host_link" \
-                        || die "Could not remove stale BMaaS host link ${host_link}"
-                fi
-            fi
-            if ! ip link show "$host_link" >/dev/null 2>&1; then
-                sudo "$CONTAINERLAB" tools veth create \
-                    --a-endpoint "${switch}:swp5" \
-                    --b-endpoint "host:${host_link}" \
-                    || die "Could not add the dedicated BMaaS host link ${switch}/swp5"
-            fi
-            bmaas_wire_host_link_to_switch_guest "$switch" swp5
-            if ! ip link show "$bridge" >/dev/null 2>&1; then
-                sudo ip link add "$bridge" type bridge
-            fi
-            sudo ip link set "$host_link" master "$bridge"
-            sudo ip link set "$bridge" up
-
-            # Docker sets the host FORWARD policy to DROP and
-            # bridge-nf-call-iptables routes bridged IPv4 through it, so the
-            # guest's DHCP broadcast (0.0.0.0 to 255.255.255.255) is dropped
-            # before it reaches the switch. Allow only this lab bridge's own
-            # frames, matched by its switch-side port.
-            if [[ "$(sysctl -n net.bridge.bridge-nf-call-iptables 2>/dev/null || printf 0)" == 1 ]]; then
-                local direction
-                for direction in --physdev-in --physdev-out; do
-                    sudo iptables -C FORWARD -m physdev --physdev-is-bridged \
-                        "$direction" "$host_link" -j ACCEPT >/dev/null 2>&1 \
-                        || sudo iptables -I FORWARD 1 -m physdev --physdev-is-bridged \
-                            "$direction" "$host_link" -j ACCEPT >/dev/null \
-                        || die "Could not allow bridged traffic on ${host_link}"
-                done
-            fi
-
-            if ! virsh domiflist "$bmh_name" | awk -v bridge="$bridge" '$3 == bridge { found=1 } END { exit !found }'; then
-                vm_state="$(virsh domstate "$bmh_name" 2>/dev/null)" \
-                    || die "Could not inspect BMaaS host VM ${bmh_name}"
-                if [[ "$vm_state" == running ]]; then
-                    virsh attach-interface --domain "$bmh_name" --type bridge \
-                        --source "$bridge" --model virtio --mac "$fabric_mac" --config --live \
-                        || die "Could not attach the BMaaS fabric NIC to ${bmh_name}"
-                else
-                    virsh attach-interface --domain "$bmh_name" --type bridge \
-                        --source "$bridge" --model virtio --mac "$fabric_mac" --config \
-                        || die "Could not attach the BMaaS fabric NIC to ${bmh_name}"
-                fi
-            fi
-
-            oc label bmh "$bmh_name" -n "$bmh_namespace" \
-                osac.openshift.io/host-type=default --overwrite >/dev/null
-            oc annotate bmh "$bmh_name" -n "$bmh_namespace" \
-                "osac.openshift.io/interface-macs={\"data-0\":\"${fabric_mac}\"}" --overwrite >/dev/null
-            local hardware_nics ready=false
-            hardware_nics="$(oc get bmh "$bmh_name" -n "$bmh_namespace" -o json \
-                | jq -r '.status.hardware.nics[]?.mac | ascii_downcase')"
-            if ! grep -Fxq "$fabric_mac" <<<"$hardware_nics"; then
-                oc annotate bmh "$bmh_name" -n "$bmh_namespace" \
-                    inspect.metal3.io= --overwrite >/dev/null
-                for ((attempt = 1; attempt <= 180; attempt++)); do
-                    if [[ "$(oc get bmh "$bmh_name" -n "$bmh_namespace" \
-                        -o jsonpath='{.status.provisioning.state}' 2>/dev/null || true)" == available ]]; then
-                        ready=true
-                        break
-                    fi
-                    sleep 5
-                done
-                [[ "$ready" == true ]] || die "BMaaS host ${bmh_name} did not return to available after NIC inspection"
-                hardware_nics="$(oc get bmh "$bmh_name" -n "$bmh_namespace" -o json \
-                    | jq -r '.status.hardware.nics[]?.mac | ascii_downcase')"
-            else
-                ready=true
-            fi
-            [[ "$ready" == true ]] || {
-                printf 'BMaaS host %s is not available after fabric NIC setup\n' "$bmh_name" >&2
-                return 1
-            }
-            grep -Fxq "$fabric_mac" <<<"$hardware_nics" \
-                || die "BMaaS host ${bmh_name} hardware inspection did not report its AgentlessNet NIC"
-        done
-
-        python3 - "$state_file" "$BMAAS_HOST_PORTS_FILE" <<'PY'
-import json
-import pathlib
-import sys
-
-hosts = json.loads(pathlib.Path(sys.argv[1]).read_text())["hosts"]
-ports = {
-    host["name"]: {
-        host["interface"]: {"switch": host["switch"], "port": host["port"]}
-    }
-    for host in hosts
-}
-path = pathlib.Path(sys.argv[2])
-path.parent.mkdir(parents=True, exist_ok=True)
-path.write_text(json.dumps(ports, indent=2) + "\n")
-path.chmod(0o600)
-PY
-    }
-
-    bmaas_configure_host_ports() {
-        local log_file="${TEMP_DIR}/bmaas-access-ports.log"
-        info "Configuring the two BMaaS provisioning ports through network-runner..."
-        if ! (
-            cd "$AAP_DIR"
-            uv run --locked --group development ansible-playbook \
-                --inventory "$TEMP_DIR/inventory.yml" \
-                --private-key "$CUMULUS_LAB_ADMIN_KEY" \
-                --ssh-extra-args \
-                "-o BatchMode=yes -o IdentitiesOnly=yes -o UserKnownHostsFile=$TEMP_DIR/known_hosts -o ConnectTimeout=5" \
-                "${FABRIC_DIR}/configure_bmaas_access_ports.yml"
-        ) >"$log_file" 2>&1; then
-            tail -n 80 "$log_file" >&2
-            die "Could not configure BMaaS access ports through network-runner"
-        fi
-    }
-
     bmaas_pytest_env() {
         local route token
         local infra_dir
         OSAC_BMH_NAMESPACE="${OSAC_BMH_NAMESPACE:-host-inventory}"
-        # The suite's private-API client creates tenants, users, disk images and
-        # instance types, which the private API authorizes only for its admin
-        # identity. The public CLI keeps the least-privilege runner identity.
+        # The suite's private-API client creates disk images and instance types,
+        # which the private API authorizes only for its admin identity. The
+        # public CLI keeps the least-privilege runner identity.
         OSAC_SERVICE_ACCOUNT="${OSAC_BMAAS_PRIVATE_SERVICE_ACCOUNT:-admin}"
         export OSAC_NAMESPACE OSAC_SERVICE_ACCOUNT
         export OSAC_BMH_NAMESPACE
@@ -373,11 +46,6 @@ PY
         infra_dir="$(bmaas_test_infra_dir)"
         export OSAC_BMAAS_TEST_INFRA_SHA="$(git -C "$infra_dir" rev-parse HEAD 2>/dev/null || printf unknown)"
         export OSAC_BMAAS_TEST_INFRA_EXPECTED_SHA="$(bmaas_test_infra_ref)"
-        export OSAC_BMAAS_NAT_ENDPOINT_URL="http://${EXTERNAL_IP_TEST_LINK_CLIENT_ADDRESS}:${NAT_GATEWAY_RESPONSE_PORT}/cgi-bin/observe"
-        export OSAC_BMAAS_NAT_ENDPOINT_TOKEN="$NAT_GATEWAY_RESPONSE_TOKEN"
-        export OSAC_BMAAS_UPSTREAM_ROUTER="$CONTAINERLAB_UPSTREAM_ROUTER"
-        export OSAC_BMAAS_EXTERNAL_IP_TEST_GATEWAY="$EXTERNAL_IP_TEST_LINK_NODE_ADDRESS"
-        export OSAC_BMAAS_EXTERNAL_IP_TEST_INTERFACE="$EXTERNAL_IP_CLIENT_ROUTE_INTERFACE"
         OSAC_BMAAS_RUN_ID="${OSAC_BMAAS_RUN_ID:-agentless-bmaas}"
         OSAC_BMAAS_EVIDENCE_DIR="${VLAN_E2E_RUN_DIR:-${REPO_ROOT}/.artifacts/agentless-net-bmaas/runs}"
         export OSAC_BMAAS_RUN_ID OSAC_BMAAS_EVIDENCE_DIR
@@ -399,14 +67,8 @@ PY
         if [[ -f "$journal" ]] && [[ "$(jq -r '.cleaned // false' "$journal")" != true ]]; then
             die "Uncleaned BMaaS resources are recorded in ${journal}; run --cleanup first"
         fi
-        bmaas_configure_host_ports
-        bmaas_prepare_hosts
-        write_provider_inventory
-        prepare_external_ip_test_link
-        configure_nat_gateway_uplink
-        prepare_nat_gateway_endpoint
         bmaas_pytest_env
-        info "Running the BMaaS-to-AgentlessNet lifecycle against two real virtual hosts..."
+        info "Running the BMaaS-to-AgentlessNet lifecycle against one real virtual host..."
         if ! uv run pytest -n 0 tests/e2e/bmaas/agentless_net/test_agentless_net_networking.py; then
             PRESERVE_E2E_RECOVERY_ARTIFACTS=true
             return 1
@@ -435,9 +97,11 @@ if [[ "$#" -gt 0 && "$1" == --help || "$#" -eq 1 && "$1" == -h ]]; then
 Usage: bash ./vlan-e2e-bmaas.sh [--cleanup]
 
 Run the complete BMaaS-to-AgentlessNet E2E against the local shared VLAN lab.
-The runner prepares/reuses OSAC with BMF, two virtual BareMetalHosts, and the
-Containerlab fabric. It tests a real BMI network attachment and cleans only its
-owned test resources. The two virtual hosts and the SNO/fabric are retained.
+The shared infrastructure step prepares or reuses OSAC with BMF, one virtual
+BareMetalHost, the Containerlab fabric, the bootstrap ExternalIPPool, and the
+osac-e2e-ci installation tenant. This runner then tests one real BMI network
+attachment and cleans only its owned test resources. The virtual host and the
+SNO/fabric are retained.
 
 Run --cleanup after an interrupted test. Cleanup uses the current deployment
 and does not boot or reinstall the cluster.
@@ -448,9 +112,47 @@ if [[ "$#" -gt 0 && ("$#" -ne 1 || "$1" != --cleanup) ]]; then
     printf 'ERROR: supported arguments are --help and --cleanup\n' >&2
     exit 2
 fi
-
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ "${1:-}" == --cleanup ]]; then
-    exec bash "${script_dir}/vlan-e2e.sh" --bmaas --cleanup
+    CLEANUP_MODE=true
 fi
-exec bash "${script_dir}/vlan-e2e.sh" --bmaas
+
+on_exit() {
+    local status=$?
+    trap - EXIT
+    set +e
+    if [[ "$status" != 0 ]]; then
+        printf 'ERROR: preserving BMaaS provider access and test resources after a failed journey\n' >&2
+        PRESERVE_E2E_RECOVERY_ARTIFACTS=true
+    fi
+    vlan_infra_on_exit_tail "$status" 0
+}
+trap on_exit EXIT
+
+vlan_infra_init
+
+if [[ "$CLEANUP_MODE" == true ]]; then
+    vlan_infra_prepare_cleanup
+    if ! run_bmaas_cleanup; then
+        PRESERVE_E2E_RECOVERY_ARTIFACTS=true
+        die "BMaaS cleanup could not remove all test-owned resources"
+    fi
+    CLEANUP_DISCOVERY_COMPLETE=true
+    CLEANUP_CLIENTS_COMPLETE=true
+    info "BMaaS cleanup completed; reusable hosts and lab infrastructure were retained."
+    exit 0
+fi
+
+vlan_infra_up
+
+step "STEP 5 OF 5: Running the BMaaS-to-AgentlessNet E2E"
+HOST_IP_FORWARDING_BEFORE="$(netnode sysctl -n net.ipv4.ip_forward)"
+if ! run_bmaas_suite; then
+    PRESERVE_E2E_RECOVERY_ARTIFACTS=true
+    die "BMaaS-to-AgentlessNet E2E failed; use bash ./vlan-e2e-bmaas.sh --cleanup after reviewing the evidence"
+fi
+HOST_IP_FORWARDING_AFTER="$(netnode sysctl -n net.ipv4.ip_forward)"
+[[ "$HOST_IP_FORWARDING_AFTER" == "$HOST_IP_FORWARDING_BEFORE" ]] \
+    || die "The BMaaS E2E changed the Containerlab network-node forwarding sysctl"
+assert_legacy_provider_state_unchanged \
+    || die "The BMaaS E2E changed legacy AgentlessNet provider state"
+info "BMaaS-to-AgentlessNet E2E passed."
