@@ -1,0 +1,20 @@
+---
+- name: Configure the dedicated BMaaS provisioning access ports through network-runner
+  hosts: switches
+  connection: ssh
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Configure {{ _agentless_net_bmaas_port }} as a provisioning access port
+      ansible.builtin.include_role:
+        name: ansible_network.network_runner.switch
+        tasks_from: conf_access_port
+      vars:
+        port_name: "{{ _agentless_net_bmaas_port }}"
+        port_description: "OSAC BMaaS provisioning port"
+        vlan_id: "{{ agentless_net_provisioning_network.vlan_id }}"
+      loop: "{{ agentless_net_bmaas_switch_ports.get(inventory_hostname, []) }}"
+      loop_control:
+        loop_var: _agentless_net_bmaas_port
+        label: "{{ inventory_hostname }}/{{ _agentless_net_bmaas_port }}"
