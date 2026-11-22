@@ -63,6 +63,17 @@ describe('SubnetDetailPage', () => {
     expect((await screen.findAllByRole('button', { name: 'vn-prod' })).length).toBeGreaterThan(0);
   });
 
+  it('shows the provisioning error message for a failed subnet', async () => {
+    const message =
+      'No routing /31 is available in this VirtualNetwork CIDR. Choose a different or larger CIDR.';
+    renderPage({
+      subnets: [{ ...mockSubnet, status: { state: SubnetState.FAILED, message } } as Subnet],
+    });
+
+    expect(await screen.findByText('Provisioning failed')).toBeInTheDocument();
+    expect(screen.getByText(message)).toBeInTheDocument();
+  });
+
   it('deletes the subnet and returns to the parent virtual network', async () => {
     let deleteRequest: SubnetsDeleteRequest | undefined;
     const { user } = renderPage(

@@ -176,6 +176,15 @@ class PublicStateError(StateError):
         "pool_exhausted": "ExternalIPPool has no available addresses",
         "pool_not_registered": "ExternalIPPool is not registered",
         "attachment_conflict": "physical address or switch port was reserved concurrently",
+        "subnet_transit_overlap": (
+            "Subnet CIDR overlaps the VirtualNetwork's reserved routing range. "
+            "Choose a different Subnet CIDR."
+        ),
+        "subnet_vlan_exhausted": "No VLAN is available for this Subnet. Contact your cloud administrator.",
+        "vn_transit_exhausted": (
+            "No routing /31 is available in this VirtualNetwork CIDR. "
+            "Choose a different or larger CIDR."
+        ),
     }
 
     def __init__(self, code: str):
@@ -2406,7 +2415,7 @@ class StateStore:
                 if not subnet_network.subnet_of(parent_network):
                     raise StateError("Subnet CIDR must be contained by its parent VirtualNetwork")
                 if subnet_network.overlaps(transit_network):
-                    raise StateError("Subnet CIDR overlaps its parent VirtualNetwork transit link")
+                    raise PublicStateError("subnet_transit_overlap")
 
                 current = self._subnet_for_uid(connection, uid)
                 existing_subnets = self._subnets_for_virtual_network(
@@ -2443,7 +2452,7 @@ class StateStore:
                     None,
                 )
                 if vlan_id is None:
-                    raise StateError("AgentlessNet Subnet VLAN range is exhausted")
+                    raise PublicStateError("subnet_vlan_exhausted")
                 entry = _subnet_payload(
                     uid,
                     virtual_network_uid,
@@ -3859,9 +3868,7 @@ class StateStore:
                                 transit_network = candidate
                                 break
                         if transit_network is None:
-                            raise StateError(
-                                "no free /31 transit block remains in the VirtualNetwork CIDR"
-                            )
+                            raise PublicStateError("vn_transit_exhausted")
 
                         namespace_ip = transit_network.network_address + 1
                         host_ip = transit_network.network_address
