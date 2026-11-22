@@ -2214,7 +2214,7 @@ def test_subnet_reservation_checks_parent_tenant_transit_and_siblings(tmp_path):
     with pytest.raises(StateError, match="tenant does not match"):
         reserve_subnet(store, uid=UID_THREE, cidr=available_subnet_cidr(parent), tenant_id=TENANT_TWO)
     transit_supernet = ipaddress.ip_network(parent["transit"]["cidr"]).supernet(new_prefix=28)
-    with pytest.raises(StateError, match="overlaps its parent VirtualNetwork transit"):
+    with pytest.raises(StateError, match="reserved routing range"):
         reserve_subnet(store, uid=UID_THREE, cidr=str(transit_supernet))
 
 
@@ -2225,7 +2225,7 @@ def test_subnet_reservation_validates_pool_exhaustion_and_small_prefix(tmp_path)
     reserve_subnet(
         store, uid=UID_TWO, cidr=cidr, observed_vlan_ids=range(1, 4094)
     )
-    with pytest.raises(StateError, match="VLAN range is exhausted"):
+    with pytest.raises(StateError, match="No VLAN is available for this Subnet"):
         reserve_subnet(
             store,
             uid=UID_THREE,
@@ -2322,7 +2322,7 @@ def test_sibling_subnet_provider_operations_share_parent_resource_lock(tmp_path,
 def test_transit_address_exhaustion_preserves_existing_reservation(tmp_path):
     store = store_for(tmp_path)
     first = ensure_virtual_network(store, UID_ONE, "10.0.0.0/31")
-    with pytest.raises(StateError, match="no free /31 transit block"):
+    with pytest.raises(StateError, match="No routing /31 is available"):
         ensure_virtual_network(store, UID_TWO, "10.0.0.0/31")
     assert get_virtual_network(store, UID_ONE) == first
     assert get_virtual_network(store, UID_TWO) is None

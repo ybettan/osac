@@ -56,6 +56,9 @@ def test_real_pool_exhaustion_is_public_and_final(tmp_path, check_mode):
     [
         ("PublicStateError", "pool_exhausted", False, True),
         ("PublicStateError", "pool_not_registered", False, True),
+        ("PublicStateError", "subnet_transit_overlap", False, True),
+        ("PublicStateError", "subnet_vlan_exhausted", False, True),
+        ("PublicStateError", "vn_transit_exhausted", False, True),
         ("PublicRetryableStateError", "attachment_conflict", True, True),
         ("StateError", "ExternalIPPool has no available addresses", False, False),
         ("StateError", TEST_REDACTION_SENTINEL, False, False),
@@ -106,6 +109,7 @@ def test_module_only_exports_explicit_public_errors(monkeypatch, kind, code, ret
     [
         ("osac.templates.agentless_net_state", {"public_message": "ExternalIPPool has no available addresses", "retryable": False}, True, "ExternalIPPool has no available addresses"),
         ("osac.templates.agentless_net_state", {"public_message": "physical address or switch port was reserved concurrently", "retryable": True}, False, "physical address or switch port was reserved concurrently"),
+        ("osac.templates.agentless_net_state", {"public_message": "No routing /31 is available in this VirtualNetwork CIDR. Choose a different or larger CIDR.", "retryable": False}, False, "No routing /31 is available in this VirtualNetwork CIDR. Choose a different or larger CIDR."),
         ("osac.templates.agentless_net_state", {"msg": TEST_REDACTION_SENTINEL, "retryable": False}, True, "AgentlessNet network task failed."),
         ("ansible.builtin.command", {"msg": TEST_REDACTION_SENTINEL, "public_message": TEST_REDACTION_SENTINEL}, True, "AgentlessNet network task failed."),
         ("ansible.builtin.assert", {"msg": TEST_REDACTION_SENTINEL}, False, "AgentlessNet network task failed."),
