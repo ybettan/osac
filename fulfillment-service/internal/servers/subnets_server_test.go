@@ -19,11 +19,15 @@ import (
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
 	"github.com/osac-project/osac/fulfillment-service/internal/collections"
+	"github.com/osac-project/osac/fulfillment-service/internal/controllers/defaultnetworking"
 	"github.com/osac-project/osac/fulfillment-service/internal/database"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
@@ -183,6 +187,64 @@ var _ = Describe("Subnets server", func() {
 				}
 				Expect(status.GetComputeInstanceUnsupportedReason()).To(Equal("eligibility explanation"))
 			}
+		})
+
+		It("rejects a Subnet that overlaps the parent transit range before insertion", func() {
+			vnDao, err := dao.NewGenericDAO[*privatev1.VirtualNetwork]().
+				SetLogger(logger).
+				SetTenancyLogic(tenancy).
+				Build()
+			Expect(err).ToNot(HaveOccurred())
+			parentName := fmt.Sprintf("parent-%s", uuid.NewString()[:8])
+			parent, err := vnDao.Create().SetObject(privatev1.VirtualNetwork_builder{
+				Metadata: privatev1.Metadata_builder{Name: parentName, Tenant: testTenant}.Build(),
+				Spec:     privatev1.VirtualNetworkSpec_builder{Ipv4Cidr: new("10.0.8.0/23")}.Build(),
+				Status: privatev1.VirtualNetworkStatus_builder{
+					State:           privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_READY,
+					TransitIpv4Cidr: new("10.0.9.0/31"),
+				}.Build(),
+			}.Build()).Do(ctx)
+			Expect(err).ToNot(HaveOccurred())
+
+			name := fmt.Sprintf("overlap-%s", uuid.NewString()[:8])
+			_, err = server.Create(ctx, publicv1.SubnetsCreateRequest_builder{
+				Object: publicv1.Subnet_builder{
+					Metadata: publicv1.Metadata_builder{Name: name}.Build(),
+					Spec: publicv1.SubnetSpec_builder{
+						VirtualNetwork: publicv1.VirtualNetworkLocalReference_builder{Id: parent.GetObject().GetId()}.Build(),
+						Ipv4Cidr:       new("10.0.9.0/24"),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).To(HaveOccurred())
+			Expect(status.Code(err)).To(Equal(codes.InvalidArgument))
+			Expect(status.Convert(err).Message()).To(Equal(
+				"Subnet CIDR 10.0.9.0/24 overlaps 10.0.9.0/31, which your VirtualNetwork reserves " +
+					"for routing. Choose a CIDR that does not overlap that range."))
+			details := status.Convert(err).Details()
+			Expect(details).To(HaveLen(1))
+			info, ok := details[0].(*errdetails.ErrorInfo)
+			Expect(ok).To(BeTrue())
+			Expect(info.GetReason()).To(Equal(defaultnetworking.SubnetTransitOverlapReason))
+			Expect(info.GetDomain()).To(Equal(defaultnetworking.SubnetErrorDomain))
+
+			list, err := server.List(ctx, publicv1.SubnetsListRequest_builder{
+				Filter: new(fmt.Sprintf("this.metadata.name == %q", name)),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(list.GetItems()).To(BeEmpty())
+
+			valid, err := server.Create(ctx, publicv1.SubnetsCreateRequest_builder{
+				Object: publicv1.Subnet_builder{
+					Metadata: publicv1.Metadata_builder{Name: name + "-ok"}.Build(),
+					Spec: publicv1.SubnetSpec_builder{
+						VirtualNetwork: publicv1.VirtualNetworkLocalReference_builder{Id: parent.GetObject().GetId()}.Build(),
+						Ipv4Cidr:       new("10.0.8.0/24"),
+					}.Build(),
+				}.Build(),
+			}.Build())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(valid.GetObject().GetStatus().GetState()).To(Equal(publicv1.SubnetState_SUBNET_STATE_PENDING))
 		})
 
 		It("Creates object", func() {

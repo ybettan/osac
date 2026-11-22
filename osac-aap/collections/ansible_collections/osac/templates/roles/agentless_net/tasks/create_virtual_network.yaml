@@ -30,7 +30,17 @@
         virtual_network_cidr: "{{ osac_job_vars.resource.spec.ipv4Cidr }}"
       delegate_to: "{{ groups['agentless_net_vn_network_node'][0] }}"
       become: true
+      register: _agentless_net_virtual_network
       no_log: true
+
+    - name: Return the typed transit range
+      ansible.builtin.set_stats:
+        aggregate: false
+        per_host: false
+        data:
+          osac_result:
+            transit_ipv4_cidr: "{{ _agentless_net_virtual_network.transit_ipv4_cidr }}"
+      when: not ansible_check_mode
   rescue:
     - name: Publish a sanitized VirtualNetwork error
       ansible.builtin.include_tasks: _report_task_error.yaml

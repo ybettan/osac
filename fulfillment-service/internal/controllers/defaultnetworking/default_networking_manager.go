@@ -213,7 +213,9 @@ func (m *manager) Ensure(ctx context.Context, tenantName string) (*privatev1.Net
 	}
 
 	if _, err := m.ensureSubnet(ctx, tenantName, vn.GetId(), defaults.GetSubnetIpv4Cidr(), "default-ipv4"); err != nil {
-		return nil, fmt.Errorf("failed to ensure default IPv4 Subnet: %w", err)
+		// Return the defaults so the tenant controller can report this final
+		// condition instead of losing the configured address plan.
+		return defaults, fmt.Errorf("failed to ensure default IPv4 Subnet: %w", err)
 	}
 	if _, err := m.ensureSecurityGroup(ctx, tenantName, vn.GetId(), defaults); err != nil {
 		return nil, fmt.Errorf("failed to ensure default SecurityGroup: %w", err)

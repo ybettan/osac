@@ -145,6 +145,31 @@ var _ = Describe("VirtualNetwork controller", func() {
 		Expect(h.aap.tasks("vn-1")).To(Equal([]string{"create_virtual_network/fabric"}))
 	})
 
+	It("records the AgentlessNet transit /31 before reporting Ready", func() {
+		h.networkClass(false, false)
+		vn := h.virtualNetwork("vn-agentless")
+		reconcileNet(r, vn)
+		vn.Status.NetworkManagers.Fabric.AnsibleRole = "osac.templates.agentless_net"
+		Expect(k8sClient.Status().Update(ctx, vn)).To(Succeed())
+		h.aap.finish(networktask.CreateVirtualNetwork, netFabric, "successful", `{"osac_result": {"transit_ipv4_cidr": "10.0.8.0/31"}}`)
+		reconcileNet(r, vn)
+		expectReady(vn, metav1.ConditionTrue, v1alpha1.ReasonSucceeded)
+		Expect(vn.Status.TransitIPv4CIDR).To(Equal("10.0.8.0/31"))
+	})
+
+	It("rejects an AgentlessNet result without its transit /31", func() {
+		h.networkClass(false, false)
+		vn := h.virtualNetwork("vn-agentless")
+		reconcileNet(r, vn)
+		vn.Status.NetworkManagers.Fabric.AnsibleRole = "osac.templates.agentless_net"
+		Expect(k8sClient.Status().Update(ctx, vn)).To(Succeed())
+		h.aap.finish(networktask.CreateVirtualNetwork, netFabric, "successful", `{"osac_result": {}}`)
+		reconcileNet(r, vn)
+		Expect(expectReady(vn, metav1.ConditionFalse, v1alpha1.ReasonFailed).Message).
+			To(Equal(`OSAC rejected the create_virtual_network result: missing required output "transit_ipv4_cidr"`))
+		Expect(vn.Status.TransitIPv4CIDR).To(BeEmpty())
+	})
+
 	It("rejects an l3_vni that differs from the accepted value", func() {
 		h.networkClass(true, false)
 		vn := h.virtualNetwork("vn-1")

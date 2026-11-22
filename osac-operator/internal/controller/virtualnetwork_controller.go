@@ -85,7 +85,11 @@ func (r *VirtualNetworkReconciler) create(ctx context.Context, vn *v1alpha1.Virt
 			// The engine writes these fields with the Succeeded entry.
 			req.SerializeVNI = true
 			req.Accept = func(ctx context.Context, result networktask.Result) error {
-				backendID, l3VNI, err := networktask.ParseVirtualNetworkResult(result, r.networkType(vn))
+				requireTransit := vn.Status.NetworkManagers != nil &&
+					vn.Status.NetworkManagers.Fabric != nil &&
+					vn.Status.NetworkManagers.Fabric.AnsibleRole == "osac.templates.agentless_net"
+				backendID, l3VNI, transit, err := networktask.ParseVirtualNetworkResult(
+					result, r.networkType(vn), vn.Spec.IPv4CIDR, requireTransit)
 				if err != nil {
 					return err
 				}
@@ -102,6 +106,12 @@ func (r *VirtualNetworkReconciler) create(ctx context.Context, vn *v1alpha1.Virt
 				}
 				if l3VNI != 0 {
 					vn.Status.L3VNI = l3VNI
+				}
+				if transit != "" {
+					if vn.Status.TransitIPv4CIDR != "" && vn.Status.TransitIPv4CIDR != transit {
+						return networktask.Reject("transit_ipv4_cidr changed from the accepted value")
+					}
+					vn.Status.TransitIPv4CIDR = transit
 				}
 				return nil
 			}
