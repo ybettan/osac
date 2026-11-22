@@ -45,7 +45,7 @@ func wireResult(t *testing.T, name string) Result {
 }
 
 func TestParsersAcceptTheWireResultGoldens(t *testing.T) {
-	id, l3, err := ParseVirtualNetworkResult(wireResult(t, "create_virtual_network.fabric.json"), "evpn")
+	id, l3, _, err := ParseVirtualNetworkResult(wireResult(t, "create_virtual_network.fabric.json"), "evpn", "", false)
 	if err != nil || id != "101" || l3 != 10001 {
 		t.Fatalf("virtual network result: %q %d %v", id, l3, err)
 	}

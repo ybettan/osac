@@ -3092,7 +3092,7 @@ def test_external_ip_attachment_module_dispatches_identity_and_context(
     ansible_module = SimpleNamespace(
         params=params,
         check_mode=True,
-        exit_json=Mock(),
+        exit_json=Mock(side_effect=lambda **kw: __import__("traceback").print_stack()),
         fail_json=Mock(),
     )
     monkeypatch.setattr(module, "AnsibleModule", lambda **_kwargs: ansible_module)
@@ -3542,3 +3542,34 @@ def test_external_ip_actions_return_state_results(action, method, result, expect
 
     assert returned.value.args[0] == expected
     getattr(store, method).assert_called_once()
+
+
+def test_module_returns_the_saved_transit_range(monkeypatch):
+    module = importlib.import_module(
+        "ansible_collections.osac.templates.plugins.modules.agentless_net_state"
+    )
+    module_object = SimpleNamespace(
+        params={
+            "action": "ensure_virtual_network", "state_file": "unused",
+            "uid": UID_ONE, "tenant_id": TENANT_ONE, "virtual_network_cidr": "10.0.0.0/16",
+        },
+        check_mode=False,
+        exit_json=Mock(side_effect=SystemExit),
+        fail_json=Mock(),
+    )
+    store = SimpleNamespace(
+        ensure_and_reconcile_virtual_network=Mock(
+            return_value=({"transit": {"cidr": "10.0.0.8/31"}}, True, False)
+        )
+    )
+    monkeypatch.setattr(module, "AnsibleModule", lambda **kwargs: module_object)
+    monkeypatch.setattr(module, "StateStore", lambda path: store)
+    with pytest.raises(SystemExit):
+        module.main()
+    result = module_object.exit_json.call_args.kwargs
+    assert result == {
+        "changed": True,
+        "backend_network_id": UID_ONE,
+        "transit_ipv4_cidr": "10.0.0.8/31",
+    }
+    module_object.fail_json.assert_not_called()

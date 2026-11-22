@@ -231,3 +231,38 @@ func TestSyncSecurityGroupWaitsForStoredRules(t *testing.T) {
 		t.Fatalf("message %q not cleared once Succeeded", remote.GetStatus().GetMessage())
 	}
 }
+
+func TestSyncVirtualNetworkPublishesTransitRange(t *testing.T) {
+	remote := &privatev1.VirtualNetwork{}
+	remote.SetStatus(&privatev1.VirtualNetworkStatus{})
+	obj := &v1alpha1.VirtualNetwork{Status: v1alpha1.VirtualNetworkStatus{
+		Conditions:      readyCondition(metav1.ConditionTrue, v1alpha1.ReasonSucceeded, ""),
+		TransitIPv4CIDR: "10.0.8.0/31",
+	}}
+	if err := syncVirtualNetworkUpdate(context.Background(), obj, remote); err != nil {
+		t.Fatal(err)
+	}
+	if got := remote.GetStatus().GetState(); got != privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_READY {
+		t.Fatalf("state %v, want READY", got)
+	}
+	if got := remote.GetStatus().GetTransitIpv4Cidr(); got != "10.0.8.0/31" {
+		t.Fatalf("transit %q, want the accepted /31", got)
+	}
+	paths := virtualNetworkFeedbackMask(remote).GetPaths()
+	if len(paths) != 3 || paths[2] != "status.transit_ipv4_cidr" {
+		t.Fatalf("mask %v, want readiness and transit in one update", paths)
+	}
+
+	readyOnly := &privatev1.VirtualNetwork{}
+	readyOnly.SetStatus(&privatev1.VirtualNetworkStatus{})
+	obj.Status.TransitIPv4CIDR = ""
+	if err := syncVirtualNetworkUpdate(context.Background(), obj, readyOnly); err != nil {
+		t.Fatal(err)
+	}
+	if readyOnly.GetStatus().HasTransitIpv4Cidr() {
+		t.Fatal("a snapshot without a range must not invent one")
+	}
+	if len(virtualNetworkFeedbackMask(readyOnly).GetPaths()) != 2 {
+		t.Fatal("mask without a range must not include the transit field")
+	}
+}

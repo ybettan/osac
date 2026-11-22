@@ -70,6 +70,12 @@ type VirtualNetworkStatus struct {
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=16777215
 	L3VNI int32 `json:"l3Vni,omitempty"`
+
+	// TransitIPv4CIDR is the canonical IPv4 /31 the Fabric Manager reserves for its
+	// routing link inside the VirtualNetwork CIDR.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Type=string
+	TransitIPv4CIDR string `json:"transitIPv4Cidr,omitempty"`
 }
 
 // +kubebuilder:object:root=true

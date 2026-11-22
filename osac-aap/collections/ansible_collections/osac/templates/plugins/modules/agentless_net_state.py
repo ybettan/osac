@@ -156,6 +156,10 @@ EXAMPLES = r"""
 RETURN = r"""
 backend_network_id:
   description: Stable provider identifier, equal to the OSAC resource API ID.
+transit_ipv4_cidr:
+  description: Saved VirtualNetwork routing /31 for AgentlessNet.
+  returned: for a successful VirtualNetwork reconciliation
+  type: str
   returned: Internal module output; networking tasks set only contract results.
   type: str
 found:
@@ -426,7 +430,7 @@ def main() -> None:
                     changed=existing is None,
                     backend_network_id=params["uid"],
                 )
-            _, state_changed, network_changed = store.ensure_and_reconcile_virtual_network(
+            entry, state_changed, network_changed = store.ensure_and_reconcile_virtual_network(
                 params["uid"],
                 params["virtual_network_cidr"],
                 params["tenant_id"],
@@ -434,6 +438,7 @@ def main() -> None:
             module.exit_json(
                 changed=state_changed or network_changed,
                 backend_network_id=params["uid"],
+                transit_ipv4_cidr=entry["transit"]["cidr"],
             )
 
         if params["action"] == "get_subnet":

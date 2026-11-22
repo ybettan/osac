@@ -85,6 +85,7 @@ message VirtualNetworkStatus {
   //
   // For READY state, this is typically empty or contains confirmation like "Network ready for compute instances".
   optional string message = 2;
+
 }
 
 // Lifecycle states for VirtualNetwork resources.

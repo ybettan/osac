@@ -142,9 +142,9 @@ func TestParseVirtualNetworkResult(t *testing.T) {
 		"no type empty":     {`{}`, "", "", 0},
 	}
 	for name, tc := range ok {
-		id, l3, err := ParseVirtualNetworkResult(result(t, tc.raw), tc.networkType)
-		if err != nil || id != tc.id || l3 != tc.l3 {
-			t.Fatalf("%s: got (%q, %d, %v)", name, id, l3, err)
+		id, l3, transit, err := ParseVirtualNetworkResult(result(t, tc.raw), tc.networkType, "", false)
+		if err != nil || id != tc.id || l3 != tc.l3 || transit != "" {
+			t.Fatalf("%s: got (%q, %d, %q, %v)", name, id, l3, transit, err)
 		}
 	}
 	const vniRule = "l3_vni must be an integer from 1 to 16777215"
@@ -162,11 +162,41 @@ func TestParseVirtualNetworkResult(t *testing.T) {
 		"no type extra":     {`{"vpc_id":"1"}`, "", `undefined output "vpc_id"`},
 	}
 	for name, tc := range bad {
-		_, _, err := ParseVirtualNetworkResult(result(t, tc.raw), tc.networkType)
+		_, _, _, err := ParseVirtualNetworkResult(result(t, tc.raw), tc.networkType, "", false)
 		if err == nil {
 			t.Fatalf("%s accepted", name)
 		}
 		expectReject(t, err, tc.reason)
+	}
+}
+
+func TestParseVirtualNetworkTransit(t *testing.T) {
+	id, l3, transit, err := ParseVirtualNetworkResult(
+		result(t, `{"backend_id":"x","transit_ipv4_cidr":"10.0.8.4/31"}`), "", "10.0.0.0/16", true)
+	if err != nil || id != "x" || l3 != 0 || transit != "10.0.8.4/31" {
+		t.Fatal(id, l3, transit, err)
+	}
+	cases := map[string]struct {
+		raw, parent, reason string
+	}{
+		"missing":        {`{"backend_id":"x"}`, "10.0.0.0/16", `missing required output "transit_ipv4_cidr"`},
+		"not a string":   {`{"transit_ipv4_cidr":1}`, "10.0.0.0/16", "transit_ipv4_cidr must be a string"},
+		"not a /31":      {`{"transit_ipv4_cidr":"10.0.8.0/30"}`, "10.0.0.0/16", "transit_ipv4_cidr must be a canonical IPv4 /31"},
+		"host bits":      {`{"transit_ipv4_cidr":"10.0.8.5/31"}`, "10.0.0.0/16", "transit_ipv4_cidr must be a canonical IPv4 /31"},
+		"ipv6":           {`{"transit_ipv4_cidr":"fd00::/31"}`, "10.0.0.0/16", "transit_ipv4_cidr must be a canonical IPv4 /31"},
+		"outside parent": {`{"transit_ipv4_cidr":"10.1.0.0/31"}`, "10.0.0.0/16", "transit_ipv4_cidr must be inside the VirtualNetwork CIDR"},
+		"undefined key":  {`{"transit_ipv4_cidr":"10.0.8.0/31","x":1}`, "10.0.0.0/16", `undefined output "x"`},
+	}
+	for name, tc := range cases {
+		_, _, _, err := ParseVirtualNetworkResult(result(t, tc.raw), "", tc.parent, true)
+		if err == nil {
+			t.Fatalf("%s accepted", name)
+		}
+		expectReject(t, err, tc.reason)
+	}
+	if _, _, _, err := ParseVirtualNetworkResult(
+		result(t, `{"transit_ipv4_cidr":"10.0.8.0/31"}`), "", "10.0.0.0/16", false); err == nil {
+		t.Fatal("transit accepted without requireTransit")
 	}
 }
 

@@ -238,27 +238,67 @@ func backendID(result Result) (string, error) {
 // ParseVirtualNetworkResult reads the result of a Fabric create_virtual_network
 // (contract §4.9, EP #427): with a network type the integer l3_vni is required
 // and backend_id is optional; without one only backend_id is defined.
+// AgentlessNet additionally returns transit_ipv4_cidr, the routing /31 it saved
+// inside parentCIDR; requireTransit rejects a result without it.
 // L3 VNI allocation and uniqueness are owned by the Fabric Manager.
-func ParseVirtualNetworkResult(result Result, networkType string) (string, int32, error) {
-	if networkType == "" {
-		if _, ok := result["l3_vni"]; ok {
-			return "", 0, Reject("l3_vni returned without a network type")
+func ParseVirtualNetworkResult(result Result, networkType, parentCIDR string, requireTransit bool) (string, int32, string, error) {
+	allowed := []string{"backend_id"}
+	required := []string{}
+	if networkType != "" {
+		allowed = append(allowed, "l3_vni")
+		required = append(required, "l3_vni")
+	} else if _, ok := result["l3_vni"]; ok {
+		return "", 0, "", Reject("l3_vni returned without a network type")
+	}
+	if requireTransit {
+		allowed = append(allowed, "transit_ipv4_cidr")
+		required = append(required, "transit_ipv4_cidr")
+	}
+	if err := result.checkKeys(allowed, required...); err != nil {
+		return "", 0, "", err
+	}
+	var l3 int32
+	if networkType != "" {
+		var ok bool
+		l3, ok = vni(result["l3_vni"])
+		if !ok {
+			return "", 0, "", Reject("l3_vni must be an integer from 1 to 16777215")
 		}
-		id, err := ParseBackendID(result)
-		return id, 0, err
-	}
-	if err := result.checkKeys([]string{"backend_id", "l3_vni"}, "l3_vni"); err != nil {
-		return "", 0, err
-	}
-	l3, ok := vni(result["l3_vni"])
-	if !ok {
-		return "", 0, Reject("l3_vni must be an integer from 1 to 16777215")
 	}
 	id, err := backendID(result)
 	if err != nil {
-		return "", 0, err
+		return "", 0, "", err
 	}
-	return id, l3, nil
+	transit := ""
+	if requireTransit {
+		transit, err = parseTransitIPv4CIDR(result["transit_ipv4_cidr"], parentCIDR)
+		if err != nil {
+			return "", 0, "", err
+		}
+	}
+	return id, l3, transit, nil
+}
+
+// parseTransitIPv4CIDR accepts exactly a canonical IPv4 /31 inside the parent
+// VirtualNetwork CIDR. The value is provider input, so it is never echoed in an
+// error.
+func parseTransitIPv4CIDR(raw json.RawMessage, parentCIDR string) (string, error) {
+	value, err := stringField(raw, "transit_ipv4_cidr")
+	if err != nil {
+		return "", err
+	}
+	transit, err := netip.ParsePrefix(value)
+	if err != nil || !transit.Addr().Is4() || transit.Bits() != 31 || transit.Masked() != transit || transit.String() != value {
+		return "", Reject("transit_ipv4_cidr must be a canonical IPv4 /31")
+	}
+	parent, err := netip.ParsePrefix(parentCIDR)
+	if err != nil || !parent.Addr().Is4() || parent.Masked() != parent {
+		return "", Reject("VirtualNetwork CIDR is not a canonical IPv4 CIDR")
+	}
+	if !parent.Contains(transit.Addr()) || !parent.Contains(transit.Addr().Next()) {
+		return "", Reject("transit_ipv4_cidr must be inside the VirtualNetwork CIDR")
+	}
+	return value, nil
 }
 
 // ParseNetworkSegment reads the network_segment of a Fabric create_subnet.

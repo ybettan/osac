@@ -1115,7 +1115,8 @@ func (t *task) ensureDefaultNetworking(ctx context.Context) error {
 		return nil
 	}
 	defaults, err := t.r.defaultNetwork.Ensure(ctx, t.tenant.GetMetadata().GetName())
-	if errors.Is(err, defaultnetworking.ErrNoPoolCapacity) || errors.Is(err, defaultnetworking.ErrNoReadyPool) {
+	if errors.Is(err, defaultnetworking.ErrNoPoolCapacity) || errors.Is(err, defaultnetworking.ErrNoReadyPool) ||
+		defaultnetworking.IsSubnetTransitOverlap(err) {
 		// Reported by the DefaultNetworkingReady condition.
 		t.defaultNetworkDefaults = defaults
 		t.defaultNetworkErr = err
@@ -1169,6 +1170,11 @@ func (t *task) checkDefaultNetworkingReadiness(ctx context.Context) error {
 	}
 	if errors.Is(t.defaultNetworkErr, defaultnetworking.ErrNoPoolCapacity) {
 		t.setFailed("no READY IPv4 ExternalIPPool has capacity")
+		return nil
+	}
+	if defaultnetworking.IsSubnetTransitOverlap(t.defaultNetworkErr) {
+		t.setFailed("The configured default Subnet overlaps the VirtualNetwork's reserved routing range. " +
+			"Contact your cloud administrator.")
 		return nil
 	}
 

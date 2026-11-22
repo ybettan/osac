@@ -67,7 +67,7 @@ func NewVirtualNetworkFeedbackReconciler(hubClient clnt.Client, grpcConn grpc.Cl
 		Save: func(ctx context.Context, remote *privatev1.VirtualNetwork) error {
 			_, err := vnClient.Update(ctx, privatev1.VirtualNetworksUpdateRequest_builder{
 				Object:     remote,
-				UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{feedbackStatusStatePath, feedbackStatusMessagePath}},
+				UpdateMask: virtualNetworkFeedbackMask(remote),
 			}.Build())
 			if err != nil {
 				return err
@@ -106,6 +106,16 @@ func (r *VirtualNetworkFeedbackReconciler) Reconcile(ctx context.Context, reques
 	return r.bridge.Reconcile(ctx, request)
 }
 
+// virtualNetworkFeedbackMask includes the reserved transit range in the same
+// status Update that publishes readiness.
+func virtualNetworkFeedbackMask(remote *privatev1.VirtualNetwork) *fieldmaskpb.FieldMask {
+	paths := []string{feedbackStatusStatePath, feedbackStatusMessagePath}
+	if remote.GetStatus().HasTransitIpv4Cidr() {
+		paths = append(paths, "status.transit_ipv4_cidr")
+	}
+	return &fieldmaskpb.FieldMask{Paths: paths}
+}
+
 func syncVirtualNetworkUpdate(_ context.Context, obj *v1alpha1.VirtualNetwork, remote *privatev1.VirtualNetwork) error {
 	status := remote.GetStatus()
 	state, message := networkFeedback(obj, obj.Status.Conditions)
@@ -120,6 +130,9 @@ func syncVirtualNetworkUpdate(_ context.Context, obj *v1alpha1.VirtualNetwork, r
 		status.SetState(privatev1.VirtualNetworkState_VIRTUAL_NETWORK_STATE_PENDING)
 	}
 	feedbackMessage(message, status.SetMessage, status.ClearMessage)
+	if obj.Status.TransitIPv4CIDR != "" {
+		status.SetTransitIpv4Cidr(obj.Status.TransitIPv4CIDR)
+	}
 	return nil
 }
 

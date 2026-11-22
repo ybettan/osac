@@ -96,6 +96,10 @@ message VirtualNetworkStatus {
   // Identifier of the hub that was selected for this virtual network.
   // This is system-managed and used by the controller to track which hub cluster manages this network's resources.
   string hub = 3 [(cleanapi.field).private = true];
+
+  // Canonical IPv4 /31 that the provider reserves inside the VirtualNetwork CIDR for its routing link.
+  // It is set by the provider result and used to reject an overlapping Subnet create before insertion.
+  optional string transit_ipv4_cidr = 4 [(cleanapi.field).private = true];
 }
 
 // Lifecycle states for VirtualNetwork resources.

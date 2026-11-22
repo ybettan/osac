@@ -243,6 +243,11 @@ spec:
                   (contract §4.5).
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
+              transitIPv4Cidr:
+                description: |-
+                  TransitIPv4CIDR is the canonical IPv4 /31 the Fabric Manager reserves for its
+                  routing link inside the VirtualNetwork CIDR.
+                type: string
             type: object
         required:
         - spec

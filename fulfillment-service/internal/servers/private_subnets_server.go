@@ -26,6 +26,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"github.com/osac-project/osac/fulfillment-service/internal/auth"
+	"github.com/osac-project/osac/fulfillment-service/internal/controllers/defaultnetworking"
 	"github.com/osac-project/osac/fulfillment-service/internal/database/dao"
 	privatev1 "github.com/osac-project/osac/proto/gen/osac/private/v1"
 )
@@ -252,6 +253,9 @@ func (s *PrivateSubnetsServer) validateSubnet(ctx context.Context, subnet *priva
 	if err := validatePrefixLimit("spec.ipv4_cidr", prefix, networkClass); err != nil {
 		return err
 	}
+	if err := validateSubnetTransitOverlap(prefix, virtualNetwork); err != nil {
+		return err
+	}
 
 	var siblings []*privatev1.Subnet
 	err = forEachMatchingRecord(ctx, s.guards.subnets,
@@ -284,6 +288,26 @@ func (s *PrivateSubnetsServer) validateSubnet(ctx context.Context, subnet *priva
 			return grpcstatus.Error(grpccodes.FailedPrecondition,
 				"the default Subnet of this VirtualNetwork is not READY yet")
 		}
+	}
+	return nil
+}
+
+// validateSubnetTransitOverlap rejects a Subnet before insertion when it covers
+// the provider routing /31 recorded on its authorized parent VirtualNetwork.
+// An absent field keeps the behavior of other providers; a stored but invalid
+// value fails closed without disclosing it.
+func validateSubnetTransitOverlap(prefix netip.Prefix, virtualNetwork *privatev1.VirtualNetwork) error {
+	value := virtualNetwork.GetStatus().GetTransitIpv4Cidr()
+	if value == "" {
+		return nil
+	}
+	transit, err := netip.ParsePrefix(value)
+	if err != nil || !transit.Addr().Is4() || transit.Bits() != 31 || transit.Masked() != transit {
+		return grpcstatus.Error(grpccodes.Internal,
+			"the parent VirtualNetwork has an invalid reserved routing range")
+	}
+	if prefix.Overlaps(transit) {
+		return defaultnetworking.NewSubnetTransitOverlapError(prefix.String(), transit.String())
 	}
 	return nil
 }

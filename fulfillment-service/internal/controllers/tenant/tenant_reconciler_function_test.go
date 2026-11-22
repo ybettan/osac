@@ -2507,6 +2507,19 @@ var _ = Describe("Default networking readiness", func() {
 		Expect(cond.GetMessage()).To(ContainSubstring("capacity"))
 	})
 
+	It("fails with an actionable message when the default Subnet overlaps transit", func() {
+		setAllReady()
+		cond, err := check(newSyncedTenant("tenant-a"), fmt.Errorf(
+			"failed to ensure default IPv4 Subnet: %w",
+			defaultnetworking.NewSubnetTransitOverlapError("10.200.0.0/20", "10.200.0.8/31")))
+		Expect(err).ToNot(HaveOccurred())
+		Expect(cond.GetStatus()).To(Equal(privatev1.ConditionStatus_CONDITION_STATUS_FALSE))
+		Expect(cond.GetReason()).To(Equal("ResourceFailed"))
+		Expect(cond.GetMessage()).To(Equal(
+			"The configured default Subnet overlaps the VirtualNetwork's reserved routing range. " +
+				"Contact your cloud administrator."))
+	})
+
 	It("fails when a default resource is FAILED", func() {
 		setAllReady()
 		subnets.items[0].GetStatus().SetState(privatev1.SubnetState_SUBNET_STATE_FAILED)
